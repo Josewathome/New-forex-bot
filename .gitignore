@@ -1,0 +1,22 @@
+# ── NEVER COMMIT THESE ────────────────────────
+.env
+*.env
+.env.*
+
+# ── Generated at runtime ──────────────────────
+.cache/
+*.log
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+backtest_*.csv
+backtest_*.txt
+# ── IDE ───────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.zip
+*/venv/
+/venv

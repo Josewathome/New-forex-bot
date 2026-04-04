@@ -1,0 +1,18 @@
+# ─────────────────────────────────────────────────────────────────
+#  Zone-Reactive Trading Bot — Python Dependencies (Windows-native)
+#
+#  Install on Windows:
+#      pip install -r requirements.txt
+#
+#  MetaTrader5 is a Windows-only package. The bot now runs entirely
+#  on Windows — no WSL, no ZMQ bridge required.
+# ─────────────────────────────────────────────────────────────────
+
+# MT5 Python API  (Windows only)
+MetaTrader5>=5.0.45
+
+# HTTP client for the news API
+requests>=2.31.0
+
+# Timezone data (Python 3.9+ zoneinfo fallback for Windows)
+tzdata>=2024.1
