@@ -1,8 +1,5 @@
 """
-trade_repo.py — MT5 Trade Execution  (updated with modify_sl)
-
-Implements ITradeRepository by calling MT5Gateway directly.
-Runs on Windows where MetaTrader5 is installed.
+trade_repo.py — MT5 Trade Execution  (v3 — partial close + modify_sl)
 """
 from __future__ import annotations
 import logging
@@ -17,12 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 class MT5TradeRepository(ITradeRepository):
-    """Sends trade commands directly to MT5Gateway."""
 
     def __init__(self, gateway: MT5Gateway) -> None:
         self._gw = gateway
-
-    # ── ITradeRepository ──────────────────────────────────────────
 
     def place_trade(self, trade: Trade) -> Optional[int]:
         order = {
@@ -38,10 +32,8 @@ class MT5TradeRepository(ITradeRepository):
         if result is None:
             logger.error("place_trade failed for %s", trade.id)
             return None
-        logger.info(
-            "Trade placed ✓ ticket=%s %s %s vol=%.2f",
-            result["ticket"], trade.symbol, order["type"], order["volume"],
-        )
+        logger.info("Trade placed ✓ ticket=%s %s %s vol=%.2f",
+                    result["ticket"], trade.symbol, order["type"], order["volume"])
         return result["ticket"]
 
     def close_trade(self, ticket: int) -> bool:
@@ -49,32 +41,41 @@ class MT5TradeRepository(ITradeRepository):
         if result is None:
             logger.error("close_trade failed ticket=%s", ticket)
             return False
-        logger.info("Trade closed ✓ ticket=%s @ %s",
-                    ticket, result.get("price"))
+        logger.info("Trade closed ✓ ticket=%s @ %s", ticket, result.get("price"))
+        return True
+
+    def partial_close_trade(self, ticket: int, volume: float) -> bool:
+        """
+        Close `volume` lots of the position at market price.
+
+        The MT5 gateway sends a TRADE_ACTION_DEAL in the opposite direction
+        with the specified volume against the open position.  MT5 matches
+        it as a partial close, leaving (original_volume - volume) lots open.
+
+        If volume >= full position size, falls back to full close.
+        """
+        result = self._gw.partial_close_position(ticket, volume)
+        if result is None:
+            logger.error("partial_close failed ticket=%s vol=%.2f", ticket, volume)
+            return False
+        logger.info(
+            "Partial close ✓ ticket=%s | closed=%.2f lots @ %.5f",
+            ticket, result.get("closed_volume", volume), result.get("price", 0),
+        )
         return True
 
     def modify_sl(self, ticket: int, new_sl: float) -> bool:
-        """
-        Trail the stop-loss to new_sl while keeping TP unchanged.
-
-        Fetches the current TP from MT5 so we never accidentally
-        wipe it when sending the SLTP modification request.
-        """
+        """Move SL to new_sl, preserving the current TP."""
         pos = self._gw.get_position_by_ticket(ticket)
         if pos is None:
             logger.error("modify_sl: position %s not found", ticket)
             return False
-
-        current_tp = pos["tp"]
-        result     = self._gw.modify_position(ticket, sl=new_sl, tp=current_tp)
+        result = self._gw.modify_position(ticket, sl=new_sl, tp=pos["tp"])
         if result is None:
             logger.error("modify_sl failed ticket=%s new_sl=%.5f", ticket, new_sl)
             return False
-
-        logger.info(
-            "SL trailed ✓ ticket=%s | old_sl=%.5f → new_sl=%.5f | tp=%.5f",
-            ticket, pos["sl"], new_sl, current_tp,
-        )
+        logger.info("SL trailed ✓ ticket=%s | %.5f → %.5f",
+                    ticket, pos["sl"], new_sl)
         return True
 
     def get_open_positions(self) -> List[Trade]:

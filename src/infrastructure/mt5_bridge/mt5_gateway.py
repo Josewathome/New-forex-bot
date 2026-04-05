@@ -276,6 +276,82 @@ class MT5Gateway:
             logger.error("close_position failed ticket=%s: %s", ticket, result)
             return None
         return {"ticket": int(ticket), "retcode": int(result.retcode), "price": float(close_price)}
+    
+    def partial_close_position(self, ticket: int, volume: float):
+        """
+        Close `volume` lots of an open position (partial close).
+    
+        MT5 handles partial closes via a TRADE_ACTION_DEAL order in the
+        opposite direction with the specific volume.  MT5 matches the incoming
+        order against the existing position and leaves the remainder open.
+    
+        If volume >= position size, delegates to close_position() (full close).
+    
+        Returns:
+            dict with {ticket, closed_volume, price}  on success
+            None                                       on failure
+        """
+        if not self._ensure_ready():
+            return None
+    
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            logger.error("partial_close: no position found for ticket %s", ticket)
+            return None
+    
+        pos = positions[0]
+    
+        # If we're asked to close more than we have, do a full close
+        volume = round(volume, 2)
+        if volume >= pos.volume:
+            return self.close_position(ticket)
+    
+        close_type  = (mt5.ORDER_TYPE_SELL
+                    if pos.type == mt5.ORDER_TYPE_BUY
+                    else mt5.ORDER_TYPE_BUY)
+        tick        = mt5.symbol_info_tick(pos.symbol)
+        if tick is None:
+            logger.error("partial_close: no tick for %s", pos.symbol)
+            return None
+        close_price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
+    
+        request = {
+            "action":       mt5.TRADE_ACTION_DEAL,
+            "symbol":       pos.symbol,
+            "volume":       float(volume),
+            "type":         close_type,
+            "position":     int(ticket),
+            "price":        float(close_price),
+            "deviation":    20,
+            "magic":        int(pos.magic),
+            "comment":      "ZoneBot TP1",
+            "type_time":    mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+    
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error(
+                "partial_close failed ticket=%s vol=%.2f retcode=%s",
+                ticket, volume,
+                result.retcode if result else "None",
+            )
+            return None
+    
+        logger.info(
+            "Partial close ✓ ticket=%s | closed=%.2f lots | remaining=%.2f | price=%.5f",
+            ticket, volume, pos.volume - volume, close_price,
+        )
+        return {
+            "ticket":         int(ticket),
+            "closed_volume":  float(volume),
+            "remaining":      float(round(pos.volume - volume, 2)),
+            "price":          float(close_price),
+            "retcode":        int(result.retcode),
+        }
+
+
+
 
     def modify_position(self, ticket: int, sl: float, tp: float) -> Optional[Dict[str, Any]]:
         if not self._ensure_ready():

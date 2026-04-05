@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-
+from src.application.trade_monitor import  MonitorEvent
 class DiagnosticsCollector:
 
     def __init__(self) -> None:

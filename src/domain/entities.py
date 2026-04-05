@@ -1,18 +1,11 @@
-"""
-Domain Entities — Pure Business Objects.
-No imports from infrastructure or application layers.
-These are the canonical data shapes the entire system reasons about.
-"""
+# src/domain/entities.py
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-
-# ─────────────────────────────────────────────
-#  Enumerations
-# ─────────────────────────────────────────────
 
 class Direction(Enum):
     BULLISH = "bullish"
@@ -47,13 +40,8 @@ class Timeframe(Enum):
     D1  = "D1"
 
 
-# ─────────────────────────────────────────────
-#  Value-like primitives
-# ─────────────────────────────────────────────
-
 @dataclass
 class Candle:
-    """OHLCV bar. All prices are raw broker prices (not pips)."""
     time:      datetime
     open:      float
     high:      float
@@ -62,8 +50,6 @@ class Candle:
     volume:    float
     symbol:    str
     timeframe: Timeframe
-
-    # ── derived geometry ──────────────────────
 
     @property
     def body_high(self) -> float:
@@ -98,23 +84,14 @@ class Candle:
         return self.body_low - self.low
 
     def wick_ratio(self, side: str) -> float:
-        """Fraction of total range occupied by the named wick. side='upper'|'lower'"""
         if self.total_range == 0:
             return 0.0
         wick = self.upper_wick if side == "upper" else self.lower_wick
         return wick / self.total_range
 
 
-# ─────────────────────────────────────────────
-#  Zone / POI aggregates
-# ─────────────────────────────────────────────
-
 @dataclass
 class Zone:
-    """
-    A mapped institutional Point of Interest (POI).
-    Represents an Order Block or Fair Value Gap on H1/H4.
-    """
     id:                  str
     symbol:              str
     zone_type:           ZoneType
@@ -147,28 +124,20 @@ class Zone:
 
 @dataclass
 class LiquidityPool:
-    """
-    Recent swing high/low acting as a magnet for price.
-    Calculated from the last N H1 candles.
-    """
     symbol:           str
-    high:             float          # highest High in lookback window
-    low:              float          # lowest Low in lookback window
+    high:             float
+    low:              float
     lookback_candles: int
     created_at:       datetime
     timeframe:        Timeframe
 
 
-# ─────────────────────────────────────────────
-#  News / Risk Guard
-# ─────────────────────────────────────────────
-
 @dataclass
 class NewsEvent:
     currency:   str
     event_name: str
-    impact:     str                 # "low" | "medium" | "high"
-    event_time: datetime            # always UTC
+    impact:     str
+    event_time: datetime
     actual:     Optional[str]
     forecast:   Optional[str]
     previous:   Optional[str]
@@ -177,10 +146,6 @@ class NewsEvent:
 
 @dataclass
 class NoTradeWindow:
-    """
-    Derived from a high-impact NewsEvent.
-    Represents the ±N min blackout period around an event.
-    """
     start:      datetime
     end:        datetime
     currency:   str
@@ -190,16 +155,8 @@ class NoTradeWindow:
         return self.start <= now <= self.end
 
 
-# ─────────────────────────────────────────────
-#  Signal & Execution
-# ─────────────────────────────────────────────
-
 @dataclass
 class TradeSignal:
-    """
-    A confirmed entry signal produced by the execution engine.
-    Carries all the math needed to size and place the trade.
-    """
     symbol:       str
     direction:    Direction
     entry_price:  float
@@ -207,28 +164,13 @@ class TradeSignal:
     take_profit:  float
     zone:         Zone
     signal_type:  SignalType
-    volume_ratio: float           # rejection candle volume / avg(10) volume
+    volume_ratio: float
     created_at:   datetime
     risk_reward:  float
 
 
 @dataclass
 class Trade:
-    """
-    A live or historical trade record.
-    Written when an order is placed; updated on close.
-
-    NEW fields (v4 — post-trade analytics):
-        mfe_price          — raw price of Maximum Favorable Excursion
-        mfe_pips           — MFE expressed in pips from entry
-        pips_to_tp_at_mfe  — pips remaining to TP when MFE was reached
-                             (0 for winners; > 0 tells you "how close" a loser got)
-        duration_minutes   — how long the trade was open (entry → close/SL/TP)
-        reversal_zone_type — type of opposing zone (if any) at the MFE reversal point:
-                             "order_block" | "fvg" | "no_zone" | None (winners have None)
-        balance_before     — account equity before this trade was sized
-        balance_after      — account equity after PnL was applied
-    """
     id:           str
     symbol:       str
     direction:    Direction
@@ -239,7 +181,7 @@ class Trade:
     status:       TradeStatus
     created_at:   datetime
 
-    # ── existing optional fields ──────────────────────────────────
+    # existing optional fields
     closed_at:     Optional[datetime] = None
     close_price:   Optional[float]    = None
     pnl:           Optional[float]    = None
@@ -249,7 +191,7 @@ class Trade:
     news_affected: bool               = False
     slippage_pips: float              = 0.0
 
-    # ── NEW: post-trade analytics (backtest only) ─────────────────
+    # post-trade analytics (existing)
     mfe_price:          Optional[float] = None
     mfe_pips:           Optional[float] = None
     pips_to_tp_at_mfe:  Optional[float] = None
@@ -257,3 +199,13 @@ class Trade:
     reversal_zone_type: Optional[str]   = None
     balance_before:     Optional[float] = None
     balance_after:      Optional[float] = None
+
+    # NEW: multi‑TP tracking and profit management
+    tp1_hit: bool = False
+    tp2_hit: bool = False
+    initial_risk: float = 0.0          # distance from entry to original SL in price units
+    realized_pnl: float = 0.0          # cumulative PnL from partial closes
+    remaining_volume: float = 0.0      # remaining lot size after partial closes
+    exit_reason: str = ""              # "TP1", "TP2", "SL", "MONITOR_CLOSE"
+    mfe: float = 0.0                   # maximum favorable excursion in price units
+    mae: float = 0.0                   # maximum adverse excursion in price units

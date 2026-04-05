@@ -399,7 +399,74 @@ def find_liquidity_pool(
         lookback_candles=config.LIQUIDITY_LOOKBACK,
         created_at=datetime.now(tz=timezone.utc),
     )
+def compute_tp1_price(
+    direction:  Direction,
+    entry:      float,
+    stop_loss:  float,
+) -> Optional[float]:
+    """
+    Compute the first take-profit target (TP1) for tiered exits.
+ 
+    TP1 = entry ± (SL_distance × TIERED_TP1_RATIO)
+ 
+    TP1 is the "lock in" level.  When price reaches it, 60% of the
+    position is closed and SL moves to entry.  The remaining 40% runs
+    to the full liquidity-pool TP.
+ 
+    Returns None when tiered TP is disabled in config.
+    """
+    if not getattr(config, "TIERED_TP_ENABLED", True):
+        return None
+ 
+    sl_dist  = abs(entry - stop_loss)
+    ratio    = getattr(config, "TIERED_TP1_RATIO", 2.0)
+    tp1_dist = sl_dist * ratio
+ 
+    if direction == Direction.BULLISH:
+        return round(entry + tp1_dist, 5)
+    return round(entry - tp1_dist, 5)
+# Add these to src/application/analysis.py (after compute_tp1_price and before ZoneMapper)
 
+def compute_tp2_price(
+    direction:  Direction,
+    entry:      float,
+    stop_loss:  float,
+) -> Optional[float]:
+    """
+    Compute the second take‑profit target (TP2) for tiered exits.
+    TP2 = entry ± (SL_distance × TIERED_TP2_RATIO)
+    Returns None if tiered TP is disabled.
+    """
+    if not getattr(config, "TIERED_TP_ENABLED", True):
+        return None
+    sl_dist = abs(entry - stop_loss)
+    ratio   = getattr(config, "TIERED_TP2_RATIO", 3.5)
+    tp2_dist = sl_dist * ratio
+    if direction == Direction.BULLISH:
+        return round(entry + tp2_dist, 5)
+    return round(entry - tp2_dist, 5)
+
+
+def get_initial_risk(entry: float, stop_loss: float) -> float:
+    """Absolute price distance from entry to original SL."""
+    return abs(entry - stop_loss)
+ 
+def check_min_sl_pips(
+    symbol:    str,
+    sl_pips:   float,
+) -> bool:
+    """
+    Return True if the SL distance is large enough to be a real trade.
+ 
+    Filters out anomaly setups where price is at the exact zone edge
+    and the SL is effectively zero (e.g. 0.1 pip on GBPUSD — unlivable
+    in practice with 1 pip spread).
+ 
+    Returns True (OK to trade) if sl_pips >= MIN_SL_PIPS for the symbol.
+    Returns False (reject) if SL is too tight.
+    """
+    min_pips = config.MIN_SL_PIPS.get(symbol, config.MIN_SL_PIPS_DEFAULT)
+    return sl_pips >= min_pips
 
 # ─────────────────────────────────────────────
 #  Dynamic SL buffer helper
