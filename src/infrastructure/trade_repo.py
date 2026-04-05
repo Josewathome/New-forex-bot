@@ -1,7 +1,8 @@
 """
-trade_repo.py — Windows-native MT5 Trade Execution.
+trade_repo.py — MT5 Trade Execution  (updated with modify_sl)
+
 Implements ITradeRepository by calling MT5Gateway directly.
-No ZMQ bridge. Runs on Windows where MetaTrader5 is installed.
+Runs on Windows where MetaTrader5 is installed.
 """
 from __future__ import annotations
 import logging
@@ -21,7 +22,7 @@ class MT5TradeRepository(ITradeRepository):
     def __init__(self, gateway: MT5Gateway) -> None:
         self._gw = gateway
 
-    # ── ITradeRepository ──────────────────────
+    # ── ITradeRepository ──────────────────────────────────────────
 
     def place_trade(self, trade: Trade) -> Optional[int]:
         order = {
@@ -38,7 +39,7 @@ class MT5TradeRepository(ITradeRepository):
             logger.error("place_trade failed for %s", trade.id)
             return None
         logger.info(
-            "Trade placed ✓ ticket=%s symbol=%s type=%s vol=%.2f",
+            "Trade placed ✓ ticket=%s %s %s vol=%.2f",
             result["ticket"], trade.symbol, order["type"], order["volume"],
         )
         return result["ticket"]
@@ -46,15 +47,40 @@ class MT5TradeRepository(ITradeRepository):
     def close_trade(self, ticket: int) -> bool:
         result = self._gw.close_position(ticket)
         if result is None:
-            logger.error("close_trade failed for ticket=%s", ticket)
+            logger.error("close_trade failed ticket=%s", ticket)
             return False
-        logger.info("Trade closed ✓ ticket=%s price=%s", ticket, result.get("price"))
+        logger.info("Trade closed ✓ ticket=%s @ %s",
+                    ticket, result.get("price"))
+        return True
+
+    def modify_sl(self, ticket: int, new_sl: float) -> bool:
+        """
+        Trail the stop-loss to new_sl while keeping TP unchanged.
+
+        Fetches the current TP from MT5 so we never accidentally
+        wipe it when sending the SLTP modification request.
+        """
+        pos = self._gw.get_position_by_ticket(ticket)
+        if pos is None:
+            logger.error("modify_sl: position %s not found", ticket)
+            return False
+
+        current_tp = pos["tp"]
+        result     = self._gw.modify_position(ticket, sl=new_sl, tp=current_tp)
+        if result is None:
+            logger.error("modify_sl failed ticket=%s new_sl=%.5f", ticket, new_sl)
+            return False
+
+        logger.info(
+            "SL trailed ✓ ticket=%s | old_sl=%.5f → new_sl=%.5f | tp=%.5f",
+            ticket, pos["sl"], new_sl, current_tp,
+        )
         return True
 
     def get_open_positions(self) -> List[Trade]:
-        raw_positions = self._gw.get_open_positions()
+        raw = self._gw.get_open_positions()
         trades = []
-        for p in raw_positions:
+        for p in raw:
             direction = Direction.BULLISH if p["type"] == "BUY" else Direction.BEARISH
             open_dt   = datetime.fromtimestamp(p["open_time"], tz=timezone.utc)
             trades.append(Trade(

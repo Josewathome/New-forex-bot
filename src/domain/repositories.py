@@ -1,7 +1,7 @@
 """
 Domain Repository Interfaces.
 Abstract base classes that define the contracts the application layer
-depends on. Infrastructure provides the concrete implementations.
+depends on.  Infrastructure provides the concrete implementations.
 
 No MT5, no HTTP, no file I/O here — only domain types.
 """
@@ -20,12 +20,7 @@ from .entities import Candle, NewsEvent, Trade, Zone, LiquidityPool, Timeframe
 class IMarketDataRepository(ABC):
 
     @abstractmethod
-    def get_candles(
-        self,
-        symbol:    str,
-        timeframe: Timeframe,
-        count:     int,
-    ) -> List[Candle]:
+    def get_candles(self, symbol: str, timeframe: Timeframe, count: int) -> List[Candle]:
         """Return the most recent `count` closed candles for symbol/timeframe."""
         ...
 
@@ -68,12 +63,25 @@ class ITradeRepository(ABC):
 
     @abstractmethod
     def place_trade(self, trade: Trade) -> Optional[int]:
-        """Send order to broker. Returns MT5 ticket on success, None on failure."""
+        """Send order to broker.  Returns MT5 ticket on success, None on failure."""
         ...
 
     @abstractmethod
     def close_trade(self, ticket: int) -> bool:
         """Market-close the position identified by ticket."""
+        ...
+
+    @abstractmethod
+    def modify_sl(self, ticket: int, new_sl: float) -> bool:
+        """
+        Move the stop-loss of an open position to new_sl without changing TP.
+
+        Used by the TradeMonitor to trail the SL to a swing structure level
+        when the trade is sufficiently in profit.  The TP is preserved
+        exactly as set at entry.
+
+        Returns True on success, False if MT5 rejected the request.
+        """
         ...
 
     @abstractmethod
@@ -94,11 +102,7 @@ class ITradeRepository(ABC):
 class INewsRepository(ABC):
 
     @abstractmethod
-    def get_today_events(
-        self,
-        currencies: List[str],
-        date_str:   str,           # "YYYY-MM-DD" UTC
-    ) -> List[NewsEvent]:
+    def get_today_events(self, currencies: List[str], date_str: str) -> List[NewsEvent]:
         """Fetch or return cached high-impact events for today."""
         ...
 
@@ -120,25 +124,19 @@ class INewsRepository(ABC):
 class IZoneRepository(ABC):
 
     @abstractmethod
-    def save_zone(self, zone: Zone) -> None:
-        ...
+    def save_zone(self, zone: Zone) -> None: ...
 
     @abstractmethod
-    def get_active_zones(self, symbol: str) -> List[Zone]:
-        ...
+    def get_active_zones(self, symbol: str) -> List[Zone]: ...
 
     @abstractmethod
-    def get_all_zones(self) -> List[Zone]:
-        ...
+    def get_all_zones(self) -> List[Zone]: ...
 
     @abstractmethod
-    def invalidate_zone(self, zone_id: str) -> None:
-        ...
+    def invalidate_zone(self, zone_id: str) -> None: ...
 
     @abstractmethod
-    def save_liquidity_pool(self, pool: LiquidityPool) -> None:
-        ...
+    def save_liquidity_pool(self, pool: LiquidityPool) -> None: ...
 
     @abstractmethod
-    def get_liquidity_pool(self, symbol: str) -> Optional[LiquidityPool]:
-        ...
+    def get_liquidity_pool(self, symbol: str) -> Optional[LiquidityPool]: ...

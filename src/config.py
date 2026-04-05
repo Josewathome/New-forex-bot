@@ -194,3 +194,69 @@ SYMBOL_CURRENCIES: dict[str, list[str]] = {
     "USDJPY": ["USD", "JPY"],
     "AUDUSD": ["AUD", "USD"],
 }
+
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PASTE THESE LINES INTO config.py
+#  Place them after the ATR_COST_THRESHOLD line.
+# ══════════════════════════════════════════════════════════════════
+
+# ── Trade Monitor ──────────────────────────────────────────────────────────────
+
+# Master switch — False disables all monitor checks entirely.
+MONITOR_ENABLED             = True
+
+# When False: record all events, change nothing (gather data mode).
+# When True:  act on signals — trail SL to swing, close on high conviction.
+# START WITH False. Run one full backtest. Read the monitor performance
+# section of the report. Only flip to True once you know the accuracy.
+MONITOR_ACT_ON_SIGNALS      = True
+
+# ── Trail SL to swing structure (NOT to entry) ─────────────────────────────────
+#
+# When the monitor trails the SL, it moves it to the most recent M5 swing
+# low (for longs) or swing high (for shorts) that sits above the original SL.
+# This gives the trade room to breathe through a normal retrace.
+#
+# A RETRACE TO A SWING LOW ≠ A REVERSAL. Only a genuine break of the swing
+# structure is treated as a stop.
+#
+# BREAKEVEN_RR_TRIGGER: how many × the SL distance the trade must be in
+# profit before the first trail is considered.
+# Default 2.0 = price must move 2× the SL distance in our favour.
+BREAKEVEN_RR_TRIGGER        = 1.5
+
+# ATR multiple subtracted below the swing low (long) / added above the
+# swing high (short) to avoid getting stopped on a wick at the exact swing.
+# 0.5 × ATR gives a half-ATR breathing gap below the swing.
+MONITOR_TRAIL_ATR_BUFFER    = 0.5
+
+# ── Conviction thresholds ─────────────────────────────────────────────────────
+#
+# The monitor needs multiple DIFFERENT signal types to agree before acting.
+# A single signal is almost always a retrace, not a reversal.
+#
+# MONITOR_TRAIL_CONVICTION:
+#   Minimum unique signal types within CONFIRM_WINDOW before trailing SL.
+#   1 = trail on any single signal (less safe)
+#   2 = trail only when 2+ different signals agree (recommended)
+MONITOR_TRAIL_CONVICTION    = 1   # Start conservative — trail on BE trigger alone
+
+# MONITOR_CLOSE_CONVICTION:
+#   Minimum unique signal types before closing the trade early.
+#   3 means: need BE trigger + opposing zone + reverse ChoCh (or stall) all
+#   firing within the confirmation window before closing.
+MONITOR_CLOSE_CONVICTION    = 3
+
+# How many M5 bars to look back when counting unique signals.
+# 3 bars = 15 minutes.  If 3 different signals fire within 15 min, act.
+MONITOR_CONFIRM_WINDOW_M5   = 3
+
+# ── Individual signal settings ────────────────────────────────────────────────
+# M5 bars without a new MFE before the stall signal fires.
+MFE_STALL_BARS              = 6    # 6 × 5 min = 30 minutes of no progress
+
+# ATR multiples before an opposing zone triggers a warning.
+# 1.0 = warn when price is within 1 full H1 ATR of the zone edge.
+OPPOSING_ZONE_WARN_ATR      = 1.0

@@ -20,7 +20,7 @@ class Direction(Enum):
 
 
 class ZoneType(Enum):
-    ORDER_BLOCK   = "order_block"
+    ORDER_BLOCK    = "order_block"
     FAIR_VALUE_GAP = "fvg"
     LIQUIDITY_POOL = "liquidity_pool"
 
@@ -33,9 +33,9 @@ class TradeStatus(Enum):
 
 
 class SignalType(Enum):
-    REJECTION_WICK     = "rejection_wick"
-    VOLUME_CONFIRM     = "volume_confirm"
-    BULLISH_ENGULFING  = "bullish_engulfing"
+    REJECTION_WICK    = "rejection_wick"
+    VOLUME_CONFIRM    = "volume_confirm"
+    BULLISH_ENGULFING = "bullish_engulfing"
 
 
 class Timeframe(Enum):
@@ -151,12 +151,12 @@ class LiquidityPool:
     Recent swing high/low acting as a magnet for price.
     Calculated from the last N H1 candles.
     """
-    symbol:          str
-    high:            float          # highest High in lookback window
-    low:             float          # lowest Low in lookback window
+    symbol:           str
+    high:             float          # highest High in lookback window
+    low:              float          # lowest Low in lookback window
     lookback_candles: int
-    created_at:      datetime
-    timeframe:       Timeframe
+    created_at:       datetime
+    timeframe:        Timeframe
 
 
 # ─────────────────────────────────────────────
@@ -179,7 +179,7 @@ class NewsEvent:
 class NoTradeWindow:
     """
     Derived from a high-impact NewsEvent.
-    Represents the ±15 min blackout period around an event.
+    Represents the ±N min blackout period around an event.
     """
     start:      datetime
     end:        datetime
@@ -200,16 +200,16 @@ class TradeSignal:
     A confirmed entry signal produced by the execution engine.
     Carries all the math needed to size and place the trade.
     """
-    symbol:         str
-    direction:      Direction
-    entry_price:    float
-    stop_loss:      float
-    take_profit:    float
-    zone:           Zone
-    signal_type:    SignalType
-    volume_ratio:   float           # rejection candle volume / avg(10) volume
-    created_at:     datetime
-    risk_reward:    float
+    symbol:       str
+    direction:    Direction
+    entry_price:  float
+    stop_loss:    float
+    take_profit:  float
+    zone:         Zone
+    signal_type:  SignalType
+    volume_ratio: float           # rejection candle volume / avg(10) volume
+    created_at:   datetime
+    risk_reward:  float
 
 
 @dataclass
@@ -217,6 +217,17 @@ class Trade:
     """
     A live or historical trade record.
     Written when an order is placed; updated on close.
+
+    NEW fields (v4 — post-trade analytics):
+        mfe_price          — raw price of Maximum Favorable Excursion
+        mfe_pips           — MFE expressed in pips from entry
+        pips_to_tp_at_mfe  — pips remaining to TP when MFE was reached
+                             (0 for winners; > 0 tells you "how close" a loser got)
+        duration_minutes   — how long the trade was open (entry → close/SL/TP)
+        reversal_zone_type — type of opposing zone (if any) at the MFE reversal point:
+                             "order_block" | "fvg" | "no_zone" | None (winners have None)
+        balance_before     — account equity before this trade was sized
+        balance_after      — account equity after PnL was applied
     """
     id:           str
     symbol:       str
@@ -227,11 +238,22 @@ class Trade:
     lot_size:     float
     status:       TradeStatus
     created_at:   datetime
-    closed_at:    Optional[datetime] = None
-    close_price:  Optional[float]   = None
-    pnl:          Optional[float]   = None
-    mt5_ticket:   Optional[int]     = None
-    commission:   float             = 0.0
-    spread_cost:  float             = 0.0
-    news_affected: bool             = False
-    slippage_pips: float            = 0.0
+
+    # ── existing optional fields ──────────────────────────────────
+    closed_at:     Optional[datetime] = None
+    close_price:   Optional[float]    = None
+    pnl:           Optional[float]    = None
+    mt5_ticket:    Optional[int]      = None
+    commission:    float              = 0.0
+    spread_cost:   float              = 0.0
+    news_affected: bool               = False
+    slippage_pips: float              = 0.0
+
+    # ── NEW: post-trade analytics (backtest only) ─────────────────
+    mfe_price:          Optional[float] = None
+    mfe_pips:           Optional[float] = None
+    pips_to_tp_at_mfe:  Optional[float] = None
+    duration_minutes:   Optional[float] = None
+    reversal_zone_type: Optional[str]   = None
+    balance_before:     Optional[float] = None
+    balance_after:      Optional[float] = None
