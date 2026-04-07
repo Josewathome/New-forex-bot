@@ -1,13 +1,5 @@
-# src/application/execution_service.py
-
 """
-execution_service.py — Phase 3 + 3.5: Entry + Open Trade Guardian  (v6 — Multi‑TP & Profit Lock)
-
-UPGRADES:
-  - Three‑level TP (TP1, TP2, runner)
-  - Profit‑lock SL after TP1 (entry + 0.3R)
-  - Immediate exit on opposing_zone (monitor priority)
-  - Faster trailing after TP1 hit
+execution_service.py — Phase 3 + 3.5: Entry + Open Trade Guardian  (v7 — Adaptive TP, Scoring, Time Exit)
 """
 from __future__ import annotations
 import logging
@@ -18,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import src.config as config
 from src.domain.entities import (
-    Direction, LiquidityPool, Timeframe, Trade, TradeSignal, TradeStatus, Zone,
+    Direction, LiquidityPool, Timeframe, Trade, TradeSignal, TradeStatus, Zone,ZoneType, Candle
 )
 from src.domain.repositories import IMarketDataRepository, ITradeRepository, IZoneRepository
 from src.domain.value_objects import BrokerCost, PipCalculator, RiskParameters
@@ -35,6 +27,11 @@ from src.application.analysis import (
     compute_tp2_price,
     get_initial_risk,
     check_min_sl_pips,
+    compute_dynamic_tp,
+    score_trade,
+    dynamic_risk,
+    is_strong_trend,
+    is_kill_zone,
 )
 from src.application.news_manager import NewsManager
 from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl
@@ -52,7 +49,7 @@ class _OpenTradeState:
     entry:           float
     original_sl:     float
     current_sl:      float
-    take_profit:     float       # TP2 — original full target (liquidity pool)
+    take_profit:     float
     tp1_price:       Optional[float]
     tp2_price:       Optional[float]
     tp1_hit:         bool = False
@@ -67,6 +64,7 @@ class _OpenTradeState:
     opposing_zones:  List = field(default_factory=list)
     recent_signals:  List = field(default_factory=list)
     sl_trailed:      bool = False
+    created_at:      Optional[datetime] = None
 
 
 class ExecutionService:
@@ -185,7 +183,41 @@ class ExecutionService:
             if open_count >= config.MAX_OPEN_TRADES:
                 continue
 
-            trade = self._build_trade(signal, broker_cost, pip_calc, tick_value, risk_pct_override=risk_pct)
+            # ── Trade Scoring ─────────────────────────────────────
+            htf_aligned = (h4_bias == zone.direction)
+            liquidity_sweep = (zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count == 0)
+            fvg_clean = (zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.size > h1_atr * 0.5)
+            strong_displacement = (signal.volume_ratio >= 1.5)
+            in_kill_zone = is_kill_zone(signal.created_at)
+
+            trade_score = score_trade(
+                htf_aligned, liquidity_sweep, fvg_clean,
+                strong_displacement, in_kill_zone
+            )
+            if trade_score < config.TRADE_SCORE_THRESHOLD:
+                logger.info("REJECTED | %s | low trade score %d < %d",
+                            symbol, trade_score, config.TRADE_SCORE_THRESHOLD)
+                continue
+
+            # ── Dynamic Risk ──────────────────────────────────────
+            risk_pct = dynamic_risk(trade_score)
+
+            # ── Dynamic TP ────────────────────────────────────────
+            baseline_atr = atr(h1_short[-50:]) if len(h1_short) >= 50 else h1_atr
+            tp1_ratio, tp2_ratio = compute_dynamic_tp(
+                signal.direction, signal.entry_price, signal.stop_loss,
+                h1_atr, baseline_atr
+            )
+            tp1_price = (signal.entry_price + tp1_ratio * abs(signal.entry_price - signal.stop_loss)
+                         if signal.direction == Direction.BULLISH
+                         else signal.entry_price - tp1_ratio * abs(signal.entry_price - signal.stop_loss))
+            tp2_price = (signal.entry_price + tp2_ratio * abs(signal.entry_price - signal.stop_loss)
+                         if signal.direction == Direction.BULLISH
+                         else signal.entry_price - tp2_ratio * abs(signal.entry_price - signal.stop_loss))
+
+            trade = self._build_trade(signal, broker_cost, pip_calc, tick_value,
+                                      risk_pct_override=risk_pct,
+                                      tp1_price=tp1_price, tp2_price=tp2_price)
             if trade is None:
                 continue
 
@@ -193,10 +225,6 @@ class ExecutionService:
             if ticket is None:
                 logger.error("Trade placement failed for %s", symbol)
                 continue
-
-            # Compute TP1 and TP2
-            tp1_price = compute_tp1_price(signal.direction, signal.entry_price, signal.stop_loss)
-            tp2_price = compute_tp2_price(signal.direction, signal.entry_price, signal.stop_loss)
 
             trade.mt5_ticket = ticket
             trade.status = TradeStatus.OPEN
@@ -216,13 +244,14 @@ class ExecutionService:
                 lot_size=trade.lot_size,
                 initial_risk=trade.initial_risk,
                 mfe_price=signal.entry_price,
+                created_at=datetime.now(tz=timezone.utc),
             )
 
             logger.info(
-                "TRADE ✓ | %s %s | grade=%s | "
+                "TRADE ✓ | %s %s | grade=%s | score=%d | "
                 "entry=%.5f SL=%.5f TP1=%.5f TP2=%.5f TP_final=%.5f | "
                 "lot=%.2f | RR=%.2f",
-                symbol, signal.direction.value, grade,
+                symbol, signal.direction.value, grade, trade_score,
                 signal.entry_price, signal.stop_loss,
                 tp1_price or 0, tp2_price or 0, signal.take_profit,
                 trade.lot_size, signal.risk_reward,
@@ -259,6 +288,7 @@ class ExecutionService:
                     lot_size=pos.lot_size,
                     initial_risk=get_initial_risk(pos.entry_price, pos.stop_loss),
                     mfe_price=pos.entry_price,
+                    created_at=pos.created_at,
                 )
 
             state = self._trade_states[ticket]
@@ -269,12 +299,16 @@ class ExecutionService:
             # Update MFE
             if state.direction == Direction.BULLISH:
                 if price > state.mfe_price:
-                    state.mfe_price = price; state.m1_no_mfe = 0; state.m5_no_mfe = 0
+                    state.mfe_price = price
+                    state.m1_no_mfe = 0
+                    state.m5_no_mfe = 0
                 else:
                     state.m1_no_mfe += 1
             else:
                 if price < state.mfe_price:
-                    state.mfe_price = price; state.m1_no_mfe = 0; state.m5_no_mfe = 0
+                    state.mfe_price = price
+                    state.m1_no_mfe = 0
+                    state.m5_no_mfe = 0
                 else:
                     state.m1_no_mfe += 1
 
@@ -298,7 +332,7 @@ class ExecutionService:
                 state.opposing_zones = monitor.scan_opposing_zones(
                     state.direction, state.entry, state.take_profit, zones)
 
-            # ── TP1 handling (partial close + profit‑lock SL) ──
+            # ── TP1 handling ──────────────────────────────────────
             if (state.tp1_price and not state.tp1_hit):
                 tp1_reached = (
                     (state.direction == Direction.BULLISH and price >= state.tp1_price) or
@@ -308,7 +342,6 @@ class ExecutionService:
                     close_pct = getattr(config, "TIERED_TP1_CLOSE_PCT", 0.50)
                     close_vol = round(state.lot_size * close_pct, 2)
                     close_vol = max(0.01, close_vol)
-
                     logger.info(
                         "TP1 HIT | %s ticket=%s | closing %.2f lots @ ~%.5f",
                         symbol, ticket, close_vol, price,
@@ -317,7 +350,6 @@ class ExecutionService:
                     if closed:
                         state.tp1_hit = True
                         state.lot_size -= close_vol
-                        # 🔥 Profit‑lock SL: move to entry + 0.3R (not just breakeven)
                         profit_lock_dist = state.initial_risk * 0.3
                         if state.direction == Direction.BULLISH:
                             new_sl = state.entry + profit_lock_dist
@@ -329,14 +361,14 @@ class ExecutionService:
                     else:
                         logger.error("Partial close failed for TP1 ticket=%s", ticket)
 
-            # ── TP2 handling (partial close again) ──
+            # ── TP2 handling ──────────────────────────────────────
             elif state.tp1_hit and not state.tp2_hit and state.tp2_price:
                 tp2_reached = (
                     (state.direction == Direction.BULLISH and price >= state.tp2_price) or
                     (state.direction == Direction.BEARISH and price <= state.tp2_price)
                 )
                 if tp2_reached:
-                    close_pct = getattr(config, "TIERED_TP2_CLOSE_PCT", 0.35)
+                    close_pct = getattr(config, "TIERED_TP2_CLOSE_PCT", 0.25)
                     close_vol = round(state.lot_size * close_pct, 2)
                     close_vol = max(0.01, close_vol)
                     logger.info(
@@ -348,7 +380,7 @@ class ExecutionService:
                         state.tp2_hit = True
                         state.lot_size -= close_vol
 
-            # ── Monitor checks (trailing & early close) ──
+            # ── Monitor checks ────────────────────────────────────
             if not m1_bars:
                 continue
 
@@ -380,12 +412,35 @@ class ExecutionService:
                             symbol, ticket, ev.signal_type, ev.timeframe_source,
                             ev.mfe_pips_at_signal, ev.pips_to_tp, ev.detail)
 
+            # ── Stall exit condition (only after TP1, not strong trend) ──
+            # Stall exit condition (only after TP1, not strong trend, and profit > min ratio)
+            stall_event = next((e for e in events if e.signal_type == "mfe_stall"), None)
+            if stall_event and getattr(config, "STALL_EXIT_REQUIRES_TP1", True):
+                current_price = self._md.get_current_price(symbol)
+                sl_dist = abs(state.entry - state.original_sl)
+                if sl_dist > 0:
+                    current_profit_ratio = abs(current_price - state.entry) / sl_dist
+                else:
+                    current_profit_ratio = 0
+                min_profit_ratio = getattr(config, "MIN_PROFIT_RATIO_TO_CLOSE", 1.5)
+                if state.tp1_hit and not self._is_strong_trend(state.m5_window, state.direction) and current_profit_ratio >= min_profit_ratio:
+                    should_close = True
+                    action = "close_now"
+                    logger.info("Stall exit after TP1, profit=%.1fR", current_profit_ratio)
+
+            # ── Time‑based exit ───────────────────────────────────
+            if state.created_at:
+                duration = (now - state.created_at).total_seconds() / 60
+                if duration > config.MAX_TRADE_DURATION_MINUTES:
+                    should_close = True
+                    action = "close_now"
+                    logger.info("Time‑based exit after %.0f minutes", duration)
+
             if action == "close_now" and should_close:
                 logger.warning("MONITOR CLOSE | %s ticket=%s | Closing early. MFE=%.1fp",
                                symbol, ticket,
                                pip_calc.price_to_pips(abs(state.mfe_price - state.entry)))
                 if self._tr.close_trade(ticket):
-                    # Optionally log trade summary here
                     self._log_trade_summary(pos, state, pip_calc)
                     del self._trade_states[ticket]
 
@@ -396,8 +451,20 @@ class ExecutionService:
                     state.current_sl = new_sl
                     state.sl_trailed = True
 
+    def _is_strong_trend(self, m5_window: List[Candle], direction: Direction) -> bool:
+        if len(m5_window) < 4:
+            return False
+        last_three = m5_window[-3:]
+        if direction == Direction.BULLISH:
+            return (last_three[0].close > last_three[0].open and
+                    last_three[1].close > last_three[0].high and
+                    last_three[2].close > last_three[1].high)
+        else:
+            return (last_three[0].close < last_three[0].open and
+                    last_three[1].close < last_three[0].low and
+                    last_three[2].close < last_three[1].low)
+
     def _log_trade_summary(self, trade: Trade, state: _OpenTradeState, pip_calc: PipCalculator) -> None:
-        """Log detailed trade performance after close."""
         if trade.initial_risk <= 0:
             return
         sl_pips = pip_calc.price_to_pips(trade.initial_risk)
@@ -429,7 +496,7 @@ class ExecutionService:
             del self._trade_states[t]
 
     def _build_trade(self, signal, broker_cost, pip_calc, tick_value,
-                     risk_pct_override=None):
+                     risk_pct_override=None, tp1_price=None, tp2_price=None):
         balance = self._tr.get_account_balance()
         if balance <= 0:
             return None
@@ -442,13 +509,19 @@ class ExecutionService:
         sl_pips = pip_calc.price_to_pips(abs(signal.entry_price - signal.stop_loss))
         lot_size = max(0.01, round(risk_params.lot_size(sl_pips, tick_value, pip_calc), 2))
 
+        # Use provided TP1/TP2 if given, else compute from signal
+        final_tp = signal.take_profit
+        if tp1_price is not None and tp2_price is not None:
+            # For live, we set TP to TP2 (full target) and handle TP1 via monitor
+            pass
+
         return Trade(
             id=          str(uuid.uuid4()),
             symbol=      signal.symbol,
             direction=   signal.direction,
             entry_price= signal.entry_price,
             stop_loss=   signal.stop_loss,
-            take_profit= signal.take_profit,
+            take_profit= final_tp,
             lot_size=    lot_size,
             status=      TradeStatus.PENDING,
             created_at=  datetime.now(tz=timezone.utc),

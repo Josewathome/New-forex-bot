@@ -1,5 +1,3 @@
-# src/application/trade_monitor.py
-
 """
 trade_monitor.py — Phase 3.5: Open Trade Guardian  (v4 — Immediate Exit on Opposing Zone)
 """
@@ -88,7 +86,7 @@ class TradeMonitor:
         left = self._pip.price_to_pips(abs(take_profit - mfe_price))
         sl_dist = abs(entry - original_sl)
 
-        # Signal 1: breakeven trigger (trail condition)
+        # Signal 1: breakeven trigger
         be_trigger = getattr(config, "BREAKEVEN_RR_TRIGGER", 1.2)
         profit_required = sl_dist * be_trigger
         in_trail_profit = (
@@ -109,7 +107,7 @@ class TradeMonitor:
             )
             events.append(ev)
 
-        # Signal 2: opposing zone approach
+        # Signal 2: opposing zone
         zone_hit = self._check_zone(direction, price, opposing_zones)
         if zone_hit:
             ev = MonitorEvent(
@@ -158,9 +156,8 @@ class TradeMonitor:
             )
             events.append(ev)
 
-        # ── Conviction and immediate exit rules ──
+        # Conviction and immediate exit
         if events and getattr(config, "MONITOR_ACT_ON_SIGNALS", False):
-            # 🔥 IMMEDIATE EXIT ON OPPOSING ZONE (no need for multiple signals)
             if any(ev.signal_type == "opposing_zone" for ev in events):
                 should_close = True
                 action = "close_now"
@@ -168,7 +165,6 @@ class TradeMonitor:
                     ev.action_taken = "closed_early"
                 return events, action, new_sl_val, should_close
 
-            # Otherwise use conviction thresholds
             now = m1_bar.time
             window_bars = getattr(config, "MONITOR_CONFIRM_WINDOW_M5", 3)
             window_cutoff = now - timedelta(minutes=window_bars * 5)
@@ -205,7 +201,6 @@ class TradeMonitor:
 
         return events, action, new_sl_val, should_close
 
-    # Legacy method kept for compatibility
     def update(self, trade_id, direction, entry, stop_loss, take_profit,
                bar, recent_m5, opposing_zones, mfe_price, bars_since_mfe_update):
         evts, act, new_sl, close = self.update_dual(

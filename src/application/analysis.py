@@ -776,6 +776,82 @@ def find_ltf_signal(
     return None
 
 
+
+# Add to src/application/analysis.py
+
+def compute_dynamic_tp(
+    direction: Direction,
+    entry: float,
+    stop_loss: float,
+    atr: float,
+    baseline_atr: float = 0.0,
+) -> tuple[float, float]:
+    """
+    Return (tp1_ratio, tp2_ratio) based on current ATR vs baseline.
+    """
+    if baseline_atr <= 0:
+        return config.TIERED_TP1_RATIO, config.TIERED_TP2_RATIO
+
+    ratio = atr / baseline_atr
+    if ratio < 0.8:
+        tp1, tp2 = 1.2, 2.2
+    elif ratio > 1.2:
+        tp1, tp2 = 1.8, 3.5
+    else:
+        tp1, tp2 = 1.5, 3.0
+    return tp1, tp2
+
+
+def score_trade(
+    htf_aligned: bool,
+    liquidity_sweep: bool,
+    fvg_clean: bool,
+    strong_displacement: bool,
+    in_kill_zone: bool,
+) -> int:
+    score = 0
+    if htf_aligned:
+        score += config.SCORE_HTF_ALIGNMENT
+    if liquidity_sweep:
+        score += config.SCORE_LIQUIDITY_SWEEP
+    if fvg_clean:
+        score += config.SCORE_CLEAN_FVG
+    if strong_displacement:
+        score += config.SCORE_STRONG_DISPLACEMENT
+    if in_kill_zone:
+        score += config.SCORE_KILL_ZONE
+    return score
+
+
+def dynamic_risk(score: int) -> float:
+    if score >= 7:
+        return config.RISK_HIGH_CONVICTION
+    elif score >= 5:
+        return config.RISK_MEDIUM_CONVICTION
+    else:
+        return config.RISK_LOW_CONVICTION
+
+
+def is_strong_trend(candles: List[Candle], direction: Direction) -> bool:
+    if len(candles) < 4:
+        return False
+    last_three = candles[-3:]
+    if direction == Direction.BULLISH:
+        return (last_three[0].close > last_three[0].open and
+                last_three[1].close > last_three[0].high and
+                last_three[2].close > last_three[1].high)
+    else:
+        return (last_three[0].close < last_three[0].open and
+                last_three[1].close < last_three[0].low and
+                last_three[2].close < last_three[1].low)
+
+
+def is_kill_zone(dt: datetime) -> bool:
+    hour = dt.hour
+    for start, end in config.KILL_ZONES.values():
+        if start <= hour < end:
+            return True
+    return False
 # ─────────────────────────────────────────────
 #  Zone Mapper
 # ─────────────────────────────────────────────

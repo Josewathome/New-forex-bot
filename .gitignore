@@ -20,3 +20,4 @@ backtest_*.txt
 *.zip
 */venv/
 /venv
+/history_backtest_reults    

@@ -1,14 +1,12 @@
 """
-diagnostics.py — Backtest Diagnostic Collector  (v5 — Monitor Metrics)
+diagnostics.py — Backtest Diagnostic Collector  (v6 — win-counter fix)
 
-NEW IN v5:
-  • record_monitor_event()  — stores every TradeMonitor signal that fired
-  • write_report() adds a MONITOR PERFORMANCE section showing:
-      - How many signals of each type fired
-      - True positive rate per type (signal fired → trade reversed)
-      - False positive rate (signal fired → trade actually won)
-      - Average MFE at signal time (were they firing early enough?)
-      - Breakeven save count (how many losses were turned into BEs)
+CHANGES vs v5:
+  • write_report(): trade outcomes table now correctly counts WIN_FULL and
+    WIN_PARTIAL instead of looking for a "WIN" key that never exists.
+    Previously the reported win rate was always 0.0% even when the equity
+    curve showed profitable trades.
+  • Loss analysis winners list also fixed to use WIN_FULL / WIN_PARTIAL.
 """
 from __future__ import annotations
 import src.config as config
@@ -17,7 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from src.application.trade_monitor import  MonitorEvent
+from src.application.trade_monitor import MonitorEvent
+
+
 class DiagnosticsCollector:
 
     def __init__(self) -> None:
@@ -49,7 +49,6 @@ class DiagnosticsCollector:
         self.trade_records: List[dict] = []
 
         # v5: monitor event records
-        # Each entry mirrors MonitorEvent fields + trade_outcome + was_correct
         self.monitor_events: List[dict] = []
 
     # ── MT5 data ─────────────────────────────────────────────────
@@ -125,10 +124,6 @@ class DiagnosticsCollector:
     # ── v5: monitor event record ──────────────────────────────────
 
     def record_monitor_event(self, event: "MonitorEvent") -> None:
-        """
-        Called once per MonitorEvent that fires during backtest simulation.
-        Stores everything needed to evaluate accuracy in write_report().
-        """
         self.monitor_events.append({
             "trade_id":          event.trade_id,
             "symbol":            event.symbol,
@@ -158,7 +153,7 @@ class DiagnosticsCollector:
 
         # ── Header ───────────────────────────────────────────────
         lines.append("═" * 70)
-        lines.append("  ZONE-REACTIVE BOT — BACKTEST DIAGNOSTIC REPORT  (v5)")
+        lines.append("  ZONE-REACTIVE BOT — BACKTEST DIAGNOSTIC REPORT  (v6)")
         lines.append("═" * 70)
         lines.append(f"  Generated : {finished_at.strftime('%Y-%m-%d %H:%M:%S UTC')}")
         lines.append(f"  Duration  : {str(duration).split('.')[0]}")
@@ -172,6 +167,7 @@ class DiagnosticsCollector:
             f"  Risk     : {config.RISK_PERCENT}%  |  MinRR: {config.MIN_RR}",
             f"  Monitor  : enabled={getattr(config,'MONITOR_ENABLED',True)}  "
             f"act={getattr(config,'MONITOR_ACT_ON_SIGNALS',False)}  "
+            f"conviction={getattr(config,'MONITOR_CLOSE_CONVICTION',3)}  "
             f"BE_trigger={getattr(config,'BREAKEVEN_RR_TRIGGER',2.0)}×SL  "
             f"stall_bars={getattr(config,'MFE_STALL_BARS',6)}",
         ]
@@ -225,22 +221,32 @@ class DiagnosticsCollector:
             ]
 
         # ── Trade outcomes ────────────────────────────────────────
+        # FIX: the backtester records outcomes as "WIN_FULL" and "WIN_PARTIAL".
+        # The old code looked for "WIN" which never exists → always showed 0.
         section("Trade outcomes per symbol")
         lines.append(
-            f"  {'Symbol':<10} {'WIN':>5} {'LOSS':>5} "
+            f"  {'Symbol':<10} {'WIN_F':>6} {'WIN_P':>6} {'LOSS':>5} "
             f"{'BE':>5} {'MC':>5} {'OPEN':>5} {'TOTAL':>6}")
         hr()
-        tw=tl=tb=tm=to=tt = 0
+        twf = twp = tl = tb = tm = to = tt = 0
         for sym in all_symbols:
             out  = self.outcomes[sym]
-            w,l,b,m,o = (out.get(k,0) for k in ("WIN","LOSS","BREAKEVEN","MONITOR_CLOSE","OPEN"))
-            tot  = w+l+b+m+o
-            tw+=w; tl+=l; tb+=b; tm+=m; to+=o; tt+=tot
-            lines.append(f"  {sym:<10} {w:>5} {l:>5} {b:>5} {m:>5} {o:>5} {tot:>6}")
+            # BUG FIX: use WIN_FULL and WIN_PARTIAL, not the nonexistent "WIN"
+            wf   = out.get("WIN_FULL", 0)
+            wp   = out.get("WIN_PARTIAL", 0)
+            l, b, m, o = (out.get(k, 0) for k in ("LOSS", "BREAKEVEN", "MONITOR_CLOSE", "OPEN"))
+            tot  = wf + wp + l + b + m + o
+            twf += wf; twp += wp; tl += l; tb += b; tm += m; to += o; tt += tot
+            lines.append(
+                f"  {sym:<10} {wf:>6} {wp:>6} {l:>5} {b:>5} {m:>5} {o:>5} {tot:>6}")
         hr()
-        lines.append(f"  {'TOTAL':<10} {tw:>5} {tl:>5} {tb:>5} {tm:>5} {to:>5} {tt:>6}")
-        wr = tw/(tw+tl+tb+tm)*100 if (tw+tl+tb+tm) else 0
+        lines.append(
+            f"  {'TOTAL':<10} {twf:>6} {twp:>6} {tl:>5} {tb:>5} {tm:>5} {to:>5} {tt:>6}")
+        tw = twf + twp
+        wr = tw / (tw + tl + tb + tm) * 100 if (tw + tl + tb + tm) else 0
         lines.append(f"\n  Win rate (resolved): {wr:.1f}%")
+        lines.append(f"  WIN_FULL            : {twf}   (both TP1 and TP2 hit + runner SL)")
+        lines.append(f"  WIN_PARTIAL         : {twp}   (TP1 hit, runner closed by SL/monitor)")
         if tb or tm:
             lines.append(
                 f"  Breakeven saves   : {tb}  (losses avoided by monitor moving SL to entry)")
@@ -250,14 +256,15 @@ class DiagnosticsCollector:
         # ── Loss analysis (v4) ────────────────────────────────────
         section("Loss analysis — MFE & reversal breakdown")
         losers  = [r for r in self.trade_records if r["outcome"] == "LOSS"]
-        winners = [r for r in self.trade_records if r["outcome"] == "WIN"]
+        # FIX: include both WIN_FULL and WIN_PARTIAL in the winners list
+        winners = [r for r in self.trade_records if r["outcome"] in ("WIN_FULL", "WIN_PARTIAL")]
         if not losers:
             lines.append("  No losing trades.")
         else:
             am  = sum(r["mfe_pips"] for r in losers) / len(losers)
             al  = sum(r["pips_to_tp_at_mfe"] for r in losers) / len(losers)
             adl = sum(r["duration_minutes"] for r in losers) / len(losers)
-            adw = sum(r["duration_minutes"] for r in winners)/len(winners) if winners else 0
+            adw = sum(r["duration_minutes"] for r in winners) / len(winners) if winners else 0
             lines += [
                 f"  Losses: {len(losers)}  Winners: {len(winners)}",
                 "",
@@ -278,11 +285,11 @@ class DiagnosticsCollector:
             for r in losers:
                 rz_counts[r["reversal_zone_type"]] += 1
             for zt, cnt in sorted(rz_counts.items(), key=lambda x: -x[1]):
-                pct = cnt/len(losers)*100
+                pct = cnt / len(losers) * 100
                 lines.append(f"    {zt:<25} {cnt:>5}  ({pct:.1f}%)")
 
-        # ── Monitor performance (v5 — the new section) ────────────
-        section("Monitor performance — signal accuracy  (v5)")
+        # ── Monitor performance (v5) ──────────────────────────────
+        section("Monitor performance — signal accuracy  (v6)")
 
         if not self.monitor_events:
             lines.append("  No monitor events recorded.")
@@ -295,7 +302,7 @@ class DiagnosticsCollector:
                 "    A good signal type has high TP% and fires with meaningful MFE.\n"
             )
 
-            sig_types = ["breakeven_trigger","opposing_zone","reverse_choch","mfe_stall"]
+            sig_types = ["breakeven_trigger", "opposing_zone", "reverse_choch", "mfe_stall"]
 
             lines.append(
                 f"  {'Signal type':<24} {'Fired':>6} {'TP':>6} {'FP':>6} "
@@ -303,15 +310,15 @@ class DiagnosticsCollector:
             hr()
 
             for st in sig_types:
-                evs   = [e for e in self.monitor_events if e["signal_type"] == st]
+                evs = [e for e in self.monitor_events if e["signal_type"] == st]
                 if not evs:
                     lines.append(f"  {st:<24} {'0':>6}")
                     continue
-                tp    = sum(1 for e in evs if e["was_correct"])
-                fp    = len(evs) - tp
-                tp_pct= tp / len(evs) * 100
-                avg_m = sum(e["mfe_pips"] for e in evs) / len(evs)
-                acts  = sum(1 for e in evs if e["action_taken"] != "none")
+                tp     = sum(1 for e in evs if e["was_correct"])
+                fp     = len(evs) - tp
+                tp_pct = tp / len(evs) * 100
+                avg_m  = sum(e["mfe_pips"] for e in evs) / len(evs)
+                acts   = sum(1 for e in evs if e["action_taken"] != "none")
                 lines.append(
                     f"  {st:<24} {len(evs):>6} {tp:>6} {fp:>6} "
                     f"{tp_pct:>5.1f}% {avg_m:>7.1f}p {acts:>10}")
@@ -342,7 +349,6 @@ class DiagnosticsCollector:
                 for act, cnt in sorted(actions.items(), key=lambda x: -x[1]):
                     lines.append(f"    {act:<28} : {cnt}")
 
-                # Show 5 example events
                 lines.append("  Sample events (first 5):")
                 for e in evs[:5]:
                     lines.append(
@@ -351,13 +357,13 @@ class DiagnosticsCollector:
                         f" → {e['trade_outcome']}  ({'✓' if e['was_correct'] else '✗'})")
                 lines.append("")
 
-            # ── Breakeven saves summary ────────────────────────────
+            # ── Breakeven saves summary ───────────────────────────
             be_evs = [e for e in self.monitor_events
                       if e["action_taken"] == "moved_to_breakeven"]
             if be_evs:
                 sub(f"Breakeven saves — {len(be_evs)} trades")
                 saved  = sum(1 for e in be_evs if e["trade_outcome"] in
-                             ("BREAKEVEN","MONITOR_CLOSE"))
+                             ("BREAKEVEN", "MONITOR_CLOSE"))
                 failed = len(be_evs) - saved
                 lines += [
                     f"  SL moved to entry  : {len(be_evs)}",
@@ -404,7 +410,7 @@ class DiagnosticsCollector:
         if not warned:
             lines.append("  No warnings.")
 
-        lines += ["", "═"*70, "  END OF REPORT", "═"*70, ""]
+        lines += ["", "═" * 70, "  END OF REPORT", "═" * 70, ""]
 
         path = Path(filepath)
         path.parent.mkdir(parents=True, exist_ok=True)

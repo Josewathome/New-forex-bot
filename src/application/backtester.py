@@ -1,14 +1,13 @@
-# src/application/backtester.py (v7 with multi‑TP simulation)
+# src/application/backtester.py (v10 – MFE closure fix + conviction unlock)
 
 """
-backtester.py — Phase 4: Historical Simulation  (v7 — Multi‑TP, Profit Lock, MFE/MAE)
+backtester.py — v10: Fixes MFE/MAE closure bug, win-rate reporting, conviction gate.
 
-CHANGES:
-  - Simulates TP1 (2R, close 50%), TP2 (3.5R, close 35%), runner (15%)
-  - Profit‑lock SL after TP1 (entry + 0.3R)
-  - Tracks MFE and MAE per trade
-  - Computes profit efficiency (realized / MFE)
-  - Immediate exit on opposing_zone (monitor priority)
+CHANGES vs v9:
+  • _simulate(): meta() no longer uses frozen default args for mfe_price/mae_price.
+    The old signature `def meta(..., mfe_val=mfe_price, mae_val=mae_price)` froze
+    those values at function-definition time (= entry price), so every trade
+    reported MFE = 0.0 pips. Now reads from the enclosing scope at call time.
 """
 from __future__ import annotations
 import csv
@@ -21,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import src.config as config
 from src.domain.entities import (
     Candle, Direction, NewsEvent, NoTradeWindow,
-    Timeframe, Trade, TradeStatus, Zone,
+    Timeframe, Trade, TradeStatus, Zone, ZoneType,
 )
 from src.domain.value_objects import BrokerCost, PipCalculator, RiskParameters
 from src.application.analysis import (
@@ -37,6 +36,11 @@ from src.application.analysis import (
     compute_tp2_price,
     get_initial_risk,
     check_min_sl_pips,
+    compute_dynamic_tp,
+    score_trade,
+    dynamic_risk,
+    is_strong_trend,
+    is_kill_zone,
 )
 from src.application.diagnostics import DiagnosticsCollector
 from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl
@@ -49,7 +53,7 @@ _M5 = timedelta(minutes=5)
 @dataclass
 class BacktestResult:
     trade:              Trade
-    outcome:            str    # WIN_FULL|WIN_PARTIAL|LOSS|OPEN|MONITOR_CLOSE
+    outcome:            str
     pnl_usd:            float
     pips_gain:          float
     news_affected:      bool
@@ -71,9 +75,11 @@ class BacktestResult:
     tp2_hit:                bool = False
     mfe:                    float = 0.0
     mae:                    float = 0.0
-    efficiency:             float = 0.0   # realized_pnl / mfe (if mfe>0)
+    efficiency:             float = 0.0
     realized_pnl:           float = 0.0
     remaining_volume:       float = 0.0
+    trade_score:            int = 0
+    kill_zone:              bool = False
 
 
 class Backtester:
@@ -116,7 +122,7 @@ class Backtester:
         return all_evts
 
     def run(self, candle_data, start_date, end_date, diag=None):
-        logger.info("Backtest v7 (multi‑TP, profit lock): %s → %s", start_date, end_date)
+        logger.info("Backtest v10 (MFE fix + conviction unlock): %s → %s", start_date, end_date)
         results, equity = [], self._account
 
         if diag:
@@ -168,6 +174,7 @@ class Backtester:
                 results.append(r)
 
         self.print_summary(results, equity, start_date, end_date)
+        self.analyze_trade_features(results)
         return results
 
     def _process_h1_bar(self, symbol, h1, m5, m1, h4,
@@ -211,11 +218,11 @@ class Backtester:
         sym_min_score = config.SYMBOL_MIN_SCORE.get(symbol, config.SETUP_SCORE_THRESHOLD)
 
         for zone in zones:
-            sc = score_setup(zone.direction, h4_bias, bar_px, h4_eq)
-            if sc < sym_min_score:
+            setup_score = score_setup(zone.direction, h4_bias, bar_px, h4_eq)
+            if setup_score < sym_min_score:
                 if diag: diag.record_rejection(symbol, "below_score_threshold")
                 continue
-            grade, rpct, min_rr = grade_setup(sc)
+            grade, rpct, min_rr = grade_setup(setup_score)
 
             signal = find_m5_choch_signal(
                 m5_candles=m5_win, zone=zone, pip_calc=pip_calc,
@@ -234,15 +241,47 @@ class Backtester:
                 if diag: diag.record_rejection(symbol, "sl_too_tight")
                 continue
 
-            rp = RiskParameters(account_balance=equity, risk_percent=rpct,
+            # Trade Scoring
+            htf_aligned = (h4_bias == zone.direction)
+            liquidity_sweep = (zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count == 0)
+            fvg_clean = (zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.size > h1_atr * 0.5)
+            strong_displacement = (signal.volume_ratio >= 1.5)
+            in_kill_zone = is_kill_zone(signal.created_at)
+
+            trade_score = score_trade(
+                htf_aligned, liquidity_sweep, fvg_clean,
+                strong_displacement, in_kill_zone
+            )
+            if trade_score < config.TRADE_SCORE_THRESHOLD:
+                if diag: diag.record_rejection(symbol, "low_trade_score")
+                continue
+
+            risk_pct = dynamic_risk(trade_score)
+
+            # Dynamic TP
+            baseline_atr = atr(h1_win[-50:]) if len(h1_win) >= 50 else h1_atr
+            tp1_ratio, tp2_ratio = compute_dynamic_tp(
+                signal.direction, signal.entry_price, signal.stop_loss,
+                h1_atr, baseline_atr
+            )
+            # Override with config values
+            tp1_ratio = config.TIERED_TP1_RATIO
+            tp2_ratio = config.TIERED_TP2_RATIO
+
+            tp1_price = (signal.entry_price + tp1_ratio * abs(signal.entry_price - signal.stop_loss)
+                         if signal.direction == Direction.BULLISH
+                         else signal.entry_price - tp1_ratio * abs(signal.entry_price - signal.stop_loss))
+            tp2_price = (signal.entry_price + tp2_ratio * abs(signal.entry_price - signal.stop_loss)
+                         if signal.direction == Direction.BULLISH
+                         else signal.entry_price - tp2_ratio * abs(signal.entry_price - signal.stop_loss))
+
+            # Position size
+            rp = RiskParameters(account_balance=equity, risk_percent=risk_pct,
                                 commission_per_lot=self._commission,
                                 min_rr_ratio=min_rr,
                                 account_currency=self._currency)
             lot = max(0.01, min(round(rp.lot_size(sl_pips, tv, pip_calc), 2), 100.0))
-            ram = equity * (rpct / 100)
-
-            tp1_price = compute_tp1_price(signal.direction, signal.entry_price, signal.stop_loss)
-            tp2_price = compute_tp2_price(signal.direction, signal.entry_price, signal.stop_loss)
+            ram = equity * (risk_pct / 100)
 
             max_m1 = config.MAX_FORWARD_M1_BARS
             fm1 = [c for c in m1 if c.time >= signal.created_at][:max_m1]
@@ -256,6 +295,7 @@ class Backtester:
                 risk_amt=ram, lot_size=lot, tick_value=tv,
                 pip_calc=pip_calc, zones=zones, monitor=monitor,
                 tp1_price=tp1_price, tp2_price=tp2_price,
+                trade_score=trade_score, tp1_ratio=tp1_ratio, tp2_ratio=tp2_ratio,
             )
 
             if diag:
@@ -281,7 +321,6 @@ class Backtester:
             bb, ba = equity, equity + pnl
             tid = f"bt_{h1_idx}_{zone.id[:8]}"
 
-            # Build Trade object with new fields
             trade = Trade(
                 id=tid, symbol=signal.symbol, direction=signal.direction,
                 entry_price=signal.entry_price, stop_loss=signal.stop_loss,
@@ -307,12 +346,13 @@ class Backtester:
             )
 
             logger.info(
-                "BT | %s %s | %s | MFE=%.1f | TP1=%s TP2=%s | eff=%.1f%%",
+                "BT | %s %s | %s | MFE=%.1f | TP1=%s TP2=%s | eff=%.1f%% | score=%d",
                 symbol, signal.direction.value, outcome,
                 meta.get("mfe_pips", 0),
                 "HIT" if meta.get("tp1_hit") else ("SET" if tp1_price else "OFF"),
                 "HIT" if meta.get("tp2_hit") else ("SET" if tp2_price else "OFF"),
                 meta.get("efficiency", 0.0),
+                trade_score,
             )
 
             return BacktestResult(
@@ -340,6 +380,8 @@ class Backtester:
                 efficiency=meta.get("efficiency", 0.0),
                 realized_pnl=meta.get("realized_pnl", 0.0),
                 remaining_volume=meta.get("remaining_volume", lot),
+                trade_score=trade_score,
+                kill_zone=in_kill_zone,
             )
 
         return None
@@ -352,10 +394,10 @@ class Backtester:
         pip_calc, zones, monitor,
         tp1_price: Optional[float] = None,
         tp2_price: Optional[float] = None,
+        trade_score: int = 0,
+        tp1_ratio: float = 1.8,
+        tp2_ratio: float = 3.5,
     ):
-        """
-        Walk M1 bars, simulate multi‑TP, profit‑lock SL, monitor exits.
-        """
         use_m1 = bool(future_m1)
         bars = future_m1 if use_m1 else future_m5
         if not bars:
@@ -381,9 +423,8 @@ class Backtester:
         sl_pips = pip_calc.price_to_pips(sl_dist)
         comm = self._commission * lot_size
 
-        # TP percentages
-        tp1_pct = getattr(config, "TIERED_TP1_CLOSE_PCT", 0.50)
-        tp2_pct = getattr(config, "TIERED_TP2_CLOSE_PCT", 0.35)
+        tp1_pct = getattr(config, "TIERED_TP1_CLOSE_PCT", 0.60)
+        tp2_pct = getattr(config, "TIERED_TP2_CLOSE_PCT", 0.25)
         runner_pct = 1.0 - tp1_pct - tp2_pct
         if runner_pct < 0:
             runner_pct = 0.0
@@ -393,8 +434,8 @@ class Backtester:
         tp1_hit = False
         tp2_hit = False
         exit_reason = ""
+        start_time = bars[0].time
 
-        # M5 cursor state
         m5_idx = 0
         m5_window: List[Candle] = []
         m5_no_mfe = 0
@@ -404,31 +445,43 @@ class Backtester:
         opposing = monitor.scan_opposing_zones(
             signal.direction, entry, signal.take_profit, zones)
 
-        def ppnl(close_px, vol=remaining_vol):
-            # profit/loss in account currency for given volume
+        def ppnl(close_px, vol=lot_size):
             raw_move = abs(close_px - entry)
             pips_move = pip_calc.price_to_pips(raw_move)
             direction_mult = 1 if (is_bull and close_px > entry) or (not is_bull and close_px < entry) else -1
             return direction_mult * (pips_move / max(sl_pips, 0.001)) * risk_amt * (vol / lot_size) - comm * (vol / lot_size)
 
-        def meta(bar, rzt=None, exit_reason_str="", realized=realized_pnl, remaining=remaining_vol, mfe_val=mfe_price, mae_val=mae_price):
-            mp = pip_calc.price_to_pips(abs(mfe_val - entry))
-            lp = pip_calc.price_to_pips(abs(signal.take_profit - mfe_val))
-            dm = (bar.time - signal.created_at).total_seconds() / 60
-            efficiency = (realized / (mp * risk_amt / sl_pips)) * 100 if mp > 0 and risk_amt > 0 else 0.0
+        # ── BUG FIX: meta() no longer uses mfe_price/mae_price as frozen default
+        # arguments. In Python, default argument values are evaluated ONCE at
+        # function-definition time — so the old signature
+        #   def meta(..., mfe_val=mfe_price, mae_val=mae_price)
+        # captured mfe_price=entry and mae_price=entry permanently, making every
+        # trade report MFE = 0.0 pips regardless of how far price actually moved.
+        # The fix: remove those defaults and read the variables from the enclosing
+        # scope at the moment meta() is called.
+        def meta(bar, rzt=None, exit_reason_str="", realized=None, remaining=None):
+            _mfe      = mfe_price          # read live from enclosing scope
+            _mae      = mae_price          # read live from enclosing scope
+            _realized = realized_pnl  if realized  is None else realized
+            _remain   = remaining_vol if remaining is None else remaining
+            mp = pip_calc.price_to_pips(abs(_mfe - entry))
+            lp = pip_calc.price_to_pips(abs(signal.take_profit - _mfe))
+            dm = (bar.time - start_time).total_seconds() / 60
+            max_possible = risk_amt * tp2_ratio - comm
+            efficiency = (_realized / max_possible * 100) if max_possible > 0 else 0.0
             return {
-                "mfe_price": mfe_val, "mfe_pips": mp,
+                "mfe_price": _mfe, "mfe_pips": mp,
                 "pips_to_tp_at_mfe": lp, "closed_at": bar.time,
                 "duration_minutes": dm, "reversal_zone_type": rzt,
                 "tp1_hit": tp1_hit, "tp2_hit": tp2_hit,
-                "realized_pnl": realized, "remaining_volume": remaining,
+                "realized_pnl": _realized, "remaining_volume": _remain,
                 "exit_reason": exit_reason_str,
-                "mfe": mp, "mae": pip_calc.price_to_pips(abs(mae_val - entry)),
+                "mfe": mp, "mae": pip_calc.price_to_pips(abs(_mae - entry)),
                 "efficiency": efficiency,
             }
 
         for i, bar in enumerate(bars):
-            # Update MFE and MAE
+            # ── Update MFE / MAE ──────────────────────────────────
             if is_bull:
                 if bar.high > mfe_price:
                     mfe_price = bar.high
@@ -450,7 +503,7 @@ class Backtester:
                 if bar.high > mae_price:
                     mae_price = bar.high
 
-            # Advance M5 cursor
+            # ── M5 cursor ─────────────────────────────────────────
             new_m5 = False
             if use_m1:
                 while m5_idx < len(future_m5) and bar.time >= future_m5[m5_idx].time + _M5:
@@ -468,29 +521,23 @@ class Backtester:
                     m5_window.pop(0)
                 new_m5 = True
 
-            # ── TP1 handling ─────────────────────────────────────
+            # ── TP1 ───────────────────────────────────────────────
             if tp1_price and not tp1_hit:
                 tp1_reached = (is_bull and bar.high >= tp1_price) or (not is_bull and bar.low <= tp1_price)
                 if tp1_reached:
                     close_vol = round(remaining_vol * tp1_pct, 2)
                     close_vol = max(0.01, close_vol)
-                    # Profit from this partial close
-                    profit_partial = ppnl(tp1_price, close_vol)  # approximate using TP1 price
+                    profit_partial = ppnl(tp1_price, close_vol)
                     realized_pnl += profit_partial
                     remaining_vol -= close_vol
                     tp1_hit = True
-                    # Profit‑lock SL: move to entry + 0.3R
                     profit_lock_dist = sl_dist * 0.3
                     if is_bull:
                         virtual_sl = entry + profit_lock_dist
                     else:
                         virtual_sl = entry - profit_lock_dist
-                    logger.debug(
-                        "BACKTEST TP1 | %s | closed %.2f lots, profit=%.2f, new SL=%.5f",
-                        signal.symbol, close_vol, profit_partial, virtual_sl
-                    )
 
-            # ── TP2 handling ─────────────────────────────────────
+            # ── TP2 ───────────────────────────────────────────────
             if tp1_hit and not tp2_hit and tp2_price:
                 tp2_reached = (is_bull and bar.high >= tp2_price) or (not is_bull and bar.low <= tp2_price)
                 if tp2_reached:
@@ -500,12 +547,8 @@ class Backtester:
                     realized_pnl += profit_partial
                     remaining_vol -= close_vol
                     tp2_hit = True
-                    logger.debug(
-                        "BACKTEST TP2 | %s | closed %.2f lots, profit=%.2f, remaining=%.2f",
-                        signal.symbol, close_vol, profit_partial, remaining_vol
-                    )
 
-            # ── Check SL (with profit‑lock level) ─────────────────
+            # ── SL check ──────────────────────────────────────────
             hit_sl = (is_bull and bar.low <= virtual_sl) or (not is_bull and bar.high >= virtual_sl)
             if hit_sl:
                 if remaining_vol > 0:
@@ -514,16 +557,15 @@ class Backtester:
                     remaining_vol = 0.0
                 exit_reason = "SL"
                 total_pnl = realized_pnl
-                # Determine outcome string
                 if tp1_hit and tp2_hit:
                     outcome = "WIN_FULL"
                 elif tp1_hit:
                     outcome = "WIN_PARTIAL"
                 else:
                     outcome = "LOSS"
-                return outcome, total_pnl, meta(bar, exit_reason_str=exit_reason, realized=realized_pnl, remaining=remaining_vol), all_evts
+                return outcome, total_pnl, meta(bar, exit_reason_str=exit_reason), all_evts
 
-            # ── Monitor checks (same as before but with immediate opposing_zone exit) ──
+            # ── Monitor ───────────────────────────────────────────
             if not getattr(config, "MONITOR_ENABLED", True):
                 continue
 
@@ -552,29 +594,43 @@ class Backtester:
                 recent_sigs.extend((ev.signal_type, now) for ev in evts)
                 recent_sigs = [(st, t) for st, t in recent_sigs if t >= cutoff]
 
+            # Stall exit with conditions (profit > min ratio, not strong trend)
+            stall_event = next((e for e in evts if e.signal_type == "mfe_stall"), None)
+            if stall_event and getattr(config, "STALL_EXIT_REQUIRES_TP1", True):
+                current_profit_ratio = (abs(bar.close - entry) / sl_dist) if sl_dist > 0 else 0
+                min_profit_ratio = getattr(config, "MIN_PROFIT_RATIO_TO_CLOSE", 1.5)
+                if tp1_hit and not is_strong_trend(m5_window, signal.direction) and current_profit_ratio >= min_profit_ratio:
+                    should_close = True
+                    action = "close_now"
+                    exit_reason = "stall_exit"
+
             if action == "trail_sl" and new_sl != virtual_sl:
                 virtual_sl = new_sl
-                logger.debug("BACKTEST TRAIL | %s | SL moved to %.5f", signal.symbol, virtual_sl)
+
+            # Time‑based exit
+            duration = (bar.time - start_time).total_seconds() / 60
+            if duration > config.MAX_TRADE_DURATION_MINUTES:
+                should_close = True
+                action = "close_now"
+                exit_reason = "timeout"
 
             if should_close:
-                # Close remaining volume at current bar's close
                 if remaining_vol > 0:
                     close_pnl = ppnl(bar.close, remaining_vol)
                     realized_pnl += close_pnl
                     remaining_vol = 0.0
-                exit_reason = "MONITOR_CLOSE"
+                exit_reason = exit_reason or "MONITOR_CLOSE"
                 total_pnl = realized_pnl
                 outcome = "MONITOR_CLOSE"
-                return outcome, total_pnl, meta(bar, exit_reason_str=exit_reason, realized=realized_pnl, remaining=remaining_vol), all_evts
+                return outcome, total_pnl, meta(bar, exit_reason_str=exit_reason), all_evts
 
-        # End of bars: trade still open (should not happen in backtest)
+        # End of bars
         if remaining_vol > 0:
-            # Close at last price
             close_pnl = ppnl(bars[-1].close, remaining_vol)
             realized_pnl += close_pnl
         total_pnl = realized_pnl
         outcome = "OPEN"
-        return outcome, total_pnl, meta(bars[-1], exit_reason_str="END_OF_DATA", realized=realized_pnl, remaining=remaining_vol), all_evts
+        return outcome, total_pnl, meta(bars[-1], exit_reason_str="END_OF_DATA"), all_evts
 
     def _build_windows(self, events):
         windows = []
@@ -585,6 +641,9 @@ class Backtester:
             elif impact == "medium":
                 buf = timedelta(minutes=config.MEDIUM_IMPACT_BUFFER_MINS)
             else:
+                continue
+            # Skip zero-width windows (MEDIUM_IMPACT_BUFFER_MINS = 0)
+            if buf.total_seconds() == 0:
                 continue
             windows.append(NoTradeWindow(
                 start=e.event_time - buf, end=e.event_time + buf,
@@ -604,17 +663,45 @@ class Backtester:
         res = wf + wp + los + mc
         wr = (wf + wp) / res * 100 if res else 0
         avg_eff = sum(r.efficiency for r in results if r.efficiency > 0) / max(1, len(results))
+        avg_score = sum(r.trade_score for r in results) / max(1, len(results))
 
         logger.info("═" * 65)
-        logger.info("  BACKTEST v7 (multi‑TP, profit lock)  %s → %s", start_date, end_date)
+        logger.info("  BACKTEST v10  %s → %s", start_date, end_date)
         logger.info("  WIN_FULL=%d  WIN_PARTIAL=%d  LOSS=%d  MC=%d  OPEN=%d",
                     wf, wp, los, mc, opn)
         logger.info("  Win rate (W_FULL+W_PARTIAL): %.1f%%  |  total resolved: %d", wr, res)
         logger.info("  Equity: %.0f %s  |  P&L: %+.0f", final_eq, self._currency, final_eq - self._account)
         logger.info("  Avg profit efficiency: %.1f%%", avg_eff)
+        logger.info("  Avg trade score: %.1f", avg_score)
         logger.info("  TP1 hit: %d / %d trades (%.0f%%)",
                     sum(1 for r in results if r.tp1_hit), len(results),
                     sum(1 for r in results if r.tp1_hit) / len(results) * 100 if results else 0)
+        logger.info("═" * 65)
+
+    def analyze_trade_features(self, results):
+        if not results:
+            return
+        score_groups = {}
+        kill_zone_groups = {True: [], False: []}
+        for r in results:
+            score = r.trade_score
+            if score not in score_groups:
+                score_groups[score] = []
+            score_groups[score].append(r.pnl_usd)
+            kill_zone_groups[r.kill_zone].append(r.pnl_usd)
+
+        logger.info("═" * 65)
+        logger.info("SELF‑LEARNING FEEDBACK")
+        logger.info("Profit by trade score:")
+        for score in sorted(score_groups.keys()):
+            pnls = score_groups[score]
+            avg = sum(pnls) / len(pnls)
+            logger.info("  Score %d: %d trades, avg P&L = %.0f", score, len(pnls), avg)
+        logger.info("Profit by kill zone:")
+        for kz, pnls in kill_zone_groups.items():
+            if pnls:
+                avg = sum(pnls) / len(pnls)
+                logger.info("  Kill zone %s: %d trades, avg P&L = %.0f", kz, len(pnls), avg)
         logger.info("═" * 65)
 
     def export_csv(self, results, filepath):
@@ -632,6 +719,7 @@ class Backtester:
                 "monitor_events_count","first_monitor_signal",
                 "sl_trailed","trail_sl_value","early_close",
                 "be_events_m1","zone_events_m1","choch_events_m5","stall_events_m5",
+                "trade_score","kill_zone",
             ])
             for r in results:
                 t = r.trade
@@ -658,5 +746,6 @@ class Backtester:
                     sum(1 for e in es if e.signal_type=="opposing_zone"),
                     sum(1 for e in es if e.signal_type=="reverse_choch"),
                     sum(1 for e in es if e.signal_type=="mfe_stall"),
+                    r.trade_score, r.kill_zone,
                 ])
         logger.info("CSV → %s (%d rows)", filepath, len(results))

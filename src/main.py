@@ -308,6 +308,7 @@ def run_backtest() -> None:
         end_date=   end_date,
         diag=       diag,
     )
+    bt.analyze_trade_features(results)
 
     # ── Export results ────────────────────────
     csv_path    = f"src/backtest_results/backtest_{start_date}_{end_date}.csv"

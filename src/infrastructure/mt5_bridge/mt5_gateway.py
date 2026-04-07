@@ -10,24 +10,26 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
+import os
+_mt5_host = os.environ.get("MT5_HOST", "localhost")
+_mt5_port = int(os.environ.get("MT5_PORT", 18812))
+mt5 = None
+_use_bridge = False
+MT5_AVAILABLE = False
 try:
-    import MetaTrader5 as mt5
+    if os.name == "nt":
+        import MetaTrader5 as mt5
+        _use_bridge = False
+    else:
+        from mt5linux import MetaTrader5 as _MT5Bridge
+        _use_bridge = True
+        mt5 = None
+
     MT5_AVAILABLE = True
-except ImportError:
+
+except ImportError as e:
+    print("IMPORT ERROR:", e)
     MT5_AVAILABLE = False
-    logger.warning("MetaTrader5 not available (expected on WSL — ignore).")
-
-TIMEFRAME_MAP: Dict[str, int] = {}
-if MT5_AVAILABLE:
-    TIMEFRAME_MAP = {
-        "M1":  mt5.TIMEFRAME_M1,
-        "M5":  mt5.TIMEFRAME_M5,
-        "M15": mt5.TIMEFRAME_M15,
-        "H1":  mt5.TIMEFRAME_H1,
-        "H4":  mt5.TIMEFRAME_H4,
-        "D1":  mt5.TIMEFRAME_D1,
-    }
-
 
 class MT5Gateway:
     """
@@ -44,12 +46,13 @@ class MT5Gateway:
         mt5_path: str = "",
     ) -> None:
         if not MT5_AVAILABLE:
-            raise RuntimeError("MetaTrader5 package not installed. Run on Windows.")
+            raise RuntimeError("MT5 not available (import failed). Check mt5linux or MetaTrader5 installation.")
         self.login    = login
         self.password = password
         self.server   = server
         self.mt5_path = mt5_path
         self._ready   = False
+        self.TIMEFRAME_MAP = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -60,6 +63,13 @@ class MT5Gateway:
         No path= unless explicitly set — passing path= to a running
         terminal causes -6 Authorization errors.
         """
+        global mt5
+
+        if _use_bridge and mt5 is None:
+            from mt5linux import MetaTrader5 as _MT5Bridge
+            mt5 = _MT5Bridge(host=_mt5_host, port=_mt5_port)
+
+
         import time as _time
         for attempt in range(1, retries + 1):
             logger.info("MT5 connect attempt %d/%d …", attempt, retries)
@@ -95,6 +105,15 @@ class MT5Gateway:
                 continue
 
             self._ready = True
+
+            self.TIMEFRAME_MAP = {
+                "M1":  mt5.TIMEFRAME_M1,
+                "M5":  mt5.TIMEFRAME_M5,
+                "M15": mt5.TIMEFRAME_M15,
+                "H1":  mt5.TIMEFRAME_H1,
+                "H4":  mt5.TIMEFRAME_H4,
+                "D1":  mt5.TIMEFRAME_D1,
+            }
             logger.info(
                 "MT5 connected ✓  account=%s  name=%s  balance=%.2f %s  server=%s",
                 acc.login, acc.name, acc.balance, acc.currency, acc.server,
@@ -149,9 +168,9 @@ class MT5Gateway:
     ) -> Optional[List[Dict[str, Any]]]:
         if not self._ensure_ready():
             return None
-        tf = TIMEFRAME_MAP.get(timeframe)
+        tf = self.TIMEFRAME_MAP.get(timeframe)
         if tf is None:
-            logger.error("Unknown timeframe: %s", timeframe)
+            logger.error("Unknown timeframe or MT5 not initialized: %s", timeframe)
             return None
         # Ensure symbol is in Market Watch
         if not mt5.symbol_select(symbol, True):
@@ -422,9 +441,9 @@ class MT5Gateway:
         """Fetch all candles between two UTC datetimes. No bar-count cap."""
         if not self._ensure_ready():
             return None
-        tf = TIMEFRAME_MAP.get(timeframe)
+        tf = self.TIMEFRAME_MAP.get(timeframe)
         if tf is None:
-            logger.error("Unknown timeframe: %s", timeframe)
+            logger.error("Unknown timeframe or MT5 not initialized: %s", timeframe)
             return None
         if not mt5.symbol_select(symbol, True):
             logger.error("Failed to select symbol %s", symbol)
