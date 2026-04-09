@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Zone Bot Dashboard</title>
+<style>
+  :root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3e;--accent:#6c63ff;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--text:#e2e8f0;--muted:#64748b;--font:'Inter',system-ui,sans-serif}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;min-height:100vh}
+  a{color:var(--accent);text-decoration:none}
+  /* Layout */
+  .header{background:var(--card);border-bottom:1px solid var(--border);padding:0 24px;display:flex;align-items:center;justify-content:space-between;height:56px;position:sticky;top:0;z-index:100}
+  .header-title{font-size:18px;font-weight:700;display:flex;align-items:center;gap:10px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .header-meta{color:var(--muted);font-size:12px;text-align:right}
+  .tabs{background:var(--card);border-bottom:1px solid var(--border);display:flex;padding:0 24px}
+  .tab{padding:14px 18px;cursor:pointer;border-bottom:2px solid transparent;color:var(--muted);font-weight:500;transition:.2s}
+  .tab:hover{color:var(--text)}
+  .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+  .page{display:none;padding:24px}
+  .page.active{display:block}
+  /* Cards */
+  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:16px;margin-bottom:24px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:18px}
+  .card-label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+  .card-value{font-size:26px;font-weight:700}
+  .card-value.green{color:var(--green)}
+  .card-value.red{color:var(--red)}
+  .card-value.yellow{color:var(--yellow)}
+  /* Tables */
+  .section{background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:20px;overflow:hidden}
+  .section-header{padding:14px 18px;font-weight:600;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;padding:10px 14px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);font-weight:500}
+  td{padding:10px 14px;border-bottom:1px solid #1e2132}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:rgba(255,255,255,.02)}
+  .badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600}
+  .badge-green{background:rgba(34,197,94,.15);color:var(--green)}
+  .badge-red{background:rgba(239,68,68,.15);color:var(--red)}
+  .badge-yellow{background:rgba(245,158,11,.15);color:var(--yellow)}
+  .badge-blue{background:rgba(108,99,255,.15);color:var(--accent)}
+  /* Forms */
+  .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:18px}
+  .form-group{display:flex;flex-direction:column;gap:6px}
+  label{font-size:12px;color:var(--muted);font-weight:500}
+  input,select{background:#13151f;border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:14px;width:100%;transition:.2s}
+  input:focus,select:focus{outline:none;border-color:var(--accent)}
+  .btn{padding:8px 18px;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600;transition:.2s}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-primary:hover{filter:brightness(1.15)}
+  .btn-danger{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+  .btn-danger:hover{background:rgba(239,68,68,.25)}
+  .btn-sm{padding:4px 12px;font-size:12px}
+  .form-actions{padding:0 18px 18px;display:flex;gap:10px;align-items:center}
+  .save-msg{font-size:12px;color:var(--green);opacity:0;transition:.3s}
+  .save-msg.show{opacity:1}
+  /* Pairs */
+  .pair-list{padding:18px;display:flex;flex-wrap:wrap;gap:10px}
+  .pair-chip{display:flex;align-items:center;gap:8px;background:#13151f;border:1px solid var(--border);border-radius:8px;padding:8px 14px;font-weight:600}
+  .pair-chip .remove{color:var(--muted);cursor:pointer;font-size:16px;line-height:1}
+  .pair-chip .remove:hover{color:var(--red)}
+  .add-pair-row{padding:0 18px 18px;display:flex;gap:10px}
+  .add-pair-row input{max-width:160px}
+  /* Logs */
+  .log-box{background:#0a0c12;border-top:1px solid var(--border);padding:14px 16px;height:480px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.6}
+  .log-line.INFO{color:#94a3b8}
+  .log-line.ERROR{color:var(--red)}
+  .log-line.WARNING{color:var(--yellow)}
+  .log-line.CRITICAL{color:#f97316}
+  /* Misc */
+  .empty{color:var(--muted);text-align:center;padding:32px;font-size:13px}
+  .uptime{font-size:12px;color:var(--muted)}
+  .pnl-pos{color:var(--green)}
+  .pnl-neg{color:var(--red)}
+  .spin{display:inline-block;animation:spin .7s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .toggle{position:relative;display:inline-block;width:40px;height:22px}
+  .toggle input{opacity:0;width:0;height:0}
+  .slider{position:absolute;inset:0;background:#2a2d3e;border-radius:22px;cursor:pointer;transition:.3s}
+  .slider:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.3s}
+  input:checked+.slider{background:var(--accent)}
+  input:checked+.slider:before{transform:translateX(18px)}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-title">
+    <div class="dot" id="statusDot"></div>
+    Zone Bot
+  </div>
+  <div class="header-meta">
+    <div id="serverTime">Loading...</div>
+    <div id="uptime" class="uptime"></div>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="showTab('analytics')">Analytics</div>
+  <div class="tab" onclick="showTab('pairs')">Pairs</div>
+  <div class="tab" onclick="showTab('config')">Configuration</div>
+  <div class="tab" onclick="showTab('logs')">Logs</div>
+</div>
+
+<!-- ANALYTICS -->
+<div class="page active" id="page-analytics">
+  <div class="cards" id="statCards">
+    <div class="card"><div class="card-label">Total Trades</div><div class="card-value" id="sc-total">-</div></div>
+    <div class="card"><div class="card-label">Wins</div><div class="card-value green" id="sc-wins">-</div></div>
+    <div class="card"><div class="card-label">Losses</div><div class="card-value red" id="sc-losses">-</div></div>
+    <div class="card"><div class="card-label">Win Rate</div><div class="card-value yellow" id="sc-wr">-</div></div>
+    <div class="card"><div class="card-label">Total PnL</div><div class="card-value" id="sc-pnl">-</div></div>
+    <div class="card"><div class="card-label">Avg PnL / Trade</div><div class="card-value" id="sc-avg">-</div></div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">Per-Symbol Breakdown</div>
+    <table>
+      <thead><tr><th>Symbol</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Total PnL</th><th>Avg PnL</th></tr></thead>
+      <tbody id="symTable"><tr><td colspan="7" class="empty">No closed trades yet.</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      Recent Trades
+      <span style="font-size:12px;color:var(--muted)" id="tradeCount"></span>
+    </div>
+    <table>
+      <thead><tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>Lots</th><th>Grade</th><th>Outcome</th><th>PnL</th><th>Opened</th></tr></thead>
+      <tbody id="tradeTable"><tr><td colspan="10" class="empty">No trades recorded yet.</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- PAIRS -->
+<div class="page" id="page-pairs">
+  <div class="section">
+    <div class="section-header">Active Trading Pairs</div>
+    <div class="pair-list" id="pairList"></div>
+    <div class="add-pair-row">
+      <input id="newPairInput" placeholder="e.g. NZDUSD" maxlength="10" style="text-transform:uppercase"/>
+      <button class="btn btn-primary" onclick="addPair()">+ Add Pair</button>
+    </div>
+  </div>
+  <div style="color:var(--muted);font-size:12px;padding:0 4px">
+    Changes take effect on the next trading loop cycle (~60 seconds).
+  </div>
+</div>
+
+<!-- CONFIG -->
+<div class="page" id="page-config">
+  <div class="section">
+    <div class="section-header">Risk & Execution</div>
+    <div class="form-grid">
+      <div class="form-group"><label>Risk per Trade (%)</label><input type="number" id="cfg-risk_pct" step="0.1" min="0.1" max="5"/></div>
+      <div class="form-group"><label>Min Reward:Risk Ratio</label><input type="number" id="cfg-min_rr" step="0.1" min="1"/></div>
+      <div class="form-group"><label>Max Open Trades</label><input type="number" id="cfg-max_open_trades" step="1" min="1" max="10"/></div>
+      <div class="form-group"><label>ATR Cost Threshold</label><input type="number" id="cfg-atr_cost_threshold" step="0.01" min="0.01" max="1"/></div>
+      <div class="form-group"><label>Loop Interval (seconds)</label><input type="number" id="cfg-loop_interval" step="5" min="10"/></div>
+      <div class="form-group"><label>Breakeven RR Trigger</label><input type="number" id="cfg-breakeven_rr" step="0.1" min="0.5"/></div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="saveConfig()">Save & Apply</button>
+      <span class="save-msg" id="saveMsg">Saved!</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">Take Profit Strategy</div>
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Tiered TP Enabled</label>
+        <label class="toggle"><input type="checkbox" id="cfg-tiered_tp_enabled" onchange="saveConfig()"/><span class="slider"></span></label>
+      </div>
+      <div class="form-group"><label>TP1 Ratio (×SL)</label><input type="number" id="cfg-tiered_tp1_ratio" step="0.1" min="1"/></div>
+      <div class="form-group"><label>TP2 Ratio (×SL)</label><input type="number" id="cfg-tiered_tp2_ratio" step="0.1" min="1"/></div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="saveConfig()">Save & Apply</button>
+      <span class="save-msg" id="saveMsgTP">Saved!</span>
+    </div>
+  </div>
+</div>
+
+<!-- LOGS -->
+<div class="page" id="page-logs">
+  <div class="section">
+    <div class="section-header">
+      Live Log
+      <button class="btn btn-sm btn-primary" onclick="loadLogs()">Refresh</button>
+    </div>
+    <div class="log-box" id="logBox"><div class="empty">Loading logs...</div></div>
+  </div>
+</div>
+
+<script>
+const API = '';  // same host
+
+// ── Tab navigation ─────────────────────────────────────────────
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i)=>{
+    const names = ['analytics','pairs','config','logs'];
+    t.classList.toggle('active', names[i]===name);
+  });
+  document.querySelectorAll('.page').forEach(p=>{
+    p.classList.toggle('active', p.id===`page-${name}`);
+  });
+  if(name==='logs') loadLogs();
+}
+
+// ── Status ─────────────────────────────────────────────────────
+async function loadStatus() {
+  try {
+    const r = await fetch(`${API}/api/status`);
+    const d = await r.json();
+    document.getElementById('serverTime').textContent = new Date(d.server_time).toLocaleTimeString();
+    const u = d.uptime_seconds;
+    const h = Math.floor(u/3600), m = Math.floor((u%3600)/60);
+    document.getElementById('uptime').textContent = `Uptime: ${h}h ${m}m`;
+    document.getElementById('statusDot').style.background = d.running ? 'var(--green)' : 'var(--red)';
+  } catch(e) {
+    document.getElementById('serverTime').textContent = 'Offline';
+    document.getElementById('statusDot').style.background = 'var(--red)';
+    document.getElementById('statusDot').style.boxShadow = '0 0 6px var(--red)';
+  }
+}
+
+// ── Analytics ──────────────────────────────────────────────────
+function pnlClass(v){ return v>0?'pnl-pos':v<0?'pnl-neg':''; }
+function outcomeBadge(o){
+  const m = {WIN_FULL:'badge-green',WIN_PARTIAL:'badge-green',LOSS:'badge-red',OPEN:'badge-blue',MONITOR_CLOSE:'badge-yellow'};
+  return `<span class="badge ${m[o]||'badge-blue'}">${o}</span>`;
+}
+
+async function loadStats() {
+  try {
+    const r = await fetch(`${API}/api/stats`);
+    const d = await r.json();
+    const g = d.global;
+    document.getElementById('sc-total').textContent   = g.total;
+    document.getElementById('sc-wins').textContent    = g.wins;
+    document.getElementById('sc-losses').textContent  = g.losses;
+    document.getElementById('sc-wr').textContent      = g.total ? `${g.win_rate}%` : '-';
+    const pnlEl = document.getElementById('sc-pnl');
+    pnlEl.textContent = g.total ? (g.total_pnl>=0?'+':'')+g.total_pnl : '-';
+    pnlEl.className = 'card-value '+pnlClass(g.total_pnl);
+    const avgEl = document.getElementById('sc-avg');
+    avgEl.textContent = g.total ? (g.avg_pnl>=0?'+':'')+g.avg_pnl : '-';
+    avgEl.className = 'card-value '+pnlClass(g.avg_pnl);
+
+    const tbody = document.getElementById('symTable');
+    const syms = Object.entries(d.by_symbol);
+    if(!syms.length){ tbody.innerHTML='<tr><td colspan="7" class="empty">No closed trades yet.</td></tr>'; return; }
+    tbody.innerHTML = syms.sort((a,b)=>b[1].total-a[1].total).map(([sym,s])=>`
+      <tr>
+        <td><strong>${sym}</strong></td>
+        <td>${s.total}</td>
+        <td class="pnl-pos">${s.wins}</td>
+        <td class="pnl-neg">${s.losses}</td>
+        <td>${s.win_rate}%</td>
+        <td class="${pnlClass(s.total_pnl)}">${s.total_pnl>=0?'+':''}${s.total_pnl}</td>
+        <td class="${pnlClass(s.avg_pnl)}">${s.avg_pnl>=0?'+':''}${s.avg_pnl}</td>
+      </tr>`).join('');
+  } catch(e) { console.error('stats error', e); }
+}
+
+async function loadTrades() {
+  try {
+    const r = await fetch(`${API}/api/trades?n=50`);
+    const d = await r.json();
+    const trades = d.trades || [];
+    document.getElementById('tradeCount').textContent = `${trades.length} shown`;
+    const tbody = document.getElementById('tradeTable');
+    if(!trades.length){ tbody.innerHTML='<tr><td colspan="10" class="empty">No trades recorded yet.</td></tr>'; return; }
+    tbody.innerHTML = [...trades].reverse().map(t=>{
+      const pnl = t.pnl!=null ? `<span class="${pnlClass(t.pnl)}">${t.pnl>=0?'+':''}${t.pnl}</span>` : '-';
+      const opened = t.opened_at ? new Date(t.opened_at).toLocaleString() : '-';
+      return `<tr>
+        <td><strong>${t.symbol}</strong></td>
+        <td>${t.direction}</td>
+        <td>${(+t.entry).toFixed(5)}</td>
+        <td>${(+t.sl).toFixed(5)}</td>
+        <td>${(+t.tp).toFixed(5)}</td>
+        <td>${t.lot_size}</td>
+        <td><span class="badge badge-blue">${t.grade||'?'}</span></td>
+        <td>${outcomeBadge(t.outcome)}</td>
+        <td>${pnl}</td>
+        <td>${opened}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error('trades error', e); }
+}
+
+// ── Pairs ───────────────────────────────────────────────────────
+async function loadPairs() {
+  try {
+    const r = await fetch(`${API}/api/symbols`);
+    const d = await r.json();
+    const list = document.getElementById('pairList');
+    if(!d.symbols||!d.symbols.length){ list.innerHTML='<span style="color:var(--muted)">No symbols configured.</span>'; return; }
+    list.innerHTML = d.symbols.map(s=>`
+      <div class="pair-chip">
+        <strong>${s}</strong>
+        <span class="remove" onclick="removePair('${s}')" title="Remove">&times;</span>
+      </div>`).join('');
+  } catch(e) {}
+}
+
+async function addPair() {
+  const inp = document.getElementById('newPairInput');
+  const sym = inp.value.trim().toUpperCase();
+  if(!sym){ alert('Enter a symbol first.'); return; }
+  const r = await fetch(`${API}/api/symbols`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym})});
+  const d = await r.json();
+  if(d.ok){ inp.value=''; loadPairs(); }
+  else alert(d.error||'Error');
+}
+
+async function removePair(sym) {
+  if(!confirm(`Remove ${sym} from trading?`)) return;
+  const r = await fetch(`${API}/api/symbols/${sym}`,{method:'DELETE'});
+  const d = await r.json();
+  if(d.ok) loadPairs();
+  else alert(d.error||'Error');
+}
+
+// ── Config ──────────────────────────────────────────────────────
+async function loadConfig() {
+  try {
+    const r = await fetch(`${API}/api/config`);
+    const d = await r.json();
+    const map = {
+      risk_pct:'cfg-risk_pct', min_rr:'cfg-min_rr', max_open_trades:'cfg-max_open_trades',
+      atr_cost_threshold:'cfg-atr_cost_threshold', loop_interval:'cfg-loop_interval',
+      tiered_tp1_ratio:'cfg-tiered_tp1_ratio', tiered_tp2_ratio:'cfg-tiered_tp2_ratio',
+      breakeven_rr:'cfg-breakeven_rr',
+    };
+    for(const[k,id] of Object.entries(map)){
+      const el = document.getElementById(id);
+      if(el) el.value = d[k]??'';
+    }
+    const tp = document.getElementById('cfg-tiered_tp_enabled');
+    if(tp) tp.checked = !!d.tiered_tp_enabled;
+  } catch(e) { console.error('config load error', e); }
+}
+
+async function saveConfig() {
+  const fields = {
+    risk_pct:            parseFloat(document.getElementById('cfg-risk_pct')?.value),
+    min_rr:              parseFloat(document.getElementById('cfg-min_rr')?.value),
+    max_open_trades:     parseInt(document.getElementById('cfg-max_open_trades')?.value),
+    atr_cost_threshold:  parseFloat(document.getElementById('cfg-atr_cost_threshold')?.value),
+    loop_interval:       parseInt(document.getElementById('cfg-loop_interval')?.value),
+    tiered_tp_enabled:   document.getElementById('cfg-tiered_tp_enabled')?.checked,
+    tiered_tp1_ratio:    parseFloat(document.getElementById('cfg-tiered_tp1_ratio')?.value),
+    tiered_tp2_ratio:    parseFloat(document.getElementById('cfg-tiered_tp2_ratio')?.value),
+    breakeven_rr:        parseFloat(document.getElementById('cfg-breakeven_rr')?.value),
+  };
+  try {
+    const r = await fetch(`${API}/api/config`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(fields)});
+    const d = await r.json();
+    if(d.ok){
+      ['saveMsg','saveMsgTP'].forEach(id=>{
+        const el = document.getElementById(id);
+        if(el){ el.classList.add('show'); setTimeout(()=>el.classList.remove('show'),2000); }
+      });
+    }
+  } catch(e) { alert('Error saving config: '+e); }
+}
+
+// ── Logs ────────────────────────────────────────────────────────
+async function loadLogs() {
+  try {
+    const r = await fetch(`${API}/api/logs?n=200`);
+    const d = await r.json();
+    const box = document.getElementById('logBox');
+    if(!d.lines||!d.lines.length){ box.innerHTML='<div class="empty">No log entries yet.</div>'; return; }
+    box.innerHTML = d.lines.map(line=>{
+      let cls = 'INFO';
+      if(line.includes('[ERROR]'))    cls='ERROR';
+      else if(line.includes('[WARNING]')) cls='WARNING';
+      else if(line.includes('[CRITICAL]')) cls='CRITICAL';
+      return `<div class="log-line ${cls}">${escHtml(line)}</div>`;
+    }).join('');
+    box.scrollTop = box.scrollHeight;
+  } catch(e) { document.getElementById('logBox').innerHTML='<div class="empty">Could not load logs.</div>'; }
+}
+
+function escHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ── Init ────────────────────────────────────────────────────────
+function refresh() {
+  loadStatus();
+  loadStats();
+  loadTrades();
+  loadPairs();
+}
+
+loadConfig();
+refresh();
+</script>
+</body>
+</html>

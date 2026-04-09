@@ -21,3 +21,8 @@ backtest_*.txt
 */venv/
 /venv
 /history_backtest_reults    
+
+.checkpoints
+/zones
+/text
+/logs

@@ -5,24 +5,18 @@ WINEPREFIX='/config/.wine'
 WINEDEBUG='-all'
 wine_executable="wine"
 metatrader_version="5.0.36"
-mt5server_port="18812"          # FIX 1: was 8001
 MT5_CMD_OPTIONS="${MT5_CMD_OPTIONS:-}"
 mono_url="https://dl.winehq.org/wine/wine-mono/10.3.0/wine-mono-10.3.0-x86.msi"
 python_url="https://www.python.org/ftp/python/3.9.13/python-3.9.13.exe"
 mt5setup_url="https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
 
-show_message() { echo $1; }
+show_message() { echo "$1"; }
 
 check_dependency() {
-    if ! command -v $1 &> /dev/null; then
+    if ! command -v "$1" &> /dev/null; then
         echo "$1 is not installed."
         exit 1
     fi
-}
-
-is_python_package_installed() {
-    python3 -c "import pkg_resources; exit(not pkg_resources.require('$1'))" 2>/dev/null
-    return $?
 }
 
 is_wine_python_package_installed() {
@@ -33,72 +27,104 @@ is_wine_python_package_installed() {
 check_dependency "curl"
 check_dependency "$wine_executable"
 
+# ── [1/6] Mono ────────────────────────────────────────────────────
 if [ ! -e "/config/.wine/drive_c/windows/mono" ]; then
-    show_message "[1/7] Downloading and installing Mono..."
-    curl -o /config/.wine/drive_c/mono.msi $mono_url
+    show_message "[1/6] Downloading and installing Mono..."
+    curl -o /config/.wine/drive_c/mono.msi "$mono_url"
     WINEDLLOVERRIDES=mscoree=d $wine_executable msiexec /i /config/.wine/drive_c/mono.msi /qn
-    rm /config/.wine/drive_c/mono.msi
-    show_message "[1/7] Mono installed."
+    rm -f /config/.wine/drive_c/mono.msi
+    show_message "[1/6] Mono installed."
 else
-    show_message "[1/7] Mono is already installed."
+    show_message "[1/6] Mono already installed."
 fi
 
+# ── [2/6] MetaTrader 5 ────────────────────────────────────────────
 if [ -e "$mt5file" ]; then
-    show_message "[2/7] File $mt5file already exists."
+    show_message "[2/6] MT5 already installed."
 else
-    show_message "[2/7] File $mt5file is not installed. Installing..."
+    show_message "[2/6] Installing MetaTrader 5..."
     $wine_executable reg add "HKEY_CURRENT_USER\\Software\\Wine" /v Version /t REG_SZ /d "win10" /f
-    show_message "[3/7] Downloading MT5 installer..."
-    curl -o /config/.wine/drive_c/mt5setup.exe $mt5setup_url
-    show_message "[3/7] Installing MetaTrader 5..."
-    $wine_executable "/config/.wine/drive_c/mt5setup.exe" "/auto" &
-    wait
+    curl -o /config/.wine/drive_c/mt5setup.exe "$mt5setup_url"
+    $wine_executable "/config/.wine/drive_c/mt5setup.exe" "/auto"
+    sleep 15
     rm -f /config/.wine/drive_c/mt5setup.exe
 fi
 
+# ── [3/6] Launch MT5 terminal ─────────────────────────────────────
 if [ -e "$mt5file" ]; then
-    show_message "[4/7] File $mt5file is installed. Running MT5..."
-    $wine_executable "$mt5file" $MT5_CMD_OPTIONS &
+    show_message "[3/6] Launching MT5 terminal..."
+    $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS &
+    show_message "[3/6] MT5 launched (PID $!)."
 else
-    show_message "[4/7] File $mt5file is not installed. MT5 cannot be run."
+    show_message "[3/6] ERROR: MT5 binary not found — cannot continue."
+    exit 1
 fi
 
+# ── [4/6] Wine Python ─────────────────────────────────────────────
 if ! $wine_executable python --version 2>/dev/null; then
-    show_message "[5/7] Installing Python in Wine..."
-    curl -L $python_url -o /tmp/python-installer.exe
+    show_message "[4/6] Installing Python 3.9 in Wine..."
+    curl -L "$python_url" -o /tmp/python-installer.exe
     $wine_executable /tmp/python-installer.exe /quiet InstallAllUsers=1 PrependPath=1
     rm /tmp/python-installer.exe
-    show_message "[5/7] Python installed in Wine."
+    show_message "[4/6] Python installed."
 else
-    show_message "[5/7] Python is already installed in Wine."
+    show_message "[4/6] Wine Python already installed."
 fi
 
-show_message "[6/7] Installing Python libraries"
-$wine_executable python -m pip install --upgrade --no-cache-dir pip
+# ── [5/6] MetaTrader5 Python library ─────────────────────────────
+show_message "[5/6] Checking Python packages..."
+$wine_executable python -m pip install --upgrade --no-cache-dir pip --quiet
 
-show_message "[6/7] Installing MetaTrader5 library in Windows"
 if ! is_wine_python_package_installed "MetaTrader5==$metatrader_version"; then
-    $wine_executable python -m pip install --no-cache-dir MetaTrader5==$metatrader_version
+    show_message "[5/6] Installing MetaTrader5==$metatrader_version..."
+    $wine_executable python -m pip install --no-cache-dir "MetaTrader5==$metatrader_version"
 fi
 
-show_message "[6/7] Checking and installing mt5linux library in Windows if necessary"
-if ! is_wine_python_package_installed "mt5linux"; then
-    $wine_executable python -m pip install --no-cache-dir "mt5linux>=0.1.9"
+# MetaTrader5 5.0.36 was compiled against NumPy 1.x.
+# NumPy 2.x breaks it with "_ARRAY_API not found". Force downgrade.
+show_message "[5/6] Pinning numpy<2 (MetaTrader5 5.0.36 requires NumPy 1.x)..."
+$wine_executable python -m pip install --no-cache-dir "numpy<2" --quiet
+
+
+# ── [6/6] Bot dependencies ────────────────────────────────────────
+# The bot runs inside Wine Python so ALL deps must be installed here.
+# requests + tzdata are the only non-MT5 deps in requirements.txt.
+show_message "[6/6] Installing bot dependencies in Wine Python..."
+$wine_executable python -m pip install --no-cache-dir --quiet requests tzdata flask
+
+# Auto-install anything in requirements.txt so adding a new dep
+# is as simple as adding a line there — no rebuild needed.
+if [ -f /bot/src/requirements.txt ]; then
+    show_message "[6/6] Installing src/requirements.txt in Wine Python..."
+    $wine_executable python -m pip install --no-cache-dir -r /bot/src/requirements.txt
 fi
 
-if ! is_wine_python_package_installed "python-dateutil"; then
-    show_message "[6/7] Installing python-dateutil library in Windows"
-    $wine_executable python -m pip install --no-cache-dir python-dateutil
-fi
+# ── FIRST-RUN INSTRUCTIONS ────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════════════════"
+echo "  Zone Bot — running INSIDE Wine alongside MT5"
+echo "  (direct MetaTrader5 API — zero bridge latency)"
+echo "════════════════════════════════════════════════════════"
+echo ""
+echo "  ⚠️  One-time setup (first run only):"
+echo "  1. Open http://localhost:3000 in your browser"
+echo "  2. Log in to your broker account inside MT5"
+echo "  3. Tools → Options → Expert Advisors"
+echo "     → ✅ Allow Algorithmic Trading"
+echo "  4. When ready, run:"
+echo "     docker exec mt5 touch /bot/ready_to_trade"
+echo ""
 
-show_message "[6/7] Checking and installing mt5linux library in Linux if necessary"
-if ! is_python_package_installed "mt5linux"; then
-    pip install --break-system-packages --no-cache-dir --no-deps mt5linux && \
-    pip install --break-system-packages --no-cache-dir rpyc==5.2.3 plumbum==1.7.0 numpy
-fi
+while [ ! -f /bot/ready_to_trade ]; do
+    sleep 5
+done
 
-show_message "[6/7] Checking and installing pyxdg library in Linux if necessary"
-if ! is_python_package_installed "pyxdg"; then
-    pip install --break-system-packages --no-cache-dir pyxdg
-fi
-
+# ── START BOT ─────────────────────────────────────────────────────
+# Wine reports os.name == "nt" so mt5_gateway.py uses direct
+# MetaTrader5 import — no RPyC bridge, no latency.
+echo "  🚀 Starting bot in Wine Python..."
+# PYTHONUTF8=1 forces UTF-8 everywhere.
+# Without it Wine Python defaults to cp1252 and crashes on any
+# Unicode character (e.g. the ━ box-drawing chars in main.py logs).
+cd /bot && DISPLAY=:1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
+    $wine_executable python -m src.main

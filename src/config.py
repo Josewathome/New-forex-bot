@@ -1,13 +1,22 @@
 # ══════════════════════════════════════════════════════════════════
 #  config.py  —  ALL settings live here. One file. Nothing else.
-#  Add config.py to .gitignore so your password is never uploaded.
+#
+#  Sensitive values (passwords, API keys) are read from environment
+#  variables first, falling back to the defaults below.
+#  In Docker: set them in docker-compose.yml / .env (already done).
+#  Locally:   export them in your shell, or keep the defaults for dev.
+#
+#  FIX 4: config.py previously had all credentials hardcoded.
+#  Now os.environ is checked first so docker-compose env vars take
+#  effect without touching this file.
 # ══════════════════════════════════════════════════════════════════
 
+import os
 
 # ── MT5 Account Credentials ────────────────────────────────────────
-TRADING_ID       = 57427774
-MT5_PASSWORD     = "g3YuQ%U9CU9#Pg$"
-MT5_SERVER       = "HFMarketsKE-Demo2"
+TRADING_ID       = int(os.environ.get("TRADING_ID",   57427774))
+MT5_PASSWORD     = os.environ.get("MT5_PASSWORD",     "g3YuQ%U9CU9#Pg$")
+MT5_SERVER       = os.environ.get("MT5_SERVER",       "HFMarketsKE-Demo2")
 ACCOUNT_NICKNAME = "Demojose"
 ACCOUNT_CURRENCY = "KES"
 ACCOUNT_BALANCE  = 10_000
@@ -15,10 +24,8 @@ LEVERAGE         = "1:400"
 
 MT5_PATH = ""
 
-
 # ── News API ───────────────────────────────────────────────────────
-NEWS_API_KEY = "sk-NN7QNf0uhaCs_whD0Rly2T7v1oCdTQIVqI-6d0wWH4I"
-
+NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
 
 # ── Symbols to Trade ───────────────────────────────────────────────
 SYMBOLS = ["EURUSD", "GBPUSD", "XAUUSD", "USDJPY", "AUDUSD", "USDCHF"]
@@ -133,11 +140,6 @@ SYMBOL_MIN_SCORE: dict[str, int] = {
 MONITOR_ENABLED             = True
 MONITOR_ACT_ON_SIGNALS      = True
 
-# FIX: Lowered from 3 → 2.
-# With BREAKEVEN_RR_TRIGGER at 2.5 the breakeven_trigger signal almost never
-# fires, making the maximum reachable conviction = 2 (reverse_choch + mfe_stall).
-# Both of those signals are 88-97% accurate in the last backtest report but were
-# taking ZERO actions because conviction 3 was unreachable. This unlocks them.
 MONITOR_CLOSE_CONVICTION    = 2
 
 BREAKEVEN_RR_TRIGGER        = 2.5
@@ -155,10 +157,10 @@ TIERED_TP2_RATIO         = 4.0
 TIERED_TP2_CLOSE_PCT     = 0.25
 FINAL_RUNNER_PCT         = 0.15
 
-# ── NEW: STALL EXIT RULE ──────────────────────────────────────────
+# ── STALL EXIT RULE ───────────────────────────────────────────────
 STALL_EXIT_REQUIRES_TP1 = True
 
-# ── NEW: TRADE QUALITY SCORING ────────────────────────────────────
+# ── TRADE QUALITY SCORING ─────────────────────────────────────────
 TRADE_SCORE_THRESHOLD   = 2
 SCORE_HTF_ALIGNMENT     = 2
 SCORE_LIQUIDITY_SWEEP   = 1
@@ -166,15 +168,15 @@ SCORE_CLEAN_FVG         = 1
 SCORE_STRONG_DISPLACEMENT = 1
 SCORE_KILL_ZONE         = 0
 
-# ── NEW: DYNAMIC POSITION SIZING ──────────────────────────────────
+# ── DYNAMIC POSITION SIZING ───────────────────────────────────────
 RISK_HIGH_CONVICTION    = 1.5
 RISK_MEDIUM_CONVICTION  = 1.0
 RISK_LOW_CONVICTION     = 0.5
 
-# ── NEW: TIME‑BASED EXIT ──────────────────────────────────────────
+# ── TIME‑BASED EXIT ───────────────────────────────────────────────
 MAX_TRADE_DURATION_MINUTES = 600
 
-# ── NEW: SESSION FILTER (KILL ZONES) ──────────────────────────────
+# ── SESSION FILTER (KILL ZONES) ───────────────────────────────────
 KILL_ZONES = {
     "LONDON":   (8, 11),
     "NEW_YORK": (14, 17),
@@ -188,3 +190,29 @@ MIN_SL_PIPS: dict[str, float] = {
     "USDCHF": 3.0,
 }
 MIN_SL_PIPS_DEFAULT = 3.0
+
+# ── Retention Policies ────────────────────────────────────────────
+LOG_RETENTION_DAYS   = 3
+CACHE_RETENTION_DAYS = 2
+ZONE_RETENTION_DAYS  = 5
+ZONES_DIR            = "zones"
+
+# ── Checkpoint ────────────────────────────────────────────────────
+CHECKPOINT_DIR          = ".checkpoints"
+CHECKPOINT_INTERVAL_MIN = 15       # save checkpoint every N minutes
+
+# ── Dashboard ─────────────────────────────────────────────────────
+DASHBOARD_ENABLED = True
+DASHBOARD_PORT    = 8080
+
+# ── Email / Weekly Backtest ───────────────────────────────────────
+EMAIL_ENABLED   = False            # set True + fill fields below to activate
+EMAIL_SMTP_HOST = os.environ.get("EMAIL_SMTP_HOST", "smtp.gmail.com")
+EMAIL_SMTP_PORT = int(os.environ.get("EMAIL_SMTP_PORT", 587))
+EMAIL_USER      = os.environ.get("EMAIL_USER",      "")
+EMAIL_PASSWORD  = os.environ.get("EMAIL_PASSWORD",  "")
+EMAIL_RECIPIENT = os.environ.get("EMAIL_RECIPIENT", "")
+
+WEEKLY_BACKTEST_ENABLED  = True
+WEEKLY_BACKTEST_WEEKDAY  = 5      # Saturday
+WEEKLY_BACKTEST_HOUR_UTC = 6      # 06:00 UTC
