@@ -26,3 +26,5 @@ backtest_*.txt
 /zones
 /text
 /logs
+.claude
+/.claude
