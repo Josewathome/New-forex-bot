@@ -39,7 +39,10 @@ class CheckpointService:
             tmp = self.latest.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(state, fh, indent=2, default=str)
-            tmp.rename(self.latest)
+            # replace() is atomic on all platforms including Windows.
+            # rename() raises FileExistsError on Windows if the target already exists,
+            # which means checkpoints silently stop updating after the first save.
+            tmp.replace(self.latest)
 
             # Daily dated backup
             date_str  = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")

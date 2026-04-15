@@ -14,9 +14,20 @@
 import os
 
 # ── MT5 Account Credentials ────────────────────────────────────────
-TRADING_ID       = int(os.environ.get("TRADING_ID",   57427774))
-MT5_PASSWORD     = os.environ.get("MT5_PASSWORD",     "g3YuQ%U9CU9#Pg$")
-MT5_SERVER       = os.environ.get("MT5_SERVER",       "HFMarketsKE-Demo2")
+# IMPORTANT: Set these via environment variables or docker-compose.yml.
+# No credentials should be hardcoded here — use the .env file locally.
+_trading_id_raw = os.environ.get("TRADING_ID")
+if not _trading_id_raw:
+    raise RuntimeError("TRADING_ID environment variable is not set. Set it in your .env or docker-compose.yml.")
+TRADING_ID = int(_trading_id_raw)
+
+MT5_PASSWORD = os.environ.get("MT5_PASSWORD")
+if not MT5_PASSWORD:
+    raise RuntimeError("MT5_PASSWORD environment variable is not set.")
+
+MT5_SERVER = os.environ.get("MT5_SERVER")
+if not MT5_SERVER:
+    raise RuntimeError("MT5_SERVER environment variable is not set.")
 ACCOUNT_NICKNAME = "Demojose"
 ACCOUNT_CURRENCY = "KES"
 ACCOUNT_BALANCE  = 10_000
@@ -65,6 +76,10 @@ FVG_MIN_ATR_RATIO     = 0.3
 # ── M5 ChoCh Entry Filters ────────────────────────────────────────
 MIN_DISPLACEMENT_VOLUME_RATIO = 1.1
 CANDLE_SIZE_RATIO = 1.5
+
+# ── Legacy M1 LTF Signal Filters (find_ltf_signal / backtester) ───
+REJECTION_WICK_RATIO = 0.6   # Lower wick must be >= 60% of candle range for bullish rejection
+VOLUME_RATIO_MIN     = 1.0   # Volume must be >= 1× average to count as valid rejection candle
 
 
 # ── Weighted Scoring ──────────────────────────────────────────────
@@ -162,11 +177,11 @@ STALL_EXIT_REQUIRES_TP1 = True
 
 # ── TRADE QUALITY SCORING ─────────────────────────────────────────
 TRADE_SCORE_THRESHOLD   = 2
-SCORE_HTF_ALIGNMENT     = 2
-SCORE_LIQUIDITY_SWEEP   = 1
-SCORE_CLEAN_FVG         = 1
+SCORE_HTF_ALIGNMENT       = 2   # max contribution
+SCORE_LIQUIDITY_SWEEP     = 1
+SCORE_CLEAN_FVG           = 1
 SCORE_STRONG_DISPLACEMENT = 1
-SCORE_KILL_ZONE         = 0
+SCORE_KILL_ZONE           = 1   # was 0 — enable so max possible score = 6
 
 # ── DYNAMIC POSITION SIZING ───────────────────────────────────────
 RISK_HIGH_CONVICTION    = 1.5

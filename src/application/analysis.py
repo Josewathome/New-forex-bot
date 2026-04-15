@@ -824,9 +824,12 @@ def score_trade(
 
 
 def dynamic_risk(score: int) -> float:
-    if score >= 7:
+    # Max possible score = 6 (HTF=2, sweep=1, FVG=1, displacement=1, kill_zone=1).
+    # Old thresholds (>=7, >=5) meant RISK_HIGH_CONVICTION was mathematically unreachable.
+    # New thresholds: high=6 (perfect setup), medium=4-5, low=<4.
+    if score >= 6:
         return config.RISK_HIGH_CONVICTION
-    elif score >= 5:
+    elif score >= 4:
         return config.RISK_MEDIUM_CONVICTION
     else:
         return config.RISK_LOW_CONVICTION
