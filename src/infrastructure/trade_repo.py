@@ -44,7 +44,7 @@ class MT5TradeRepository(ITradeRepository):
         logger.info("Trade closed ✓ ticket=%s @ %s", ticket, result.get("price"))
         return True
 
-    def partial_close_trade(self, ticket: int, volume: float) -> bool:
+    def partial_close_trade(self, ticket: int, volume: float, comment: str = "ZoneBot TP") -> bool:
         """
         Close `volume` lots of the position at market price.
 
@@ -53,8 +53,10 @@ class MT5TradeRepository(ITradeRepository):
         it as a partial close, leaving (original_volume - volume) lots open.
 
         If volume >= full position size, falls back to full close.
+        Pass ``comment`` to label the close in the MT5 trade history correctly
+        (e.g. "ZoneBot TP1" vs "ZoneBot TP2").
         """
-        result = self._gw.partial_close_position(ticket, volume)
+        result = self._gw.partial_close_position(ticket, volume, comment=comment)
         if result is None:
             logger.error("partial_close failed ticket=%s vol=%.2f", ticket, volume)
             return False

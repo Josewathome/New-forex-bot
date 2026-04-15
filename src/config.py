@@ -84,10 +84,14 @@ VOLUME_RATIO_MIN     = 1.0   # Volume must be >= 1× average to count as valid r
 
 # ── Weighted Scoring ──────────────────────────────────────────────
 SETUP_SCORE_THRESHOLD = 2
+# Risk fractions returned by grade_setup() (A+/B/C grades).
+# NOTE: execution_service overrides these with dynamic_risk() (score-based)
+# after placing the trade, so only COUNTER_TREND_MIN_RR has a hard effect
+# on live trades (it lowers the RR bar for C-grade counter-trend setups).
 SETUP_RISK_A_PLUS     = 1.0
 SETUP_RISK_B          = 0.5
 SETUP_RISK_C          = 0.25
-COUNTER_TREND_MIN_RR  = 1.5
+COUNTER_TREND_MIN_RR  = 1.5   # Min RR required for C-grade (counter-trend) setups
 
 ZONE_ATR_BUFFER_PCT = 0.15
 

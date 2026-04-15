@@ -227,7 +227,9 @@ def find_h4_bias(h4_candles: List[Candle]) -> Optional[Direction]:
         Direction.BULLISH | Direction.BEARISH | None (ranging)
     """
     lookback = config.H4_EQUILIBRIUM_LOOKBACK
-    if len(h4_candles) < lookback:
+    # Guard against None before calling len() — market_data_repo returns None
+    # (not an empty list) when MT5 has no data for a symbol/timeframe.
+    if not h4_candles or len(h4_candles) < lookback:
         return None
 
     window = h4_candles[-lookback:]
@@ -278,8 +280,11 @@ def compute_h4_equilibrium(h4_candles: List[Candle]) -> Tuple[float, float, floa
 
     Returns:
         (h4_high, h4_low, equilibrium_midpoint)
+        Returns (0.0, 0.0, 0.0) when h4_candles is None or too short.
     """
     lookback = config.H4_EQUILIBRIUM_LOOKBACK
+    if not h4_candles or len(h4_candles) < 1:
+        return 0.0, 0.0, 0.0
     window   = h4_candles[-lookback:]
     h4_high  = max(c.high for c in window)
     h4_low   = min(c.low  for c in window)

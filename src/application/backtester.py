@@ -289,8 +289,29 @@ class Backtester:
 
             monitor = TradeMonitor(pip_calc=pip_calc, atr_price=h1_atr, symbol=symbol)
 
+            # ── News slippage simulation ───────────────────────────
+            # Apply NEWS_SLIPPAGE_PIPS to the simulated entry whenever the
+            # signal fires within NEWS_BUFFER_MINUTES of a news window.
+            # This makes backtests reflect real-world fill degradation on
+            # event-adjacent setups rather than assuming perfect fills.
+            news_affected = self._near_news(signal.created_at, symbol, ntw)
+            slippage_pips = 0.0
+            sim_entry = signal.entry_price
+            if news_affected:
+                slippage_pips = getattr(config, "NEWS_SLIPPAGE_PIPS", 5.0)
+                slippage_price = pip_calc.pips_to_price(slippage_pips)
+                # Slippage works against the trade: worsens fill price
+                sim_entry = (signal.entry_price + slippage_price
+                             if signal.direction == Direction.BULLISH
+                             else signal.entry_price - slippage_price)
+                logger.debug(
+                    "BT slippage | %s | news_adjacent=True | "
+                    "entry %.5f → %.5f (+%.1f pips)",
+                    symbol, signal.entry_price, sim_entry, slippage_pips,
+                )
+
             outcome, pnl, meta, mon_evts = self._simulate(
-                signal=signal, entry=signal.entry_price,
+                signal=signal, entry=sim_entry,
                 future_m1=fm1, future_m5=fm5,
                 risk_amt=ram, lot_size=lot, tick_value=tv,
                 pip_calc=pip_calc, zones=zones, monitor=monitor,
@@ -323,12 +344,12 @@ class Backtester:
 
             trade = Trade(
                 id=tid, symbol=signal.symbol, direction=signal.direction,
-                entry_price=signal.entry_price, stop_loss=signal.stop_loss,
+                entry_price=sim_entry, stop_loss=signal.stop_loss,
                 take_profit=signal.take_profit, lot_size=lot,
                 status=TradeStatus.CLOSED, created_at=signal.created_at,
                 closed_at=meta.get("closed_at"), pnl=pnl,
                 commission=self._commission * lot,
-                news_affected=False, slippage_pips=0.0,
+                news_affected=news_affected, slippage_pips=slippage_pips,
                 mfe_price=meta.get("mfe_price"),
                 mfe_pips=meta.get("mfe_pips"),
                 pips_to_tp_at_mfe=meta.get("pips_to_tp_at_mfe"),
@@ -358,9 +379,9 @@ class Backtester:
             return BacktestResult(
                 trade=trade, outcome=outcome, pnl_usd=pnl,
                 pips_gain=pip_calc.price_to_pips(abs(
-                    signal.take_profit - signal.entry_price
-                    if outcome in ("WIN_FULL",) else signal.stop_loss - signal.entry_price)),
-                news_affected=False,
+                    signal.take_profit - sim_entry
+                    if outcome in ("WIN_FULL",) else signal.stop_loss - sim_entry)),
+                news_affected=news_affected,
                 mfe_pips=meta.get("mfe_pips", 0.0),
                 pips_to_tp_at_mfe=meta.get("pips_to_tp_at_mfe", 0.0),
                 duration_minutes=meta.get("duration_minutes", 0.0),
@@ -653,6 +674,22 @@ class Backtester:
     def _in_news(self, t, symbol, windows):
         ccy = config.SYMBOL_CURRENCIES.get(symbol, [])
         return any(w.currency in ccy and w.is_blocking(t) for w in windows)
+
+    def _near_news(self, t, symbol, windows) -> bool:
+        """
+        Return True if *t* falls within NEWS_BUFFER_MINUTES of any news window
+        boundary (i.e. the trade is news-adjacent even if not strictly blocked).
+        Used to decide whether to apply NEWS_SLIPPAGE_PIPS in the backtester.
+        """
+        buf = timedelta(minutes=getattr(config, "NEWS_BUFFER_MINUTES", 15))
+        ccy = config.SYMBOL_CURRENCIES.get(symbol, [])
+        for w in windows:
+            if w.currency not in ccy:
+                continue
+            # Widen the window by the buffer on both sides
+            if (w.start - buf) <= t <= (w.end + buf):
+                return True
+        return False
 
     def print_summary(self, results, final_eq, start_date, end_date):
         wf = sum(1 for r in results if r.outcome == "WIN_FULL")

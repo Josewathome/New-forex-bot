@@ -125,16 +125,23 @@ class ForexNewsClient(INewsRepository):
         self._cache   = cache
         self._session = requests.Session()
 
-        # Validate key is not empty / placeholder
+        # Validate key is not empty / placeholder.
+        # CRITICAL: if the key is missing the news filter is completely disabled —
+        # the bot will trade straight through NFP, FOMC, CPI and other high-impact
+        # events with no protection. Emit a CRITICAL log (visible in all log levels)
+        # so the operator cannot miss it, then mark the key empty so callers know
+        # to skip all API fetches.
         if not self._api_key or self._api_key.startswith("sk-YOUR"):
-            logger.error(
-                "NEWS_API_KEY is missing or still a placeholder.\n"
-                "  Add your real key to .env:  NEWS_API_KEY=sk-...\n"
-                "  News guardrails will be DISABLED until a valid key is set."
+            logger.critical(
+                "┌─────────────────────────────────────────────────────────────┐\n"
+                "│  NEWS GUARDIAN DISABLED — NEWS_API_KEY is missing/invalid   │\n"
+                "│  The bot will trade through ALL high-impact news events.     │\n"
+                "│  Set NEWS_API_KEY in your .env file to re-enable protection. │\n"
+                "└─────────────────────────────────────────────────────────────┘"
             )
             self._api_key = ""
         else:
-            logger.info("News API key loaded (%d chars)", len(self._api_key))
+            logger.info("News API key loaded (%d chars) — news guardian active.", len(self._api_key))
 
         self._session.headers.update(self._HEADERS)
         if self._api_key:
@@ -150,7 +157,7 @@ class ForexNewsClient(INewsRepository):
     ) -> List[NewsEvent]:
         """ForexFactory — today's events, already UTC."""
         if not self._api_key:
-            logger.warning("Skipping ForexFactory fetch — no API key.")
+            logger.warning("ForexFactory fetch skipped — NEWS_API_KEY not set. News filtering inactive.")
             return []
 
         cache_key = f"ff_{date_str}_{'_'.join(sorted(currencies))}"
@@ -218,7 +225,7 @@ class ForexNewsClient(INewsRepository):
         which splits the full range into weekly requests automatically.
         """
         if not self._api_key:
-            logger.warning("Skipping MyFxBook fetch — no API key.")
+            logger.warning("MyFxBook fetch skipped — NEWS_API_KEY not set. News filtering inactive.")
             return []
 
         cache_key = f"mfx_{start_date}_{end_date}_{'_'.join(sorted(currencies))}"
