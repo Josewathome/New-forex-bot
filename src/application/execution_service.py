@@ -350,7 +350,7 @@ class ExecutionService:
                         "TP1 HIT | %s ticket=%s | closing %.2f lots @ ~%.5f",
                         symbol, ticket, close_vol, price,
                     )
-                    closed = self._tr.partial_close_trade(ticket, close_vol)
+                    closed = self._tr.partial_close_trade(ticket, close_vol, comment="ZoneBot TP1")
                     if closed:
                         state.tp1_hit = True
                         state.lot_size -= close_vol
@@ -379,7 +379,7 @@ class ExecutionService:
                         "TP2 HIT | %s ticket=%s | closing %.2f lots @ ~%.5f",
                         symbol, ticket, close_vol, price,
                     )
-                    closed = self._tr.partial_close_trade(ticket, close_vol)
+                    closed = self._tr.partial_close_trade(ticket, close_vol, comment="ZoneBot TP2")
                     if closed:
                         state.tp2_hit = True
                         state.lot_size -= close_vol
@@ -495,7 +495,22 @@ class ExecutionService:
         if not self._trade_states:
             return
         open_tickets = {p.mt5_ticket or int(p.id) for p in self._tr.get_open_positions()}
-        stale = [t for t in self._trade_states if t not in open_tickets]
+        now = datetime.now(tz=timezone.utc)
+        # Primary prune: remove any state whose ticket is no longer open in MT5.
+        # This handles normal bot-managed closes (TP hit, monitor close, time exit).
+        #
+        # TTL prune: also evict entries older than 24 h whose ticket is gone.
+        # This catches positions closed MANUALLY in MT5 — those bypass the normal
+        # close path so their state would otherwise linger in memory indefinitely.
+        # After months of trading this dict would grow without bound.
+        _TTL = timedelta(hours=24)
+        stale = [
+            t for t, s in self._trade_states.items()
+            if t not in open_tickets or (
+                s.created_at is not None and (now - s.created_at) > _TTL
+                and t not in open_tickets
+            )
+        ]
         for t in stale:
             del self._trade_states[t]
 

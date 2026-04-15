@@ -18,6 +18,7 @@ Endpoints:
     GET  /api/logs              → last N lines of trading_bot.log
 """
 from __future__ import annotations
+import json
 import logging
 import threading
 from datetime import datetime, timezone
@@ -29,6 +30,60 @@ import src.config as config
 logger = logging.getLogger(__name__)
 
 _BOT_START_TIME = datetime.now(tz=timezone.utc)
+
+# File where dashboard config overrides are written so they survive restarts.
+_CONFIG_OVERRIDE_FILE = Path(".checkpoints/config_overrides.json")
+
+# Mapping of JSON key → (config attr name, type cast) — same as in update_config().
+# Defined at module level so both the loader and the saver share one source of truth.
+_CONFIG_MAP = {
+    "risk_pct":           ("RISK_PERCENT",          float),
+    "min_rr":             ("MIN_RR",                float),
+    "max_open_trades":    ("MAX_OPEN_TRADES",        int),
+    "atr_cost_threshold": ("ATR_COST_THRESHOLD",    float),
+    "loop_interval":      ("LOOP_INTERVAL_SECONDS", int),
+    "tiered_tp_enabled":  ("TIERED_TP_ENABLED",     bool),
+    "tiered_tp1_ratio":   ("TIERED_TP1_RATIO",      float),
+    "tiered_tp2_ratio":   ("TIERED_TP2_RATIO",      float),
+    "breakeven_rr":       ("BREAKEVEN_RR_TRIGGER",  float),
+}
+
+
+def _persist_config_overrides(changed_keys, _map) -> None:
+    """Write all current mutable config values to disk."""
+    try:
+        _CONFIG_OVERRIDE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        overrides = {}
+        for key, (attr, _) in _map.items():
+            overrides[key] = getattr(config, attr, None)
+        tmp = _CONFIG_OVERRIDE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(overrides, indent=2), encoding="utf-8")
+        tmp.replace(_CONFIG_OVERRIDE_FILE)
+        logger.info("Config overrides persisted to %s (%s changed)",
+                    _CONFIG_OVERRIDE_FILE, changed_keys)
+    except Exception as exc:
+        logger.error("Failed to persist config overrides: %s", exc)
+
+
+def load_config_overrides() -> None:
+    """
+    Apply any previously-saved dashboard config overrides to the live config module.
+    Call this once at bot startup (from main.py) BEFORE trading begins.
+    """
+    if not _CONFIG_OVERRIDE_FILE.exists():
+        return
+    try:
+        overrides = json.loads(_CONFIG_OVERRIDE_FILE.read_text(encoding="utf-8"))
+        applied = []
+        for key, (attr, cast) in _CONFIG_MAP.items():
+            if key in overrides and overrides[key] is not None:
+                setattr(config, attr, cast(overrides[key]))
+                applied.append(f"{attr}={overrides[key]}")
+        if applied:
+            logger.info("Loaded %d config overrides from disk: %s",
+                        len(applied), ", ".join(applied))
+    except Exception as exc:
+        logger.warning("Could not load config overrides (%s) — using defaults.", exc)
 
 
 class DashboardServer:
@@ -125,18 +180,7 @@ class DashboardServer:
         def update_config():
             data    = request.get_json(silent=True) or {}
             changed = []
-            _MAP = {
-                "risk_pct":           ("RISK_PERCENT",         float),
-                "min_rr":             ("MIN_RR",               float),
-                "max_open_trades":    ("MAX_OPEN_TRADES",       int),
-                "atr_cost_threshold": ("ATR_COST_THRESHOLD",   float),
-                "loop_interval":      ("LOOP_INTERVAL_SECONDS", int),
-                "tiered_tp_enabled":  ("TIERED_TP_ENABLED",    bool),
-                "tiered_tp1_ratio":   ("TIERED_TP1_RATIO",     float),
-                "tiered_tp2_ratio":   ("TIERED_TP2_RATIO",     float),
-                "breakeven_rr":       ("BREAKEVEN_RR_TRIGGER", float),
-            }
-            for key, (attr, cast) in _MAP.items():
+            for key, (attr, cast) in _CONFIG_MAP.items():
                 if key in data:
                     try:
                         setattr(config, attr, cast(data[key]))
@@ -146,6 +190,11 @@ class DashboardServer:
 
             if changed:
                 logger.info("Config updated via dashboard: %s", changed)
+                # Persist to disk so changes survive a bot restart.
+                # Previously all PATCH changes were in-memory only and
+                # lost whenever the container or process restarted.
+                _persist_config_overrides(changed, _CONFIG_MAP)
+
             return jsonify({"updated": changed, "ok": True})
 
         # ── Symbols ─────────────────────────────────────────────────

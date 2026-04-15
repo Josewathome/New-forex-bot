@@ -296,7 +296,7 @@ class MT5Gateway:
             return None
         return {"ticket": int(ticket), "retcode": int(result.retcode), "price": float(close_price)}
     
-    def partial_close_position(self, ticket: int, volume: float):
+    def partial_close_position(self, ticket: int, volume: float, comment: str = "ZoneBot TP"):
         """
         Close `volume` lots of an open position (partial close).
     
@@ -343,11 +343,11 @@ class MT5Gateway:
             "price":        float(close_price),
             "deviation":    20,
             "magic":        int(pos.magic),
-            "comment":      "ZoneBot TP1",
+            "comment":      comment,
             "type_time":    mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
-    
+
         result = mt5.order_send(request)
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             logger.error(

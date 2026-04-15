@@ -143,6 +143,14 @@ def run_live() -> None:
     if cp:
         logger.info("Resumed from checkpoint (saved_at=%s).", cp.get("saved_at"))
 
+    # Re-apply any config values changed via the dashboard before last shutdown.
+    # Must run AFTER checkpoint load and BEFORE building services that read config.
+    try:
+        from src.api.server import load_config_overrides
+        load_config_overrides()
+    except Exception as _e:
+        logger.warning("Config override load skipped: %s", _e)
+
     if getattr(config, "DASHBOARD_ENABLED", True):
         try:
             from src.api.server import DashboardServer
