@@ -3,6 +3,7 @@ execution_service.py — Phase 3 + 3.5: Entry + Open Trade Guardian  (v7 — Ada
 """
 from __future__ import annotations
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -120,7 +121,10 @@ class ExecutionService:
             return None
 
         broker_cost = self._spread.get_broker_cost(symbol)
-        h1_short    = self._md.get_candles(symbol, Timeframe.H1, 20)
+        # Fetch 100 H1 bars: 14 for ATR warmup + 50 for baseline_atr + headroom.
+        # Previously only 20 were fetched, making the >=50 baseline check always false
+        # and leaving compute_dynamic_tp() permanently locked to the static ratios.
+        h1_short    = self._md.get_candles(symbol, Timeframe.H1, 100)
         h1_atr      = atr(h1_short) if h1_short else 0.0
         digits      = self._md.get_symbol_digits(symbol)
         pip_calc    = PipCalculator(digits=digits)
@@ -340,8 +344,8 @@ class ExecutionService:
                 )
                 if tp1_reached:
                     close_pct = getattr(config, "TIERED_TP1_CLOSE_PCT", 0.50)
-                    close_vol = round(state.lot_size * close_pct, 2)
-                    close_vol = max(0.01, close_vol)
+                    # Floor to avoid closing more lots than intended (round() can overshoot)
+                    close_vol = max(0.01, math.floor(state.lot_size * close_pct * 100) / 100)
                     logger.info(
                         "TP1 HIT | %s ticket=%s | closing %.2f lots @ ~%.5f",
                         symbol, ticket, close_vol, price,
@@ -369,8 +373,8 @@ class ExecutionService:
                 )
                 if tp2_reached:
                     close_pct = getattr(config, "TIERED_TP2_CLOSE_PCT", 0.25)
-                    close_vol = round(state.lot_size * close_pct, 2)
-                    close_vol = max(0.01, close_vol)
+                    # Floor to avoid closing more lots than intended
+                    close_vol = max(0.01, math.floor(state.lot_size * close_pct * 100) / 100)
                     logger.info(
                         "TP2 HIT | %s ticket=%s | closing %.2f lots @ ~%.5f",
                         symbol, ticket, close_vol, price,
@@ -507,7 +511,9 @@ class ExecutionService:
             min_rr_ratio=self._min_rr, account_currency=self._currency,
         )
         sl_pips = pip_calc.price_to_pips(abs(signal.entry_price - signal.stop_loss))
-        lot_size = max(0.01, round(risk_params.lot_size(sl_pips, tick_value, pip_calc), 2))
+        # Floor (not round) to 2 decimal places so we never exceed the calculated risk.
+        # round() would push e.g. 0.125 → 0.13 lots, overspending by ~4%.
+        lot_size = max(0.01, math.floor(risk_params.lot_size(sl_pips, tick_value, pip_calc) * 100) / 100)
 
         # Use provided TP1/TP2 if given, else compute from signal
         final_tp = signal.take_profit
