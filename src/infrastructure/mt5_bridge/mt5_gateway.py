@@ -514,6 +514,13 @@ class MT5Gateway:
             logger.error("Failed to select symbol %s", symbol)
             return None
 
+        # MT5 Python <= 5.0.36 rejects timezone-aware datetimes with
+        # error -2 "Invalid params".  Strip tzinfo (datetimes are already UTC).
+        if start_dt.tzinfo is not None:
+            start_dt = start_dt.replace(tzinfo=None)
+        if end_dt.tzinfo is not None:
+            end_dt = end_dt.replace(tzinfo=None)
+
         rates = mt5.copy_rates_range(symbol, tf, start_dt, end_dt)
         if rates is None or len(rates) == 0:
             logger.error("copy_rates_range empty %s/%s: %s", symbol, timeframe, mt5.last_error())

@@ -120,7 +120,10 @@ MT5_SERVER=BrokerName-Server   # e.g. HFMarketsKE-Demo2
 VNC_USER=admin
 VNC_PASSWORD=changeme
 
-# Optional — leave blank to disable news filtering
+# Dashboard authentication (required to access the web UI and REST API)
+DASHBOARD_PASSWORD=choose_a_strong_password
+
+# News filtering (optional — MT5 built-in calendar is used when this is blank)
 NEWS_API_KEY=
 ```
 
@@ -147,10 +150,15 @@ Open **http://localhost:3000** in your browser. You will see the MT5 desktop run
 ### 5 — Release the bot
 
 ```bash
-docker exec -it mt5 touch /app/ready_to_trade
+docker exec mt5 touch /bot/ready_to_trade
 ```
 
 The bot's entrypoint waits for this file before starting the trading loop. This lets you verify MT5 is fully loaded before the bot connects.
+
+> **Note:** Because `.:/bot` maps your host folder into the container, this file is created at `c:\Users\hp\Desktop\forex_bot\ready_to_trade` on your machine. On any future container restart the bot will skip the wait and start immediately. Delete the file if you ever want to pause before trading on a restart:
+> ```powershell
+> Remove-Item c:\Users\hp\Desktop\forex_bot\ready_to_trade
+> ```
 
 ### 6 — Watch the startup logs
 
@@ -177,30 +185,89 @@ Go to **http://localhost:8000** for live trade analytics, configuration controls
 
 The backtester replays historical candle data through the same analysis engine used for live trading and writes a detailed text report.
 
-### Via Docker
+> **Important — Docker always requires `wine python`.**
+> The `MetaTrader5` package is installed inside Wine, not in the Linux layer of the container. Using `python` (without `wine`) will fail with `ModuleNotFoundError`. Always use the full command shown below.
+>
+> The backtest also needs a **live MT5 connection** to pull historical candle data — MT5 must be running and logged in to your broker account regardless of which scenario applies.
+
+---
+
+### Scenario A — Bot has never started yet (fresh container, first run)
+
+Follow the Quick Start steps until MT5 is installed and you are logged in (steps 1–4). Then, **before** touching `ready_to_trade`, run the backtest:
 
 ```bash
-docker exec -it mt5 python -m src.main --backtest
+# Run backtest directly — bot is not running yet
+docker exec -it --user abc mt5 bash -c "cd /bot && DISPLAY=:1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 wine python -m src.main --backtest"
 ```
 
-### Natively (Windows)
+When the backtest finishes you can start the live bot normally:
+
+```bash
+docker exec mt5 touch /bot/ready_to_trade
+```
+
+---
+
+### Scenario B — Live bot is currently running
+
+The backtest runs as a completely separate process alongside the live bot — **you do not need to stop trading**. Open a second terminal and run:
+
+```bash
+docker exec -it --user abc mt5 bash -c "cd /bot && DISPLAY=:1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 wine python -m src.main --backtest"
+```
+
+Both processes share the same MT5 connection. The live bot continues placing and managing trades while the backtest reads historical bars in the background.
+
+---
+
+### Scenario C — Bot has been running for a day and you want a backtest
+
+Same command as Scenario B — just open a new terminal while the bot is running:
+
+```bash
+docker exec -it --user abc mt5 bash -c "cd /bot && DISPLAY=:1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 wine python -m src.main --backtest"
+```
+
+If you prefer to stop the live bot first (e.g. to avoid any MT5 load during the run):
+
+```bash
+# 1. Stop the live bot process inside the container (sends SIGTERM for a clean shutdown)
+docker exec mt5 pkill -f "src.main"
+
+# 2. Run the backtest
+docker exec -it --user abc mt5 bash -c "cd /bot && DISPLAY=:1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 wine python -m src.main --backtest"
+
+# 3. Restart the container to bring the live bot back up
+docker-compose restart
+```
+
+> After `docker-compose restart` the container detects `ready_to_trade` already exists (from your first setup) and starts the live bot immediately.
+
+---
+
+### Natively (Windows — no Docker)
 
 ```bash
 python -m src.main --backtest
 ```
 
-**What happens:**
+---
+
+### What the backtest does
 
 1. Fetches H4 / H1 / M5 / M1 history from MT5 for all configured symbols.
-2. Runs the full zone-mapping → signal detection → entry → trade-management simulation.
+2. Runs the full zone-mapping → signal detection → scoring → entry → trade-management simulation.
 3. Writes a report to `src/backtest_results/backtest_YYYY-MM-DD_YYYY-MM-DD_report.txt`.
 
-**Configuring the date range** (in `src/config.py`):
+Because `.:/bot` maps your host folder into the container, the report file appears directly on your desktop under `src/backtest_results/` — no copying needed.
+
+### Configuring the date range (`src/config.py`)
 
 ```python
 BACKTEST_MONTHS_BACK = 6          # default: last 6 months
-BACKTEST_START_DATE  = ""         # override: "2024-01-01"
-BACKTEST_END_DATE    = ""         # override: "2024-06-30"
+BACKTEST_START_DATE  = ""         # override with "2024-01-01"
+BACKTEST_END_DATE    = ""         # override with "2024-06-30"
 ```
 
 Backtests also run **automatically every Saturday at 06:00 UTC** and can be emailed to you when `EMAIL_ENABLED = True` in config.
@@ -235,7 +302,7 @@ python -m src.main
 | Rebuild after code changes | `docker-compose up -d --build` |
 | Stream live logs | `docker logs -f mt5` |
 | Open a shell inside the container | `docker exec -it mt5 bash` |
-| Run backtest | `docker exec -it mt5 python -m src.main --backtest` |
+| Run backtest | `docker exec -it --user abc mt5 bash -c "cd /bot && DISPLAY=:1 PYTHONUTF8=1 wine python -m src.main --backtest"` |
 | Stop the container | `docker-compose down` |
 | Stop and erase MT5 saved session | `docker-compose down -v` |
 
@@ -290,11 +357,22 @@ Phase 1 collects candidates from all symbols, ranks by score, and executes the s
 
 ### News Filter
 
+The bot blocks new entries around high-impact economic events. Two calendar sources are supported and combined automatically:
+
+| `NEWS_API_KEY` set? | Source |
+|---|---|
+| Yes | ForexFactory (primary) **+** MT5 built-in calendar (enrichment) — events from both sources are merged and deduplicated |
+| No | MT5 built-in calendar only — broker-provided data, no external API key needed |
+
+When both sources are active, events from the same currency within a 15-minute window are deduplicated; the higher-impact classification wins.
+
 | Setting | Default | Description |
 |---|---|---|
-| `HIGH_IMPACT_BUFFER_MINS` | `30` | Pause new entries 30 min before high-impact events |
+| `HIGH_IMPACT_BUFFER_MINS` | `30` | Pause new entries 30 min before/after high-impact events |
 | `STRICT_NEWS_FILTER` | `True` | Block entry when either currency in the pair has an event |
 | `NEWS_REFRESH_INTERVAL_MINUTES` | `10` | How often to re-fetch the economic calendar |
+
+> **No API key required for basic protection.** MT5 ships an economic calendar for all connected brokers. Set `NEWS_API_KEY` only if you want ForexFactory data as a primary/richer source.
 
 ### Trade Scoring (0 – 6)
 
@@ -332,14 +410,70 @@ MAX_TRADE_DURATION_MINUTES = 600    # force-close stalled trades after 10 hours
 
 Access at **http://localhost:8000** (Docker) or **http://localhost:8080** (local).
 
+### Authentication
+
+The dashboard and all REST API endpoints are protected by JWT (JSON Web Token) authentication. On first visit, a login screen prompts for your `DASHBOARD_PASSWORD`.
+
+| Token | Lifetime | Storage |
+|---|---|---|
+| Access token | 15 minutes (configurable) | Browser `sessionStorage` — cleared on tab close |
+| Refresh token | 7 days (configurable) | Browser `localStorage` — persists across tabs |
+
+The access token is refreshed silently in the background when it expires — you will not be logged out mid-session. The refresh token is revoked on logout.
+
+**Rotating the JWT secret** (Configuration → Security tab) immediately invalidates all active sessions everywhere. Use this if you suspect a token has been compromised. You will be prompted for your password before rotation proceeds.
+
+If `DASHBOARD_PASSWORD` is not set in `.env`, a random one-time password is printed to the log at startup:
+
+```
+DASHBOARD_PASSWORD not set — auto-generated: <random-token>
+Add DASHBOARD_PASSWORD=<above> to your .env file.
+```
+
+### Dashboard tabs
+
 | Tab | What you see |
 |---|---|
 | **Analytics** | Win rate, total PnL, per-symbol breakdown table, recent trade history |
 | **Pairs** | Add or remove trading symbols — takes effect within one cycle |
-| **Configuration** | Edit risk %, R:R, TP ratios, loop interval in real time |
+| **Configuration** | Edit risk %, R:R, TP ratios, loop interval in real time; rotate JWT secret |
 | **Logs** | Colour-coded live log viewer (last 200 lines — INFO / WARN / ERROR) |
 
-The dashboard also exposes a REST API at `/api/status`, `/api/stats`, `/api/trades`, `/api/config`, and `/api/logs` for integration with external tools.
+### REST API
+
+All endpoints require `Authorization: Bearer <access_token>` except the auth endpoints themselves.
+
+**Auth (public)**
+
+| Method | Endpoint | Body | Response |
+|---|---|---|---|
+| `POST` | `/api/auth/login` | `{"password": "..."}` | `{access_token, refresh_token, expires_in}` |
+| `POST` | `/api/auth/refresh` | `{"refresh_token": "..."}` | `{access_token, expires_in}` |
+| `POST` | `/api/auth/logout` | `{"refresh_token": "..."}` | `{ok: true}` |
+| `POST` | `/api/auth/rotate-secret` | `{"password": "..."}` | `{ok: true, message}` |
+
+**Protected data endpoints**
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/status` | Bot uptime, server time, active symbols |
+| `GET` | `/api/stats` | Trade analytics — global and per-symbol |
+| `GET` | `/api/trades?n=50` | Recent trade list (last *n* trades) |
+| `GET` | `/api/config` | Current live configuration values |
+| `PATCH` | `/api/config` | Update config values without restart |
+| `GET` | `/api/symbols` | Active symbol list |
+| `POST` | `/api/symbols` | Add a symbol `{"symbol": "NZDUSD"}` |
+| `DELETE` | `/api/symbols/<SYM>` | Remove a symbol |
+| `GET` | `/api/logs?n=200` | Tail of `trading_bot.log` |
+
+**Example — fetch status with curl:**
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"password":"your_password"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/api/status
+```
 
 ---
 
@@ -366,6 +500,9 @@ zonebot/
 │   │   ├── mt5_bridge/mt5_gateway.py     # MT5 API wrapper (RPyC-aware, UTC detection)
 │   │   ├── market_data_repo.py           # Candle & tick data fetching
 │   │   ├── trade_repo.py                 # Position management with UTC correction
+│   │   ├── news_client.py                # ForexFactory + MyFxBook HTTP client
+│   │   ├── mt5_news_client.py            # MT5 built-in calendar client (no API key needed)
+│   │   ├── composite_news_client.py      # Merges + deduplicates multiple news sources
 │   │   ├── trade_journal.py              # Persistent trade history for dashboard
 │   │   ├── checkpoint_service.py         # State save/restore on restart
 │   │   ├── cleanup_service.py            # Log / cache / zone retention
@@ -387,6 +524,8 @@ zonebot/
 | Mechanism | Location | Retention | Purpose |
 |---|---|---|---|
 | Checkpoints | `.checkpoints/` | Last save | Survives restarts; resumes loop from last known state |
+| JWT secret | `.checkpoints/jwt_secret.txt` | Permanent | Signing key for dashboard auth tokens; rotatable via UI |
+| Config overrides | `.checkpoints/config_overrides.json` | Permanent | Dashboard config edits that survive restarts |
 | Zone snapshots | `zones/` | 5 days | Per-symbol timestamped zone files |
 | Trade journal | `trade_journal.json` | Permanent | Drives dashboard analytics; grows over time |
 | Logs | `logs/trading_bot.log` | 3 days | Auto-cleaned by daily CleanupService |
@@ -405,6 +544,19 @@ zonebot/
 - Confirm the current time falls within a London or New York session.
 - Look for `NEWS BLOCK` log lines — a high-impact event may be within the 30-minute buffer.
 - Verify `MAX_OPEN_TRADES` (6) and `MAX_TRADES_PER_SYMBOL` (2) limits have not been reached.
+
+### News calendar shows 0 events
+- If `NEWS_API_KEY` is blank, the bot uses MT5's built-in calendar. Check `MT5 calendar: 0 event definitions` in the logs — this means MT5 has no calendar data for your broker. Try a different broker or set `NEWS_API_KEY` for the ForexFactory source.
+- If `NEWS_API_KEY` is set but ForexFactory returns 0 events, confirm the key is valid and check for HTTP 403 errors in the log — `docker logs mt5 | grep ForexFactory`.
+
+### Dashboard login fails / "Invalid password"
+- Check that `DASHBOARD_PASSWORD` is set correctly in your `.env` file and that the container was restarted after the change.
+- If `DASHBOARD_PASSWORD` is blank, the bot auto-generates a one-time password at startup — find it in the logs: `docker logs mt5 | grep "auto-generated"`.
+- If you have forgotten the password, set a new one in `.env` and restart the container. The JWT secret in `.checkpoints/jwt_secret.txt` is unaffected and existing sessions will remain valid until they expire.
+
+### "Token expired" / constantly redirected to login
+- Access tokens last 15 minutes; the dashboard refreshes them silently using the refresh token. If silent refresh fails (e.g. the bot was restarted and the secret rotated), sign in again.
+- Extend `JWT_ACCESS_EXPIRES_MINUTES` or `JWT_REFRESH_EXPIRES_DAYS` in `.env` if you want longer sessions.
 
 ### Dashboard shows no data
 - Confirm port 8000 is not occupied: `docker logs mt5 | grep Dashboard`.

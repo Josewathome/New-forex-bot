@@ -9,6 +9,7 @@ CHANGES vs v5:
   • Loss analysis winners list also fixed to use WIN_FULL / WIN_PARTIAL.
 """
 from __future__ import annotations
+import calendar
 import src.config as config
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -253,6 +254,118 @@ class DiagnosticsCollector:
             lines.append(
                 f"  Monitor closes    : {tm}  (trades closed early by monitor)")
 
+        # ── Symbol Performance Ranking ────────────────────────────
+        section("Symbol Performance Ranking  (best → worst)")
+        lines.append(
+            f"  {'#':<3}  {'Symbol':<7} {'Trades':>7} {'Wins':>5} "
+            f"{'Loss':>5} {'MC':>5} {'Win%':>6}  "
+            f"{'Net P&L':>14}  {'Avg Win':>10}  {'Avg Loss':>10}  "
+            f"{'% of Gain':>10}  Verdict")
+        hr()
+
+        _sym_pnl: dict = defaultdict(list)
+        _sym_out: dict = defaultdict(list)
+        for _r in self.trade_records:
+            _p = _r["balance_after"] - _r["balance_before"]
+            _sym_pnl[_r["symbol"]].append(_p)
+            _sym_out[_r["symbol"]].append(_r["outcome"])
+
+        total_gain = sum(
+            _r["balance_after"] - _r["balance_before"] for _r in self.trade_records
+        )
+
+        ranked_syms = sorted(
+            _sym_pnl.keys(),
+            key=lambda s: sum(_sym_pnl[s]),
+            reverse=True,
+        )
+
+        for _rank, _sym in enumerate(ranked_syms, 1):
+            _pnls  = _sym_pnl[_sym]
+            _outs  = _sym_out[_sym]
+            _wins  = [p for p, o in zip(_pnls, _outs) if o in ("WIN_FULL", "WIN_PARTIAL")]
+            _lossp = [p for p, o in zip(_pnls, _outs) if o == "LOSS"]
+            _mcs   = [p for p, o in zip(_pnls, _outs) if o == "MONITOR_CLOSE"]
+            _res   = len(_wins) + len(_lossp) + len(_mcs)
+            _wr    = len(_wins) / _res * 100 if _res else 0
+            _tot   = sum(_pnls)
+            _aw    = sum(_wins)  / len(_wins)  if _wins  else 0
+            _al    = sum(_lossp) / len(_lossp) if _lossp else 0
+            _share = _tot / total_gain * 100 if total_gain else 0
+            if _tot > 0 and _wr >= 10:
+                _v = "✓ PROFITABLE"
+            elif _tot > 0:
+                _v = "~ MC-DRIVEN"
+            elif len(_lossp) > len(_wins) * 3:
+                _v = "✗ HEAVY LOSS"
+            else:
+                _v = "✗ LOSING"
+            lines.append(
+                f"  {_rank:<3}  {_sym:<7} {len(_pnls):>7} {len(_wins):>5} "
+                f"{len(_lossp):>5} {len(_mcs):>5} {_wr:>5.1f}%  "
+                f"{_tot:>+14,.0f}  {_aw:>+10,.0f}  {_al:>+10,.0f}  "
+                f"{_share:>+9.1f}%  {_v}")
+        hr()
+        lines.append(
+            f"  {'':52}  Total gain : {total_gain:>+14,.0f}")
+
+        # ── Per-symbol deep dive ──────────────────────────────────
+        section("Per-Symbol Deep Dive")
+        lines.append(
+            "  Scan this section to identify which symbols to keep, tune, or cut.\n")
+
+        for _sym in ranked_syms:
+            _pnls  = _sym_pnl[_sym]
+            _outs  = _sym_out[_sym]
+            _wins  = [p for p, o in zip(_pnls, _outs) if o in ("WIN_FULL", "WIN_PARTIAL")]
+            _lossp = [p for p, o in zip(_pnls, _outs) if o == "LOSS"]
+            _mcs   = [p for p, o in zip(_pnls, _outs) if o == "MONITOR_CLOSE"]
+            _res   = len(_wins) + len(_lossp) + len(_mcs)
+            _wr    = len(_wins) / _res * 100 if _res else 0
+            _tot   = sum(_pnls)
+            _share = _tot / total_gain * 100 if total_gain else 0
+            _aw    = sum(_wins)  / len(_wins)  if _wins  else 0
+            _al    = sum(_lossp) / len(_lossp) if _lossp else 0
+            _amc   = sum(_mcs)   / len(_mcs)   if _mcs   else 0
+            _best  = max(_pnls) if _pnls else 0
+            _worst = min(_pnls) if _pnls else 0
+
+            _max_streak = _cur = 0
+            for _o in _outs:
+                if _o == "LOSS":
+                    _cur += 1
+                    _max_streak = max(_max_streak, _cur)
+                else:
+                    _cur = 0
+
+            if _tot > 0 and _wr >= 15:
+                _verd = "✓ PROFITABLE — solid win rate; strategy working well on this pair"
+            elif _tot > 0 and _wr >= 5:
+                _verd = "~ MC-DRIVEN PROFIT — wins rare but monitor exits carry returns; fragile"
+            elif _tot > 0:
+                _verd = "~ MARGINAL — positive but very low win rate; review entry criteria"
+            elif _tot < 0 and _max_streak >= 5:
+                _verd = "✗ NOT BREAKING EVEN — long losing streaks; consider disabling this pair"
+            elif _tot < 0 and len(_lossp) > len(_wins) * 3:
+                _verd = "✗ NOT BREAKING EVEN — losses far outweigh wins; needs entry filter work"
+            elif _tot < 0:
+                _verd = "✗ LOSING — net drag on performance; review setup scoring thresholds"
+            else:
+                _verd = "~ FLAT — negligible contribution either way"
+
+            sub(_sym)
+            lines += [
+                f"  Trades        : {len(_pnls)}  "
+                f"(WIN_FULL+PARTIAL: {len(_wins)}  |  LOSS: {len(_lossp)}  |  MC: {len(_mcs)})",
+                f"  Win rate      : {_wr:.1f}%  (resolved trades only, excl. OPEN)",
+                f"  Net P&L       : {_tot:>+,.0f}    ({_share:+.1f}% of total backtest gain)",
+                f"  Avg win       : {_aw:>+,.0f}    |  Avg loss : {_al:>+,.0f}    |  Avg MC : {_amc:>+,.0f}",
+                f"  Best trade    : {_best:>+,.0f}    |  Worst    : {_worst:>+,.0f}",
+                f"  Max consec. losses : {_max_streak}",
+                f"",
+                f"  Verdict → {_verd}",
+            ]
+
         # ── Loss analysis (v4) ────────────────────────────────────
         section("Loss analysis — MFE & reversal breakdown")
         losers  = [r for r in self.trade_records if r["outcome"] == "LOSS"]
@@ -377,19 +490,81 @@ class DiagnosticsCollector:
                     "    Consider raising BREAKEVEN_RR_TRIGGER if false-save rate is high.",
                 ]
 
-        # ── Equity curve ──────────────────────────────────────────
-        sub("Equity curve (all trades in order)")
+        # ── Monthly performance ────────────────────────────────────
+        # Group trade_records into calendar months using opened_at timestamp
+        _monthly: dict = {}
+        for _r in self.trade_records:
+            try:
+                _dt = datetime.fromisoformat(_r["opened_at"]) if _r["opened_at"] else None
+            except Exception:
+                _dt = None
+            _key = (_dt.year, _dt.month) if _dt else (9999, 99)
+            if _key not in _monthly:
+                _monthly[_key] = []
+            _monthly[_key].append(_r)
+
+        sub("Monthly performance summary")
+        lines.append(
+            f"  {'Month':<22} {'Trades':>7} {'W':>4} {'L':>5} {'MC':>5}  "
+            f"{'Month P&L':>14}  {'Eq Start':>13}  {'Eq End':>13}  {'Chg%':>8}")
+        hr()
+        _mnum = 0
+        for (_yr, _mo), _recs in _monthly.items():
+            _mnum += 1
+            if _yr == 9999:
+                _mlabel = f"Month {_mnum}: Unknown"
+            else:
+                _mlabel = f"Month {_mnum}: {calendar.month_abbr[_mo]} {_yr}"
+            _mw   = sum(1 for _r in _recs if _r["outcome"] in ("WIN_FULL", "WIN_PARTIAL"))
+            _ml   = sum(1 for _r in _recs if _r["outcome"] == "LOSS")
+            _mmc  = sum(1 for _r in _recs if _r["outcome"] == "MONITOR_CLOSE")
+            _mpnl = sum(_r["balance_after"] - _r["balance_before"] for _r in _recs)
+            _eqs  = _recs[0]["balance_before"]
+            _eqe  = _recs[-1]["balance_after"]
+            _cpct = (_eqe - _eqs) / _eqs * 100 if _eqs else 0
+            lines.append(
+                f"  {_mlabel:<22} {len(_recs):>7} {_mw:>4} {_ml:>5} {_mmc:>5}  "
+                f"{_mpnl:>+14,.0f}  {_eqs:>13,.0f}  {_eqe:>13,.0f}  "
+                f"{_cpct:>+7.1f}%")
+        hr()
+
+        # ── Equity curve (grouped by month) ───────────────────────
+        sub("Equity curve (grouped by month)")
         lines.append(
             f"  {'#':>4}  {'Symbol':<10} {'Outcome':<14}  "
             f"{'Before':>10}  {'After':>10}  {'Change':>10}")
-        hr()
-        for i, r in enumerate(self.trade_records, 1):
-            chg  = r["balance_after"] - r["balance_before"]
-            sign = "+" if chg >= 0 else ""
+
+        _tnum = 0
+        _mnum = 0
+        for (_yr, _mo), _recs in _monthly.items():
+            _mnum += 1
+            if _yr == 9999:
+                _mlabel = f"Month {_mnum}: Unknown"
+            else:
+                _mlabel = f"Month {_mnum}: {calendar.month_abbr[_mo]} {_yr}"
+            _mw   = sum(1 for _r in _recs if _r["outcome"] in ("WIN_FULL", "WIN_PARTIAL"))
+            _ml   = sum(1 for _r in _recs if _r["outcome"] == "LOSS")
+            _mmc  = sum(1 for _r in _recs if _r["outcome"] == "MONITOR_CLOSE")
+            _mpnl = sum(_r["balance_after"] - _r["balance_before"] for _r in _recs)
+            _eqs  = _recs[0]["balance_before"]
+            _eqe  = _recs[-1]["balance_after"]
+            _cpct = (_eqe - _eqs) / _eqs * 100 if _eqs else 0
+            _msign = "+" if _mpnl >= 0 else ""
+            lines.append("")
             lines.append(
-                f"  {i:>4}  {r['symbol']:<10} {r['outcome']:<14}  "
-                f"{r['balance_before']:>10,.0f}  {r['balance_after']:>10,.0f}  "
-                f"{sign}{chg:>10,.0f}")
+                f"  ── {_mlabel}  "
+                f"[trades={len(_recs)} | W={_mw} L={_ml} MC={_mmc} | "
+                f"P&L={_msign}{_mpnl:,.0f} | "
+                f"Equity {_eqs:,.0f} → {_eqe:,.0f} ({_cpct:+.1f}%)]")
+            hr()
+            for _r in _recs:
+                _tnum += 1
+                _chg  = _r["balance_after"] - _r["balance_before"]
+                _sign = "+" if _chg >= 0 else ""
+                lines.append(
+                    f"  {_tnum:>4}  {_r['symbol']:<10} {_r['outcome']:<14}  "
+                    f"{_r['balance_before']:>10,.0f}  {_r['balance_after']:>10,.0f}  "
+                    f"{_sign}{_chg:>10,.0f}")
 
         # ── Warnings ─────────────────────────────────────────────
         section("Warnings & flags")

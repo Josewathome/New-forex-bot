@@ -4,7 +4,7 @@ mt5file='/config/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe'
 WINEPREFIX='/config/.wine'
 WINEDEBUG='-all'
 wine_executable="wine"
-metatrader_version="5.0.36"
+metatrader_version="5.0.37"
 MT5_CMD_OPTIONS="${MT5_CMD_OPTIONS:-}"
 mono_url="https://dl.winehq.org/wine/wine-mono/10.3.0/wine-mono-10.3.0-x86.msi"
 python_url="https://www.python.org/ftp/python/3.9.13/python-3.9.13.exe"
@@ -80,9 +80,9 @@ if ! is_wine_python_package_installed "MetaTrader5==$metatrader_version"; then
     $wine_executable python -m pip install --no-cache-dir "MetaTrader5==$metatrader_version"
 fi
 
-# MetaTrader5 5.0.36 was compiled against NumPy 1.x.
-# NumPy 2.x breaks it with "_ARRAY_API not found". Force downgrade.
-show_message "[5/6] Pinning numpy<2 (MetaTrader5 5.0.36 requires NumPy 1.x)..."
+# MetaTrader5 5.0.45 supports NumPy 1.x; keep the pin as a safety measure.
+# Remove this line only if a future MT5 version explicitly requires NumPy 2.x.
+show_message "[5/6] Pinning numpy<2 for stability..."
 $wine_executable python -m pip install --no-cache-dir "numpy<2" --quiet
 
 

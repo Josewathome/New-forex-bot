@@ -78,6 +78,10 @@ class MT5NewsClient(INewsRepository):
     def _load_defs(self, currencies: List[str]) -> None:
         """Populate event_id -> (currency, name, importance) for the given currencies."""
         self._event_defs.clear()
+        if not hasattr(mt5, "calendar_event_by_currency"):
+            # MT5 Python < 5.0.37 does not ship this API — silently skip.
+            logger.debug("MT5 calendar_event_by_currency unavailable (MT5 version too old) — skipping")
+            return
         for currency in currencies:
             result = mt5.calendar_event_by_currency(currency)
             if not result:

@@ -139,7 +139,15 @@ HIGH_IMPACT_BUFFER_MINS    = 30
 MEDIUM_IMPACT_BUFFER_MINS  = 0   # only HIGH events block trading
 NEWS_BUFFER_MINUTES        = 15
 STRICT_NEWS_FILTER         = True
-ATR_COST_THRESHOLD         = 0.10
+"""
+When using the HFM Premium Account, you will likely need to raise your
+New Threshold: Set ATR_COST_THRESHOLD = 0.20. This allows a cost up to 20% of the H1 ATR, which accommodates the ~1.4 pip spread on an 8-pip H1 move.
+Volatility Buffer: If trading specifically during the Iran conflict spikes, a threshold of 0.25 might be necessary to avoid being completely filtered out, though this increases your "cost of business" significantly.
+"""
+
+ATR_COST_THRESHOLD         = 0.25
+
+
 # How often the news manager re-fetches events from the API.
 # 10 min keeps the blind-spot window below the HIGH_IMPACT_BUFFER_MINS (30 min)
 # so a late-added event is always caught before the bot enters within its window.
@@ -153,12 +161,6 @@ TRADING_SESSIONS = {
 
 LOOP_INTERVAL_SECONDS = 60
 
-# ── Backtest ──────────────────────────────────────────────────────
-NEWS_SLIPPAGE_PIPS   = 5.0
-MAX_FORWARD_M1_BARS  = 4_320
-BACKTEST_MONTHS_BACK = 6
-BACKTEST_START_DATE  = ""
-BACKTEST_END_DATE    = ""
 
 # ── Symbol Metadata ───────────────────────────────────────────────
 SYMBOL_DIGITS: dict[str, int] = {
@@ -280,3 +282,10 @@ EMAIL_RECIPIENT = os.environ.get("EMAIL_RECIPIENT", "")
 WEEKLY_BACKTEST_ENABLED  = True
 WEEKLY_BACKTEST_WEEKDAY  = 5      # Saturday
 WEEKLY_BACKTEST_HOUR_UTC = 6      # 06:00 UTC
+
+# ── Backtest ──────────────────────────────────────────────────────
+NEWS_SLIPPAGE_PIPS   = 5.0
+MAX_FORWARD_M1_BARS  = 4_320
+BACKTEST_MONTHS_BACK = 6
+BACKTEST_START_DATE  = ""
+BACKTEST_END_DATE    = ""

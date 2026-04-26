@@ -1,10 +1,13 @@
 #!/bin/bash
-# fix_rpyc.sh — intentionally a no-op.
+# fix_rpyc.sh — runs as root during linuxserver.io container init.
 #
-# RPyC startup has been moved into override_start.sh (step 7) which runs
-# as the abc user (UID 911) who owns /config/.wine.  Running wine here
-# (as root) causes:  wine: '/config/.wine' is not owned by you
+# RPyC startup has been moved into override_start.sh which runs as the
+# abc user (UID 911).  Running wine here (as root) would cause:
+#   wine: '/config/.wine' is not owned by you
 #
-# This script is kept mounted so the linuxserver custom-init system
-# doesn't error on a missing file.
+# We do use this root context to fix volume ownership so the abc user
+# can write to the Docker named volumes (news_cache, zones_data) that
+# Docker creates owned by root by default.
+mkdir -p /bot/.cache /bot/logs /bot/zones
+chown -R abc:abc /bot/.cache /bot/logs /bot/zones 2>/dev/null || true
 exit 0

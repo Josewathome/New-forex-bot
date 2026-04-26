@@ -41,7 +41,41 @@ class CleanupService:
         target = (self.zones_dir / symbol) if symbol else self.zones_dir
         self._purge(target, self.zone_days, f"zones/{symbol or '*'}")
 
+    def market_close_wipe(self) -> None:
+        """
+        Full wipe of zones and news cache on Friday market close (21:00 UTC).
+        Zones are rebuilt from scratch on Monday when the bot remaps at startup.
+        Cache is repopulated on first fetch. Both directories are kept small this way
+        regardless of how many months the bot has been running.
+        """
+        logger.info("CleanupService: Friday market-close wipe starting.")
+        self._wipe(self.zones_dir, "zones")
+        self._wipe(self.cache_dir, "cache")
+        logger.info("CleanupService: market-close wipe complete — fresh start on Monday.")
+
     # ── Internal ────────────────────────────────────────────────────
+
+    def _wipe(self, directory: Path, label: str) -> None:
+        """Delete every file in directory tree (no age check — full wipe)."""
+        if not directory.exists():
+            return
+        removed = 0
+        for f in directory.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                f.unlink()
+                removed += 1
+            except OSError as exc:
+                logger.warning("Cleanup wipe: could not delete %s — %s", f, exc)
+        # Remove any now-empty subdirectories
+        for d in sorted(directory.rglob("*"), reverse=True):
+            if d.is_dir():
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
+        logger.info("Cleanup [%-8s]: wiped %d file(s)", label, removed)
 
     def _purge(self, directory: Path, days: int, label: str) -> None:
         if not directory.exists():

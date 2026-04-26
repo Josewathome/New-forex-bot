@@ -185,6 +185,9 @@ def run_live() -> None:
             logger.warning("Dashboard failed to start: %s", e)
 
     scheduler.add_daily("cleanup", cleanup.run_all, hour=2)
+    # Friday 21:00 UTC = New York session close. Wipe zones + cache so the bot
+    # starts fresh on Monday without months of accumulated files.
+    scheduler.add_weekly("market_close_wipe", cleanup.market_close_wipe, weekday=4, hour=21)
     if getattr(config, "WEEKLY_BACKTEST_ENABLED", True):
         scheduler.add_weekly(
             "weekly_backtest", weekly_bt.run,
@@ -348,16 +351,25 @@ def run_backtest() -> None:
     h1_buf = timedelta(hours=150)
     h4_buf = timedelta(hours=config.H4_CANDLE_COUNT * 4 + 40)
 
+    # Most brokers only retain ~60 days of M1 history in the terminal.
+    # Requesting the full backtest window returns -2 "Invalid params".
+    # Limit M1 to 60 days so we get precise bar data for recent trades;
+    # the simulator falls back to M5 automatically for older bars.
+    m1_start = max(start_dt, end_dt - timedelta(days=60))
+
     candle_data = {}
     for sym in config.SYMBOLS:
         h1 = md.get_candles_range(sym, Timeframe.H1, start_dt-h1_buf, end_dt)
         m5 = md.get_candles_range(sym, Timeframe.M5, start_dt, end_dt)
-        m1 = md.get_candles_range(sym, Timeframe.M1, start_dt, end_dt)
+        m1 = md.get_candles_range(sym, Timeframe.M1, m1_start, end_dt)
         h4 = md.get_candles_range(sym, Timeframe.H4, start_dt-h4_buf, end_dt)
         if h1 and m5:
             candle_data[sym] = {Timeframe.H1:h1,Timeframe.M5:m5,Timeframe.M1:m1,Timeframe.H4:h4}
+            logger.info("  %s: H1=%d  M5=%d  M1=%d(last 60d)  H4=%d",
+                        sym, len(h1), len(m5), len(m1) if m1 else 0, len(h4) if h4 else 0)
         else:
-            logger.warning("  %s: insufficient data.", sym)
+            logger.warning("  %s: insufficient data (H1=%s M5=%s).",
+                           sym, "ok" if h1 else "MISSING", "ok" if m5 else "MISSING")
 
     if not candle_data:
         logger.critical("No candle data.")
