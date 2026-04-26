@@ -30,6 +30,8 @@ from src.infrastructure.mt5_bridge.mt5_gateway  import MT5Gateway
 from src.infrastructure.market_data_repo         import MT5MarketDataRepository
 from src.infrastructure.trade_repo               import MT5TradeRepository
 from src.infrastructure.news_client              import ForexNewsClient
+from src.infrastructure.mt5_news_client          import MT5NewsClient
+from src.infrastructure.composite_news_client    import CompositeNewsClient
 from src.infrastructure.cache_store              import JsonCacheStore
 from src.infrastructure.zone_repo                import InMemoryZoneRepository
 from src.infrastructure.spread_calculator        import SpreadCalculator
@@ -79,12 +81,19 @@ def connect_mt5() -> MT5Gateway:
     return gw
 
 
-def build_services(gw: MT5Gateway):
+def build_services(gw: MT5Gateway, journal=None):
     market_data  = MT5MarketDataRepository(gw)
     trade_repo   = MT5TradeRepository(gw)
     zone_repo    = InMemoryZoneRepository(persist=True)
     cache        = JsonCacheStore()
-    news_client  = ForexNewsClient(api_key=config.NEWS_API_KEY, cache=cache)
+    mt5_news     = MT5NewsClient()
+    if config.NEWS_API_KEY:
+        ff_news     = ForexNewsClient(api_key=config.NEWS_API_KEY, cache=cache)
+        news_client = CompositeNewsClient([ff_news, mt5_news])
+        logger.info("News guardian: ForexFactory (primary) + MT5 calendar (enrichment)")
+    else:
+        news_client = mt5_news
+        logger.info("News guardian: MT5 built-in calendar (NEWS_API_KEY not set)")
     news_manager = NewsManager(news_client)
     commission   = _commission_in_account_ccy(config.COMMISSION_PER_LOT)
     spread_calc  = SpreadCalculator(
@@ -102,19 +111,30 @@ def build_services(gw: MT5Gateway):
         commission=        commission,
         min_rr=            config.MIN_RR,
         account_currency=  config.ACCOUNT_CURRENCY,
+        journal=           journal,
     )
     return execution, news_manager, market_data, zone_repo
 
 
 def _commission_in_account_ccy(usd: float) -> float:
-    rates = {"USD":1.0,"EUR":0.92,"GBP":0.79,"KES":130.0,"NGN":1550.0,"ZAR":18.5}
+    rates = {
+        "USD": 1.0, "EUR": 0.92, "GBP": 0.79,
+        "KES": config.KES_PER_USD,   # single source of truth from config
+        "NGN": 1550.0, "ZAR": 18.5,
+    }
     return usd * rates.get(config.ACCOUNT_CURRENCY.upper(), 1.0)
 
 
 class H1ClockWatcher:
-    def __init__(self): self._last = None
+    def __init__(self):
+        # Pre-seed with the current hour so the first loop tick does NOT fire.
+        # The initial zone mapping is already done explicitly before the loop starts;
+        # without seeding, _last=None would trigger a second redundant remap immediately.
+        now = datetime.now(tz=timezone.utc)
+        self._last = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
+
     def should_remap(self, now: datetime) -> bool:
-        h = int(now.replace(minute=0,second=0,microsecond=0).timestamp())
+        h = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
         if self._last != h:
             self._last = h
             return True
@@ -123,17 +143,23 @@ class H1ClockWatcher:
 
 def run_live() -> None:
     gw  = connect_mt5()
+
+    # Auto-detect broker server UTC offset so position.time corrections are exact.
+    # Overwrites the config default; falls back to that default if market is closed.
+    config.BROKER_UTC_OFFSET_HOURS = gw.detect_utc_offset()
+    logger.info("Broker UTC offset: UTC%+d", config.BROKER_UTC_OFFSET_HOURS)
+
     acc = gw.get_account_info()
     if acc:
         logger.info("MT5  |  %s  |  balance=%.2f %s  |  server=%s",
                     acc.get("name"), acc.get("balance",0),
                     acc.get("currency","?"), acc.get("server"))
 
-    execution, news_manager, market_data, zone_repo = build_services(gw)
+    journal    = TradeJournal()
+    execution, news_manager, market_data, zone_repo = build_services(gw, journal)
 
     cleanup    = CleanupService()
     checkpoint = CheckpointService(getattr(config,"CHECKPOINT_DIR",".checkpoints"))
-    journal    = TradeJournal()
     zone_store = ZoneFileStore()
     email_svc  = EmailService()
     scheduler  = Scheduler()
@@ -204,26 +230,83 @@ def run_live() -> None:
                     except Exception as exc:
                         logger.exception("Zone remap [%s]: %s", sym, exc)
 
+            # ── Monitoring pass (all symbols first) ───────────────
             for sym in config.SYMBOLS:
                 try:
-                    trade = execution.run_monitoring_cycle(sym)
-                    if trade:
-                        logger.info("TRADE | %s %s | %.2f lots | entry=%.5f SL=%.5f TP=%.5f",
-                                    trade.symbol, trade.direction.value.upper(),
-                                    trade.lot_size, trade.entry_price,
-                                    trade.stop_loss, trade.take_profit)
-                        if getattr(trade, "mt5_ticket", None):
-                            journal.record_open(
-                                ticket=   trade.mt5_ticket,
-                                symbol=   trade.symbol,
-                                direction=trade.direction.value,
-                                entry=    trade.entry_price,
-                                sl=       trade.stop_loss,
-                                tp=       trade.take_profit,
-                                lot_size= trade.lot_size,
-                            )
+                    execution.run_monitoring_only(sym)
                 except Exception as exc:
                     logger.exception("Monitoring [%s]: %s", sym, exc)
+
+            # ── Phase 1: collect → rank → execute ─────────────────
+            p1_candidates = []
+            for sym in config.SYMBOLS:
+                try:
+                    c = execution.collect_entry_candidate(sym, is_phase2=False)
+                    if c:
+                        p1_candidates.append(c)
+                except Exception as exc:
+                    logger.exception("Entry eval [%s]: %s", sym, exc)
+
+            p1_candidates.sort(key=lambda c: c.trade_score, reverse=True)
+
+            for candidate in p1_candidates:
+                if len(execution._tr.get_open_positions()) >= config.MAX_OPEN_TRADES:
+                    logger.debug("Phase 1 stopped: global cap reached (%d)", config.MAX_OPEN_TRADES)
+                    break
+                if execution.open_count_for_symbol(candidate.symbol) >= getattr(config, "MAX_TRADES_PER_SYMBOL", 2):
+                    logger.debug("Phase 1 skip %s: per-symbol cap reached", candidate.symbol)
+                    continue
+                try:
+                    trade = execution.execute_entry_candidate(candidate)
+                    if trade:
+                        logger.info(
+                            "TRADE P1 | %s %s | score=%d | %.2f lots | "
+                            "entry=%.5f SL=%.5f TP=%.5f",
+                            trade.symbol, trade.direction.value.upper(),
+                            candidate.trade_score, trade.lot_size,
+                            trade.entry_price, trade.stop_loss, trade.take_profit,
+                        )
+                except Exception as exc:
+                    logger.exception("Execute P1 [%s]: %s", candidate.symbol, exc)
+
+            # ── Phase 2: conviction re-entry (TP1-gated) ──────────
+            if getattr(config, "PHASE2_ENABLED", True):
+                p2_min = getattr(config, "PHASE2_MIN_TRADE_SCORE", 5)
+                p2_cap = getattr(config, "MAX_TRADES_PER_SYMBOL", 2)
+                p2_candidates = []
+
+                for sym in config.SYMBOLS:
+                    if execution.open_count_for_symbol(sym) >= p2_cap:
+                        continue
+                    if not execution.has_tp1_hit_for_symbol(sym):
+                        continue
+                    try:
+                        c = execution.collect_entry_candidate(sym, is_phase2=True)
+                        if c and c.trade_score >= p2_min:
+                            p2_candidates.append(c)
+                    except Exception as exc:
+                        logger.exception("Phase 2 eval [%s]: %s", sym, exc)
+
+                p2_candidates.sort(key=lambda c: c.trade_score, reverse=True)
+
+                for candidate in p2_candidates:
+                    if len(execution._tr.get_open_positions()) >= config.MAX_OPEN_TRADES:
+                        logger.debug("Phase 2 stopped: global cap reached (%d)", config.MAX_OPEN_TRADES)
+                        break
+                    if execution.open_count_for_symbol(candidate.symbol) >= p2_cap:
+                        continue
+                    try:
+                        trade = execution.execute_entry_candidate(candidate)
+                        if trade:
+                            logger.info(
+                                "TRADE P2 | %s %s | score=%d | %.2f lots | "
+                                "entry=%.5f SL=%.5f TP=%.5f",
+                                trade.symbol, trade.direction.value.upper(),
+                                candidate.trade_score, trade.lot_size,
+                                trade.entry_price, trade.stop_loss, trade.take_profit,
+                            )
+                    except Exception as exc:
+                        logger.exception("Execute P2 [%s]: %s", candidate.symbol, exc)
 
             loop_n += 1
             if (loop_start - last_checkpoint).total_seconds() >= cp_interval:
@@ -280,10 +363,15 @@ def run_backtest() -> None:
         logger.critical("No candle data.")
         gw.disconnect(); sys.exit(1)
 
-    cache = JsonCacheStore()
-    news  = ForexNewsClient(api_key=config.NEWS_API_KEY, cache=cache)
+    cache    = JsonCacheStore()
+    bt_mt5   = MT5NewsClient()
+    if config.NEWS_API_KEY:
+        bt_ff   = ForexNewsClient(api_key=config.NEWS_API_KEY, cache=cache)
+        bt_news = CompositeNewsClient([bt_ff, bt_mt5])
+    else:
+        bt_news = bt_mt5
     comm  = _commission_in_account_ccy(config.COMMISSION_PER_LOT)
-    bt    = Backtester(news_client=news, account=config.ACCOUNT_BALANCE,
+    bt    = Backtester(news_client=bt_news, account=config.ACCOUNT_BALANCE,
                        risk_pct=config.RISK_PERCENT, commission=comm,
                        currency=config.ACCOUNT_CURRENCY)
     diag    = DiagnosticsCollector()

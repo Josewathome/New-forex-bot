@@ -38,15 +38,47 @@ MT5_PATH = ""
 # ── News API ───────────────────────────────────────────────────────
 NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
 
+# ── Dashboard Auth ─────────────────────────────────────────────────
+# Password for the web dashboard. If empty, a random one is printed to
+# the log at startup (check logs/trading_bot.log for the one-time password).
+DASHBOARD_PASSWORD          = os.environ.get("DASHBOARD_PASSWORD", "")
+JWT_ACCESS_EXPIRES_MINUTES  = int(os.environ.get("JWT_ACCESS_EXPIRES_MINUTES", "15"))
+JWT_REFRESH_EXPIRES_DAYS    = int(os.environ.get("JWT_REFRESH_EXPIRES_DAYS", "7"))
+
 # ── Symbols to Trade ───────────────────────────────────────────────
 SYMBOLS = ["EURUSD", "GBPUSD", "XAUUSD", "USDJPY", "AUDUSD", "USDCHF"]
 
+
+# ── Broker Time Zone ───────────────────────────────────────────────
+# AUTO-DETECTED at startup: main.py calls gw.detect_utc_offset() and
+# overwrites this value before any trades are processed.
+# This default (2 = EET, common for ECN brokers) is only used as a
+# fallback when detection fails — e.g. bot started while market is closed
+# and no fresh EURUSD tick is available.  Change it if your broker is
+# permanently on a different offset and you start the bot off-hours.
+BROKER_UTC_OFFSET_HOURS: int = 2
 
 # ── Risk Management ────────────────────────────────────────────────
 RISK_PERCENT        = 1.0
 COMMISSION_PER_LOT  = 3.0
 MIN_RR              = 3.0
-MAX_OPEN_TRADES     = 1
+MAX_OPEN_TRADES     = 6
+MAX_TRADES_PER_SYMBOL = 2    # max concurrent trades on a single symbol (Phase 1 cap)
+
+# ── Phase 2 — Conviction Re-Entry ─────────────────────────────────
+# Phase 2 fires AFTER Phase 1 in the same cycle.
+# A symbol is only eligible if it already has a trade with TP1 hit
+# (proven winner) and the new signal scores at maximum conviction.
+PHASE2_ENABLED         = True
+PHASE2_MIN_TRADE_SCORE = 5   # minimum score out of 6 to qualify for re-entry
+
+# ── Margin Safety ────────────────────────────────────────────────
+# A new trade is skipped if the margin MT5 requires for it exceeds
+# free_margin / MARGIN_SAFETY_FACTOR.  Factor=2 means the trade may
+# consume at most half the remaining free margin, keeping a buffer for
+# existing trades' floating losses and swap charges.
+# Set to 1.0 to allow trades right up to the margin limit (not recommended).
+MARGIN_SAFETY_FACTOR: float = 2.0
 
 # ── UPGRADED: Dynamic ATR-Based SL Multipliers ─────────────────────
 ATR_SL_MULTIPLIERS: dict[str, float] = {
@@ -108,6 +140,10 @@ MEDIUM_IMPACT_BUFFER_MINS  = 0   # only HIGH events block trading
 NEWS_BUFFER_MINUTES        = 15
 STRICT_NEWS_FILTER         = True
 ATR_COST_THRESHOLD         = 0.10
+# How often the news manager re-fetches events from the API.
+# 10 min keeps the blind-spot window below the HIGH_IMPACT_BUFFER_MINS (30 min)
+# so a late-added event is always caught before the bot enters within its window.
+NEWS_REFRESH_INTERVAL_MINUTES = 10
 
 # ── Trading Sessions ──────────────────────────────────────────────
 TRADING_SESSIONS = {
@@ -178,6 +214,15 @@ FINAL_RUNNER_PCT         = 0.15
 
 # ── STALL EXIT RULE ───────────────────────────────────────────────
 STALL_EXIT_REQUIRES_TP1 = True
+
+# ── TP1 PROFIT-LOCK ───────────────────────────────────────────────
+# After TP1 hit, SL is moved to entry + (initial_risk × this multiplier).
+# 0.3 = lock in 0.3R of profit before letting the runner continue.
+TP1_PROFIT_LOCK_R = 0.3
+
+# ── MONITOR TRAILING ──────────────────────────────────────────────
+# ATR fraction used as buffer below/above swing pivots for SL trail.
+MONITOR_TRAIL_ATR_BUFFER = 0.5
 
 # ── TRADE QUALITY SCORING ─────────────────────────────────────────
 TRADE_SCORE_THRESHOLD   = 2

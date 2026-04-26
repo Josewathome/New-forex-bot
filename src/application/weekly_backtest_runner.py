@@ -43,16 +43,23 @@ class WeeklyBacktestRunner:
         from src.application.backtester     import Backtester
         from src.application.diagnostics    import DiagnosticsCollector
         from src.domain.entities            import Timeframe
-        from src.infrastructure.news_client import ForexNewsClient
-        from src.infrastructure.cache_store import JsonCacheStore
+        from src.infrastructure.news_client           import ForexNewsClient
+        from src.infrastructure.mt5_news_client       import MT5NewsClient
+        from src.infrastructure.composite_news_client import CompositeNewsClient
+        from src.infrastructure.cache_store           import JsonCacheStore
 
         end_dt   = datetime.now(tz=timezone.utc)
         start_dt = end_dt - timedelta(days=30 * config.BACKTEST_MONTHS_BACK)
         start_str = start_dt.strftime("%Y-%m-%d")
         end_str   = end_dt.strftime("%Y-%m-%d")
 
-        cache = JsonCacheStore()
-        news  = ForexNewsClient(api_key=config.NEWS_API_KEY, cache=cache)
+        cache    = JsonCacheStore()
+        wbr_mt5  = MT5NewsClient()
+        if config.NEWS_API_KEY:
+            wbr_ff   = ForexNewsClient(api_key=config.NEWS_API_KEY, cache=cache)
+            news     = CompositeNewsClient([wbr_ff, wbr_mt5])
+        else:
+            news = wbr_mt5
         comm  = self._commission_in_account_ccy(config.COMMISSION_PER_LOT)
 
         bt = Backtester(

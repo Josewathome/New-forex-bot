@@ -799,11 +799,14 @@ def compute_dynamic_tp(
 
     ratio = atr / baseline_atr
     if ratio < 0.8:
-        tp1, tp2 = 1.2, 2.2
+        # Low volatility: tighter targets still well above MIN_RR
+        tp1, tp2 = 2.0, 3.5
     elif ratio > 1.2:
-        tp1, tp2 = 1.8, 3.5
+        # High volatility: extended runners
+        tp1, tp2 = 2.5, 5.0
     else:
-        tp1, tp2 = 1.5, 3.0
+        # Normal: match static defaults
+        tp1, tp2 = config.TIERED_TP1_RATIO, config.TIERED_TP2_RATIO
     return tp1, tp2
 
 
@@ -830,11 +833,11 @@ def score_trade(
 
 def dynamic_risk(score: int) -> float:
     # Max possible score = 6 (HTF=2, sweep=1, FVG=1, displacement=1, kill_zone=1).
-    # Old thresholds (>=7, >=5) meant RISK_HIGH_CONVICTION was mathematically unreachable.
-    # New thresholds: high=6 (perfect setup), medium=4-5, low=<4.
-    if score >= 6:
+    # Threshold 5 catches excellent setups (HTF aligned + 3 of 4 other criteria),
+    # not just mathematically perfect ones — avoids under-risking good setups.
+    if score >= 5:
         return config.RISK_HIGH_CONVICTION
-    elif score >= 4:
+    elif score >= 3:
         return config.RISK_MEDIUM_CONVICTION
     else:
         return config.RISK_LOW_CONVICTION
@@ -845,13 +848,20 @@ def is_strong_trend(candles: List[Candle], direction: Direction) -> bool:
         return False
     last_three = candles[-3:]
     if direction == Direction.BULLISH:
-        return (last_three[0].close > last_three[0].open and
-                last_three[1].close > last_three[0].high and
-                last_three[2].close > last_three[1].high)
+        # 3 consecutive bullish candles with each close higher than the last.
+        # The old check (close > prior HIGH) required near-marubozu candles and
+        # almost never fired, making stall exits always trigger.
+        return (
+            all(c.is_bullish for c in last_three) and
+            last_three[1].close > last_three[0].close and
+            last_three[2].close > last_three[1].close
+        )
     else:
-        return (last_three[0].close < last_three[0].open and
-                last_three[1].close < last_three[0].low and
-                last_three[2].close < last_three[1].low)
+        return (
+            all(c.is_bearish for c in last_three) and
+            last_three[1].close < last_three[0].close and
+            last_three[2].close < last_three[1].close
+        )
 
 
 def is_kill_zone(dt: datetime) -> bool:

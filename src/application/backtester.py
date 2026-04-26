@@ -12,6 +12,7 @@ CHANGES vs v9:
 from __future__ import annotations
 import csv
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +46,7 @@ from src.application.analysis import (
 from src.application.diagnostics import DiagnosticsCollector
 from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl
 from src.infrastructure.news_client import ForexNewsClient
+from src.infrastructure.spread_calculator import FALLBACK_SPREAD_PIPS, DEFAULT_FALLBACK_PIPS
 
 logger = logging.getLogger(__name__)
 _M5 = timedelta(minutes=5)
@@ -213,7 +215,11 @@ class Backtester:
             if diag: diag.record_rejection(symbol, "outside_session")
             return None
 
-        bc = BrokerCost(spread_pips=1.0, commission_usd=self._commission, tick_value=tv)
+        bc = BrokerCost(
+            spread_pips=FALLBACK_SPREAD_PIPS.get(symbol, DEFAULT_FALLBACK_PIPS),
+            commission_usd=self._commission,
+            tick_value=tv,
+        )
 
         sym_min_score = config.SYMBOL_MIN_SCORE.get(symbol, config.SETUP_SCORE_THRESHOLD)
 
@@ -258,15 +264,12 @@ class Backtester:
 
             risk_pct = dynamic_risk(trade_score)
 
-            # Dynamic TP
+            # Dynamic TP — same logic as live execution_service (no static override)
             baseline_atr = atr(h1_win[-50:]) if len(h1_win) >= 50 else h1_atr
             tp1_ratio, tp2_ratio = compute_dynamic_tp(
                 signal.direction, signal.entry_price, signal.stop_loss,
                 h1_atr, baseline_atr
             )
-            # Override with config values
-            tp1_ratio = config.TIERED_TP1_RATIO
-            tp2_ratio = config.TIERED_TP2_RATIO
 
             tp1_price = (signal.entry_price + tp1_ratio * abs(signal.entry_price - signal.stop_loss)
                          if signal.direction == Direction.BULLISH
@@ -546,13 +549,13 @@ class Backtester:
             if tp1_price and not tp1_hit:
                 tp1_reached = (is_bull and bar.high >= tp1_price) or (not is_bull and bar.low <= tp1_price)
                 if tp1_reached:
-                    close_vol = round(remaining_vol * tp1_pct, 2)
-                    close_vol = max(0.01, close_vol)
+                    # Floor (not round) — matches live execution_service behaviour.
+                    close_vol = max(0.01, math.floor(remaining_vol * tp1_pct * 100) / 100)
                     profit_partial = ppnl(tp1_price, close_vol)
                     realized_pnl += profit_partial
                     remaining_vol -= close_vol
                     tp1_hit = True
-                    profit_lock_dist = sl_dist * 0.3
+                    profit_lock_dist = sl_dist * config.TP1_PROFIT_LOCK_R
                     if is_bull:
                         virtual_sl = entry + profit_lock_dist
                     else:
@@ -562,8 +565,7 @@ class Backtester:
             if tp1_hit and not tp2_hit and tp2_price:
                 tp2_reached = (is_bull and bar.high >= tp2_price) or (not is_bull and bar.low <= tp2_price)
                 if tp2_reached:
-                    close_vol = round(remaining_vol * tp2_pct, 2)
-                    close_vol = max(0.01, close_vol)
+                    close_vol = max(0.01, math.floor(remaining_vol * tp2_pct * 100) / 100)
                     profit_partial = ppnl(tp2_price, close_vol)
                     realized_pnl += profit_partial
                     remaining_vol -= close_vol

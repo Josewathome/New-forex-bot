@@ -1,3 +1,7 @@
+# Before first run: copy .env.example to .env and fill in your real credentials.
+# Docker Compose reads .env automatically for ${VAR} substitution below.
+# Dashboard: http://localhost:8000   |   MT5 VNC: http://localhost:3000
+
 services:
   mt5:
     image: gmag11/metatrader5_vnc:latest
@@ -5,7 +9,9 @@ services:
     restart: unless-stopped
     ports:
       - "3000:3000"       # noVNC browser UI → http://localhost:3000
-      - "8000:8080"       # Trading dashboard → http://localhost:8080
+      - "8000:8080"       # Trading dashboard → http://localhost:8000
+    env_file:
+      - .env              # hard-fail if .env is missing (prevents silent empty-credential start)
     environment:
       - CUSTOM_USER=${VNC_USER}
       - PASSWORD=${VNC_PASSWORD}

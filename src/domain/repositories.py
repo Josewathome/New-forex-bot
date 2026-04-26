@@ -90,8 +90,28 @@ class ITradeRepository(ABC):
         ...
 
     @abstractmethod
+    def get_remaining_volume(self, ticket: int) -> Optional[float]:
+        """Return the live remaining lot size of an open position, or None if not found."""
+        ...
+
+    @abstractmethod
     def get_account_balance(self) -> float:
         """Return current account balance in account currency."""
+        ...
+
+    @abstractmethod
+    def get_free_margin(self) -> float:
+        """Return current free margin in account currency (balance - used margin + floating PnL)."""
+        ...
+
+    @abstractmethod
+    def get_required_margin(self, trade: Trade) -> Optional[float]:
+        """
+        Ask the broker how much margin the given trade would consume before placing it.
+        Returns margin in account currency, or None when the broker cannot compute it
+        (e.g. market is closed, symbol unavailable).  Callers must treat None as
+        'check unavailable — proceed with caution' rather than 'zero margin required'.
+        """
         ...
 
 

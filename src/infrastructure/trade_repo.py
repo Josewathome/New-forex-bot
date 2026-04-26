@@ -3,8 +3,10 @@ trade_repo.py — MT5 Trade Execution  (v3 — partial close + modify_sl)
 """
 from __future__ import annotations
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
+
+from src import config
 
 from src.domain.entities import Direction, Trade, TradeStatus
 from src.domain.repositories import ITradeRepository
@@ -32,8 +34,17 @@ class MT5TradeRepository(ITradeRepository):
         if result is None:
             logger.error("place_trade failed for %s", trade.id)
             return None
-        logger.info("Trade placed ✓ ticket=%s %s %s vol=%.2f",
-                    result["ticket"], trade.symbol, order["type"], order["volume"])
+        # Update trade with actual MT5 fill price (may differ from signal price
+        # due to slippage within the 20-pip deviation band).
+        actual_fill = result.get("price", trade.entry_price)
+        if actual_fill and actual_fill != trade.entry_price:
+            logger.info("Fill slippage | %s | signal=%.5f actual=%.5f (%.1f pts)",
+                        trade.symbol, trade.entry_price, actual_fill,
+                        abs(actual_fill - trade.entry_price) / (10 ** -5))
+            trade.entry_price = actual_fill
+        logger.info("Trade placed ✓ ticket=%s %s %s vol=%.2f fill=%.5f",
+                    result["ticket"], trade.symbol, order["type"], order["volume"],
+                    actual_fill)
         return result["ticket"]
 
     def close_trade(self, ticket: int) -> bool:
@@ -85,7 +96,8 @@ class MT5TradeRepository(ITradeRepository):
         trades = []
         for p in raw:
             direction = Direction.BULLISH if p["type"] == "BUY" else Direction.BEARISH
-            open_dt   = datetime.fromtimestamp(p["open_time"], tz=timezone.utc)
+            open_dt   = datetime.fromtimestamp(p["open_time"], tz=timezone.utc) \
+                        - timedelta(hours=getattr(config, "BROKER_UTC_OFFSET_HOURS", 0))
             trades.append(Trade(
                 id=          str(p["ticket"]),
                 symbol=      p["symbol"],
@@ -100,6 +112,27 @@ class MT5TradeRepository(ITradeRepository):
             ))
         return trades
 
+    def get_remaining_volume(self, ticket: int) -> Optional[float]:
+        pos = self._gw.get_position_by_ticket(ticket)
+        if pos is None:
+            return None
+        return float(pos["volume"])
+
     def get_account_balance(self) -> float:
         info = self._gw.get_account_info()
         return info["balance"] if info else 0.0
+
+    def get_free_margin(self) -> float:
+        info = self._gw.get_account_info()
+        return info["free_margin"] if info else 0.0
+
+    def get_required_margin(self, trade: Trade) -> Optional[float]:
+        order = {
+            "symbol": trade.symbol,
+            "type":   "BUY" if trade.direction == Direction.BULLISH else "SELL",
+            "volume": round(trade.lot_size, 2),
+            "price":  trade.entry_price,
+            "sl":     trade.stop_loss,
+            "tp":     trade.take_profit,
+        }
+        return self._gw.check_order_margin(order)

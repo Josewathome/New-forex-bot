@@ -5,25 +5,41 @@ Runs in a background daemon thread inside Wine Python.
 Serves the dashboard HTML at http://localhost:8080
 and exposes a REST API for live config/stats updates.
 
-Endpoints:
-    GET  /                      → dashboard HTML
-    GET  /api/status            → bot status + config snapshot
-    GET  /api/stats             → trade analytics (global + per symbol)
-    GET  /api/trades            → recent trades list
-    GET  /api/config            → current config values
-    PATCH /api/config           → live config update
-    GET  /api/symbols           → current symbol list
-    POST /api/symbols           → add a symbol
-    DELETE /api/symbols/<sym>   → remove a symbol
-    GET  /api/logs              → last N lines of trading_bot.log
+All /api/* endpoints (except /api/auth/*) require a valid JWT access token
+in the Authorization: Bearer <token> header.
+
+Auth endpoints:
+    POST /api/auth/login          → {access_token, refresh_token, expires_in}
+    POST /api/auth/refresh        → {access_token, expires_in}
+    POST /api/auth/logout         → {ok: true}  (revokes refresh token)
+    POST /api/auth/rotate-secret  → {ok: true}  (rotates JWT secret, invalidates all sessions)
+
+Protected endpoints:
+    GET  /                        → dashboard HTML
+    GET  /api/status              → bot status + config snapshot
+    GET  /api/stats               → trade analytics (global + per symbol)
+    GET  /api/trades              → recent trades list
+    GET  /api/config              → current config values
+    PATCH /api/config             → live config update
+    GET  /api/symbols             → current symbol list
+    POST /api/symbols             → add a symbol
+    DELETE /api/symbols/<sym>     → remove a symbol
+    GET  /api/logs                → last N lines of trading_bot.log
 """
 from __future__ import annotations
+
+import base64
+import functools
+import hashlib
+import hmac
 import json
 import logging
+import secrets
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
 import src.config as config
 
@@ -34,8 +50,6 @@ _BOT_START_TIME = datetime.now(tz=timezone.utc)
 # File where dashboard config overrides are written so they survive restarts.
 _CONFIG_OVERRIDE_FILE = Path(".checkpoints/config_overrides.json")
 
-# Mapping of JSON key → (config attr name, type cast) — same as in update_config().
-# Defined at module level so both the loader and the saver share one source of truth.
 _CONFIG_MAP = {
     "risk_pct":           ("RISK_PERCENT",          float),
     "min_rr":             ("MIN_RR",                float),
@@ -86,12 +100,148 @@ def load_config_overrides() -> None:
         logger.warning("Could not load config overrides (%s) — using defaults.", exc)
 
 
+# ─────────────────────────────────────────────────────────────────────
+#  JWT utilities  (stdlib only — no PyJWT dependency)
+# ─────────────────────────────────────────────────────────────────────
+
+def _b64u_enc(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _b64u_dec(s: str) -> bytes:
+    rem = len(s) % 4
+    return base64.urlsafe_b64decode(s + "=" * (4 - rem if rem else 0))
+
+
+def _jwt_sign(header_b64: str, payload_b64: str, secret: str) -> str:
+    msg = f"{header_b64}.{payload_b64}".encode()
+    sig = hmac.new(secret.encode(), msg, hashlib.sha256).digest()
+    return _b64u_enc(sig)
+
+
+def _jwt_encode(payload: dict, secret: str) -> str:
+    header  = _b64u_enc(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    body    = _b64u_enc(json.dumps(payload).encode())
+    sig     = _jwt_sign(header, body, secret)
+    return f"{header}.{body}.{sig}"
+
+
+def _jwt_decode(token: str, secret: str) -> dict:
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("Malformed token")
+    header_b64, payload_b64, sig_b64 = parts
+    expected = _jwt_sign(header_b64, payload_b64, secret)
+    if not hmac.compare_digest(sig_b64, expected):
+        raise ValueError("Invalid signature")
+    payload = json.loads(_b64u_dec(payload_b64))
+    if payload.get("exp", 0) < time.time():
+        raise ValueError("Token expired")
+    return payload
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  JWTManager — secret persistence + token issuance + blocklist
+# ─────────────────────────────────────────────────────────────────────
+
+_SECRET_FILE = Path(".checkpoints/jwt_secret.txt")
+
+
+class JWTManager:
+    """Manages JWT signing secret and refresh-token revocation list."""
+
+    def __init__(self) -> None:
+        self._secret: str = self._load_or_create()
+        self._blocklist: Set[str] = set()  # revoked refresh-token JTIs
+
+    # ── Secret lifecycle ──────────────────────────────────────────
+
+    def _load_or_create(self) -> str:
+        if _SECRET_FILE.exists():
+            s = _SECRET_FILE.read_text(encoding="utf-8").strip()
+            if s:
+                logger.debug("JWT secret loaded from %s", _SECRET_FILE)
+                return s
+        return self._save_new_secret()
+
+    def _save_new_secret(self) -> str:
+        secret = secrets.token_urlsafe(48)
+        _SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _SECRET_FILE.write_text(secret, encoding="utf-8")
+        return secret
+
+    def rotate(self) -> None:
+        """Generate a new secret and save it. All existing tokens immediately invalid."""
+        self._secret = self._save_new_secret()
+        self._blocklist.clear()
+        logger.info("JWT secret rotated — all existing sessions invalidated.")
+
+    # ── Token issuance ────────────────────────────────────────────
+
+    def issue_access(self) -> str:
+        exp = int(time.time()) + config.JWT_ACCESS_EXPIRES_MINUTES * 60
+        return _jwt_encode({"sub": "dashboard", "type": "access",
+                            "iat": int(time.time()), "exp": exp}, self._secret)
+
+    def issue_refresh(self) -> str:
+        jti = secrets.token_urlsafe(16)
+        exp = int(time.time()) + config.JWT_REFRESH_EXPIRES_DAYS * 86400
+        return _jwt_encode({"sub": "dashboard", "type": "refresh",
+                            "jti": jti, "iat": int(time.time()), "exp": exp}, self._secret)
+
+    # ── Token verification ────────────────────────────────────────
+
+    def verify_access(self, token: str) -> dict:
+        payload = _jwt_decode(token, self._secret)
+        if payload.get("type") != "access":
+            raise ValueError("Not an access token")
+        return payload
+
+    def verify_refresh(self, token: str) -> dict:
+        payload = _jwt_decode(token, self._secret)
+        if payload.get("type") != "refresh":
+            raise ValueError("Not a refresh token")
+        if payload.get("jti", "") in self._blocklist:
+            raise ValueError("Token revoked")
+        return payload
+
+    def revoke_refresh(self, token: str) -> None:
+        try:
+            payload = _jwt_decode(token, self._secret)
+            jti = payload.get("jti", "")
+            if jti:
+                self._blocklist.add(jti)
+        except Exception:
+            pass  # already invalid — nothing to do
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  DashboardServer
+# ─────────────────────────────────────────────────────────────────────
+
 class DashboardServer:
 
     def __init__(self, trade_journal, checkpoint_service) -> None:
         self.journal    = trade_journal
         self.checkpoint = checkpoint_service
         self._thread: Optional[threading.Thread] = None
+        self._jwt       = JWTManager()
+        self._password  = self._resolve_password()
+
+    def _resolve_password(self) -> str:
+        pw = getattr(config, "DASHBOARD_PASSWORD", "").strip()
+        if pw:
+            return pw
+        generated = secrets.token_urlsafe(16)
+        logger.warning(
+            "┌──────────────────────────────────────────────────────┐\n"
+            "│  DASHBOARD_PASSWORD not set — auto-generated:         │\n"
+            "│  %-52s │\n"
+            "│  Add DASHBOARD_PASSWORD=<above> to your .env file.   │\n"
+            "└──────────────────────────────────────────────────────┘",
+            generated,
+        )
+        return generated
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -106,7 +256,6 @@ class DashboardServer:
     def _run(self) -> None:
         try:
             from flask import Flask, jsonify, request, send_file
-            from flask import Response
         except ImportError:
             logger.error(
                 "Flask not installed — dashboard unavailable. "
@@ -117,9 +266,84 @@ class DashboardServer:
         app = Flask(__name__)
         app.config["JSON_SORT_KEYS"] = False
 
+        jwt_mgr  = self._jwt
+        password = self._password
+
+        # ── Auth helpers ─────────────────────────────────────────────
+
+        def require_auth(f):
+            @functools.wraps(f)
+            def wrapper(*args, **kwargs):
+                auth = request.headers.get("Authorization", "")
+                if not auth.startswith("Bearer "):
+                    return jsonify({"error": "Missing Authorization header"}), 401
+                try:
+                    jwt_mgr.verify_access(auth[7:])
+                except ValueError as exc:
+                    return jsonify({"error": str(exc)}), 401
+                return f(*args, **kwargs)
+            return wrapper
+
+        def _check_password(candidate: str) -> bool:
+            return hmac.compare_digest(
+                candidate.encode("utf-8"),
+                password.encode("utf-8"),
+            )
+
+        # ── Auth endpoints (public) ──────────────────────────────────
+
+        @app.route("/api/auth/login", methods=["POST"])
+        def auth_login():
+            data = request.get_json(silent=True) or {}
+            if not _check_password(data.get("password", "")):
+                logger.warning("Dashboard: failed login attempt from %s",
+                               request.remote_addr)
+                return jsonify({"error": "Invalid password"}), 401
+            logger.info("Dashboard: login from %s", request.remote_addr)
+            return jsonify({
+                "access_token":  jwt_mgr.issue_access(),
+                "refresh_token": jwt_mgr.issue_refresh(),
+                "expires_in":    config.JWT_ACCESS_EXPIRES_MINUTES * 60,
+            })
+
+        @app.route("/api/auth/refresh", methods=["POST"])
+        def auth_refresh():
+            data = request.get_json(silent=True) or {}
+            rt   = data.get("refresh_token", "")
+            try:
+                jwt_mgr.verify_refresh(rt)
+            except ValueError as exc:
+                return jsonify({"error": str(exc)}), 401
+            return jsonify({
+                "access_token": jwt_mgr.issue_access(),
+                "expires_in":   config.JWT_ACCESS_EXPIRES_MINUTES * 60,
+            })
+
+        @app.route("/api/auth/logout", methods=["POST"])
+        def auth_logout():
+            data = request.get_json(silent=True) or {}
+            rt   = data.get("refresh_token", "")
+            if rt:
+                jwt_mgr.revoke_refresh(rt)
+            logger.info("Dashboard: logout from %s", request.remote_addr)
+            return jsonify({"ok": True})
+
+        @app.route("/api/auth/rotate-secret", methods=["POST"])
+        def auth_rotate():
+            data = request.get_json(silent=True) or {}
+            if not _check_password(data.get("password", "")):
+                return jsonify({"error": "Invalid password"}), 401
+            jwt_mgr.rotate()
+            logger.info("Dashboard: JWT secret rotated by %s", request.remote_addr)
+            return jsonify({
+                "ok": True,
+                "message": "Secret rotated. All existing sessions have been invalidated.",
+            })
+
         # ── Static ──────────────────────────────────────────────────
 
         @app.route("/")
+        @require_auth
         def index():
             p = Path("src/dashboard/index.html")
             if p.exists():
@@ -129,6 +353,7 @@ class DashboardServer:
         # ── Status ──────────────────────────────────────────────────
 
         @app.route("/api/status")
+        @require_auth
         def status():
             cp  = self.checkpoint.load() or {}
             uptime_secs = int(
@@ -147,13 +372,15 @@ class DashboardServer:
         # ── Analytics ───────────────────────────────────────────────
 
         @app.route("/api/stats")
+        @require_auth
         def stats():
             return jsonify({
-                "global":     self.journal.get_stats(),
-                "by_symbol":  self.journal.get_stats_by_symbol(),
+                "global":    self.journal.get_stats(),
+                "by_symbol": self.journal.get_stats_by_symbol(),
             })
 
         @app.route("/api/trades")
+        @require_auth
         def trades():
             n = int(request.args.get("n", 50))
             return jsonify({"trades": self.journal.get_recent(n)})
@@ -161,6 +388,7 @@ class DashboardServer:
         # ── Config ──────────────────────────────────────────────────
 
         @app.route("/api/config", methods=["GET"])
+        @require_auth
         def get_config():
             return jsonify({
                 "symbols":             config.SYMBOLS,
@@ -177,6 +405,7 @@ class DashboardServer:
             })
 
         @app.route("/api/config", methods=["PATCH"])
+        @require_auth
         def update_config():
             data    = request.get_json(silent=True) or {}
             changed = []
@@ -187,23 +416,20 @@ class DashboardServer:
                         changed.append(key)
                     except (ValueError, TypeError) as exc:
                         logger.warning("Config update: bad value for %s — %s", key, exc)
-
             if changed:
                 logger.info("Config updated via dashboard: %s", changed)
-                # Persist to disk so changes survive a bot restart.
-                # Previously all PATCH changes were in-memory only and
-                # lost whenever the container or process restarted.
                 _persist_config_overrides(changed, _CONFIG_MAP)
-
             return jsonify({"updated": changed, "ok": True})
 
         # ── Symbols ─────────────────────────────────────────────────
 
         @app.route("/api/symbols", methods=["GET"])
+        @require_auth
         def get_symbols():
             return jsonify({"symbols": config.SYMBOLS})
 
         @app.route("/api/symbols", methods=["POST"])
+        @require_auth
         def add_symbol():
             data = request.get_json(silent=True) or {}
             sym  = data.get("symbol", "").upper().strip()
@@ -216,6 +442,7 @@ class DashboardServer:
             return jsonify({"ok": True, "symbols": config.SYMBOLS})
 
         @app.route("/api/symbols/<symbol>", methods=["DELETE"])
+        @require_auth
         def remove_symbol(symbol):
             sym = symbol.upper()
             if sym not in config.SYMBOLS:
@@ -227,13 +454,23 @@ class DashboardServer:
         # ── Log tail ────────────────────────────────────────────────
 
         @app.route("/api/logs")
+        @require_auth
         def logs():
             n    = int(request.args.get("n", 100))
             logf = Path("trading_bot.log")
             if not logf.exists():
                 return jsonify({"lines": []})
             try:
-                lines = logf.read_text(encoding="utf-8", errors="replace").splitlines()
+                chunk_size = n * 512
+                with open(logf, "rb") as f:
+                    f.seek(0, 2)
+                    file_size = f.tell()
+                    read_from = max(0, file_size - chunk_size)
+                    f.seek(read_from)
+                    raw = f.read().decode("utf-8", errors="replace")
+                lines = raw.splitlines()
+                if read_from > 0 and lines:
+                    lines = lines[1:]
                 return jsonify({"lines": lines[-n:]})
             except Exception as exc:
                 return jsonify({"lines": [], "error": str(exc)})

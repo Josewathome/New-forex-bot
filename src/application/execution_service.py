@@ -37,6 +37,7 @@ from src.application.analysis import (
 from src.application.news_manager import NewsManager
 from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl
 from src.infrastructure.spread_calculator import SpreadCalculator
+from src.infrastructure.trade_journal import TradeJournal
 
 logger = logging.getLogger(__name__)
 _M5 = timedelta(minutes=5)
@@ -66,6 +67,29 @@ class _OpenTradeState:
     recent_signals:  List = field(default_factory=list)
     sl_trailed:      bool = False
     created_at:      Optional[datetime] = None
+    accumulated_pips: float = 0.0   # pips banked from TP1/TP2 partial closes
+    digits:           int   = 5     # symbol digit count for PipCalculator reconstruction
+    grade:            str   = "?"   # setup grade recorded in the journal
+
+
+@dataclass
+class EntryCandidate:
+    """All data needed to execute a trade, collected during evaluation."""
+    symbol:      str
+    signal:      TradeSignal
+    zone:        Zone
+    setup_score: int
+    trade_score: int
+    grade:       str
+    risk_pct:    float
+    tp1_price:   float
+    tp2_price:   float
+    broker_cost: BrokerCost
+    pip_calc:    PipCalculator
+    tick_value:  float
+    digits:      int
+    h1_atr:      float
+    is_phase2:   bool = False
 
 
 class ExecutionService:
@@ -82,6 +106,7 @@ class ExecutionService:
         commission:        float,
         min_rr:            float,
         account_currency:  str,
+        journal:           Optional[TradeJournal] = None,
     ) -> None:
         self._md          = market_data
         self._tr          = trade_repo
@@ -93,6 +118,7 @@ class ExecutionService:
         self._commission  = commission
         self._min_rr      = min_rr
         self._currency    = account_currency
+        self._journal     = journal
         self._zone_mapper = ZoneMapper()
         self._trade_states: Dict[int, _OpenTradeState] = {}
 
@@ -108,12 +134,39 @@ class ExecutionService:
         if pool:
             self._zr.save_liquidity_pool(pool)
 
-    def run_monitoring_cycle(self, symbol: str) -> Optional[Trade]:
+    # ── Phase helpers ─────────────────────────────────────────────────
+
+    def open_count_for_symbol(self, symbol: str) -> int:
+        return sum(1 for p in self._tr.get_open_positions() if p.symbol == symbol)
+
+    def has_tp1_hit_for_symbol(self, symbol: str) -> bool:
+        """True when at least one open trade on symbol has hit TP1 (proven winner)."""
+        return any(
+            state.tp1_hit
+            for state in self._trade_states.values()
+            if state.symbol == symbol
+        )
+
+    # ── Phase 1: monitoring ───────────────────────────────────────────
+
+    def run_monitoring_only(self, symbol: str) -> None:
+        """Prune closed positions and run the trade-monitor for symbol."""
         now = datetime.now(tz=timezone.utc)
         self._prune_closed_positions()
-
         if getattr(config, "MONITOR_ENABLED", True):
             self._monitor_open_trades(symbol, now)
+
+    # ── Phase 1: signal evaluation (no execution) ─────────────────────
+
+    def collect_entry_candidate(
+        self, symbol: str, is_phase2: bool = False
+    ) -> Optional[EntryCandidate]:
+        """
+        Evaluate all zones for symbol and return the highest-qualifying
+        EntryCandidate without placing a trade.  Returns None when no
+        signal qualifies or preconditions (news / session / data) fail.
+        """
+        now = datetime.now(tz=timezone.utc)
 
         if self._news.is_blocked(symbol, now):
             return None
@@ -121,14 +174,12 @@ class ExecutionService:
             return None
 
         broker_cost = self._spread.get_broker_cost(symbol)
-        # Fetch 100 H1 bars: 14 for ATR warmup + 50 for baseline_atr + headroom.
-        # Previously only 20 were fetched, making the >=50 baseline check always false
-        # and leaving compute_dynamic_tp() permanently locked to the static ratios.
-        h1_short    = self._md.get_candles(symbol, Timeframe.H1, 100)
-        h1_atr      = atr(h1_short) if h1_short else 0.0
-        digits      = self._md.get_symbol_digits(symbol)
-        pip_calc    = PipCalculator(digits=digits)
-        tick_value  = self._md.get_tick_value(symbol)
+        # 100 H1 bars: 14 for ATR warmup + 50 for baseline_atr + headroom.
+        h1_short   = self._md.get_candles(symbol, Timeframe.H1, 100)
+        h1_atr     = atr(h1_short) if h1_short else 0.0
+        digits     = self._md.get_symbol_digits(symbol)
+        pip_calc   = PipCalculator(digits=digits)
+        tick_value = self._md.get_tick_value(symbol)
 
         if h1_short and self._news.broker_cost_exceeds_atr(
                 symbol, h1_atr, broker_cost, pip_calc):
@@ -138,9 +189,9 @@ class ExecutionService:
         if not h4:
             return None
 
-        h4_bias             = find_h4_bias(h4)
-        _, _, h4_eq         = compute_h4_equilibrium(h4)
-        ask                 = self._md.get_current_price(symbol)
+        h4_bias         = find_h4_bias(h4)
+        _, _, h4_eq     = compute_h4_equilibrium(h4)
+        ask             = self._md.get_current_price(symbol)
         if ask == 0.0:
             return None
 
@@ -151,6 +202,7 @@ class ExecutionService:
             return None
 
         sym_min_score = config.SYMBOL_MIN_SCORE.get(symbol, config.SETUP_SCORE_THRESHOLD)
+        baseline_atr  = atr(h1_short[-50:]) if len(h1_short) >= 50 else h1_atr
 
         for zone in zones:
             setup_score = score_setup(zone.direction, h4_bias, ask, h4_eq)
@@ -159,7 +211,8 @@ class ExecutionService:
                              symbol, setup_score, sym_min_score)
                 continue
 
-            grade, risk_pct, min_rr = grade_setup(setup_score)
+            # grade / min_rr used for ChoCh RR gate; risk_pct overwritten by dynamic_risk()
+            grade, _, min_rr = grade_setup(setup_score)
 
             if not (ask <= zone.high + zone_buf and ask >= zone.low - zone_buf):
                 continue
@@ -183,86 +236,142 @@ class ExecutionService:
                 logger.info("REJECTED | %s | SL=%.1f pips below minimum", symbol, sl_pips)
                 continue
 
-            open_count = sum(1 for t in self._tr.get_open_positions() if t.symbol == symbol)
-            if open_count >= config.MAX_OPEN_TRADES:
-                continue
-
-            # ── Trade Scoring ─────────────────────────────────────
-            htf_aligned = (h4_bias == zone.direction)
-            liquidity_sweep = (zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count == 0)
-            fvg_clean = (zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.size > h1_atr * 0.5)
+            # ── Trade Scoring ──────────────────────────────────────
+            htf_aligned         = (h4_bias == zone.direction)
+            liquidity_sweep     = (zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count == 0)
+            fvg_clean           = (zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.size > h1_atr * 0.5)
             strong_displacement = (signal.volume_ratio >= 1.5)
-            in_kill_zone = is_kill_zone(signal.created_at)
+            in_kill_zone        = is_kill_zone(signal.created_at)
 
             trade_score = score_trade(
                 htf_aligned, liquidity_sweep, fvg_clean,
-                strong_displacement, in_kill_zone
+                strong_displacement, in_kill_zone,
             )
             if trade_score < config.TRADE_SCORE_THRESHOLD:
                 logger.info("REJECTED | %s | low trade score %d < %d",
                             symbol, trade_score, config.TRADE_SCORE_THRESHOLD)
                 continue
 
-            # ── Dynamic Risk ──────────────────────────────────────
             risk_pct = dynamic_risk(trade_score)
 
-            # ── Dynamic TP ────────────────────────────────────────
-            baseline_atr = atr(h1_short[-50:]) if len(h1_short) >= 50 else h1_atr
             tp1_ratio, tp2_ratio = compute_dynamic_tp(
                 signal.direction, signal.entry_price, signal.stop_loss,
-                h1_atr, baseline_atr
+                h1_atr, baseline_atr,
             )
-            tp1_price = (signal.entry_price + tp1_ratio * abs(signal.entry_price - signal.stop_loss)
-                         if signal.direction == Direction.BULLISH
-                         else signal.entry_price - tp1_ratio * abs(signal.entry_price - signal.stop_loss))
-            tp2_price = (signal.entry_price + tp2_ratio * abs(signal.entry_price - signal.stop_loss)
-                         if signal.direction == Direction.BULLISH
-                         else signal.entry_price - tp2_ratio * abs(signal.entry_price - signal.stop_loss))
-
-            trade = self._build_trade(signal, broker_cost, pip_calc, tick_value,
-                                      risk_pct_override=risk_pct,
-                                      tp1_price=tp1_price, tp2_price=tp2_price)
-            if trade is None:
-                continue
-
-            ticket = self._tr.place_trade(trade)
-            if ticket is None:
-                logger.error("Trade placement failed for %s", symbol)
-                continue
-
-            trade.mt5_ticket = ticket
-            trade.status = TradeStatus.OPEN
-            trade.initial_risk = get_initial_risk(signal.entry_price, signal.stop_loss)
-            trade.remaining_volume = trade.lot_size
-
-            self._trade_states[ticket] = _OpenTradeState(
-                ticket=ticket,
-                symbol=symbol,
-                direction=signal.direction,
-                entry=signal.entry_price,
-                original_sl=signal.stop_loss,
-                current_sl=signal.stop_loss,
-                take_profit=signal.take_profit,
-                tp1_price=tp1_price,
-                tp2_price=tp2_price,
-                lot_size=trade.lot_size,
-                initial_risk=trade.initial_risk,
-                mfe_price=signal.entry_price,
-                created_at=datetime.now(tz=timezone.utc),
+            tp1_price = (
+                signal.entry_price + tp1_ratio * abs(signal.entry_price - signal.stop_loss)
+                if signal.direction == Direction.BULLISH
+                else signal.entry_price - tp1_ratio * abs(signal.entry_price - signal.stop_loss)
+            )
+            tp2_price = (
+                signal.entry_price + tp2_ratio * abs(signal.entry_price - signal.stop_loss)
+                if signal.direction == Direction.BULLISH
+                else signal.entry_price - tp2_ratio * abs(signal.entry_price - signal.stop_loss)
             )
 
-            logger.info(
-                "TRADE ✓ | %s %s | grade=%s | score=%d | "
-                "entry=%.5f SL=%.5f TP1=%.5f TP2=%.5f TP_final=%.5f | "
-                "lot=%.2f | RR=%.2f",
-                symbol, signal.direction.value, grade, trade_score,
-                signal.entry_price, signal.stop_loss,
-                tp1_price or 0, tp2_price or 0, signal.take_profit,
-                trade.lot_size, signal.risk_reward,
+            return EntryCandidate(
+                symbol=symbol,      signal=signal,       zone=zone,
+                setup_score=setup_score,                 trade_score=trade_score,
+                grade=grade,        risk_pct=risk_pct,
+                tp1_price=tp1_price, tp2_price=tp2_price,
+                broker_cost=broker_cost, pip_calc=pip_calc,
+                tick_value=tick_value,   digits=digits,
+                h1_atr=h1_atr,      is_phase2=is_phase2,
             )
-            return trade
 
         return None
+
+    # ── Phase 1 & 2: execution ────────────────────────────────────────
+
+    def execute_entry_candidate(self, candidate: EntryCandidate) -> Optional[Trade]:
+        """Build, margin-check, and place the trade for a pre-evaluated candidate."""
+        symbol = candidate.symbol
+        signal = candidate.signal
+
+        trade = self._build_trade(
+            signal, candidate.broker_cost, candidate.pip_calc,
+            candidate.tick_value, risk_pct_override=candidate.risk_pct,
+        )
+        if trade is None:
+            return None
+
+        req_margin  = self._tr.get_required_margin(trade)
+        free_margin = self._tr.get_free_margin()
+        safety      = getattr(config, "MARGIN_SAFETY_FACTOR", 2.0)
+        if req_margin is not None and free_margin < req_margin * safety:
+            logger.warning(
+                "MARGIN SKIP | %s | trade needs %.2f × %.1f safety = %.2f "
+                "but free margin is only %.2f — skipping.",
+                symbol, req_margin, safety, req_margin * safety, free_margin,
+            )
+            return None
+        if req_margin is None:
+            logger.debug("MARGIN CHECK unavailable for %s — proceeding (MT5 will enforce).", symbol)
+
+        ticket = self._tr.place_trade(trade)
+        if ticket is None:
+            logger.error("Trade placement failed for %s", symbol)
+            return None
+
+        trade.mt5_ticket      = ticket
+        trade.status          = TradeStatus.OPEN
+        trade.initial_risk    = get_initial_risk(signal.entry_price, signal.stop_loss)
+        trade.remaining_volume = trade.lot_size
+
+        self._trade_states[ticket] = _OpenTradeState(
+            ticket=ticket,
+            symbol=symbol,
+            direction=signal.direction,
+            entry=signal.entry_price,
+            original_sl=signal.stop_loss,
+            current_sl=signal.stop_loss,
+            take_profit=signal.take_profit,
+            tp1_price=candidate.tp1_price,
+            tp2_price=candidate.tp2_price,
+            lot_size=trade.lot_size,
+            initial_risk=trade.initial_risk,
+            mfe_price=signal.entry_price,
+            created_at=datetime.now(tz=timezone.utc),
+            digits=candidate.digits,
+            grade=candidate.grade,
+        )
+        if self._journal:
+            try:
+                self._journal.record_open(
+                    ticket=ticket,    symbol=symbol,
+                    direction=signal.direction.value,
+                    entry=signal.entry_price, sl=signal.stop_loss,
+                    tp=signal.take_profit,    lot_size=trade.lot_size,
+                    grade=candidate.grade,
+                )
+            except Exception as exc:
+                logger.warning("Journal record_open failed ticket=%s: %s", ticket, exc)
+
+        phase_tag = "P2" if candidate.is_phase2 else "P1"
+        logger.info(
+            "TRADE ✓ [%s] | %s %s | grade=%s | score=%d | "
+            "entry=%.5f SL=%.5f TP1=%.5f TP2=%.5f TP_final=%.5f | "
+            "lot=%.2f | RR=%.2f",
+            phase_tag, symbol, signal.direction.value, candidate.grade, candidate.trade_score,
+            signal.entry_price, signal.stop_loss,
+            candidate.tp1_price or 0, candidate.tp2_price or 0, signal.take_profit,
+            trade.lot_size, signal.risk_reward,
+        )
+        return trade
+
+    # ── Legacy wrapper (used by backtest / one-symbol callers) ────────
+
+    def run_monitoring_cycle(self, symbol: str) -> Optional[Trade]:
+        """Single-symbol wrapper: monitor + evaluate + execute in one call."""
+        self.run_monitoring_only(symbol)
+        if len(self._tr.get_open_positions()) >= config.MAX_OPEN_TRADES:
+            return None
+        if self.open_count_for_symbol(symbol) >= getattr(config, "MAX_TRADES_PER_SYMBOL", 2):
+            return None
+        candidate = self.collect_entry_candidate(symbol)
+        if candidate is None:
+            return None
+        return self.execute_entry_candidate(candidate)
 
     def _monitor_open_trades(self, symbol: str, now: datetime) -> None:
         open_positions = [p for p in self._tr.get_open_positions() if p.symbol == symbol]
@@ -293,6 +402,7 @@ class ExecutionService:
                     initial_risk=get_initial_risk(pos.entry_price, pos.stop_loss),
                     mfe_price=pos.entry_price,
                     created_at=pos.created_at,
+                    digits=digits,
                 )
 
             state = self._trade_states[ticket]
@@ -353,15 +463,28 @@ class ExecutionService:
                     closed = self._tr.partial_close_trade(ticket, close_vol, comment="ZoneBot TP1")
                     if closed:
                         state.tp1_hit = True
-                        state.lot_size -= close_vol
-                        profit_lock_dist = state.initial_risk * 0.3
+                        if state.tp1_price:
+                            state.accumulated_pips += pip_calc.price_to_pips(
+                                abs(state.tp1_price - state.entry))
+                        remaining = self._tr.get_remaining_volume(ticket)
+                        if remaining is not None:
+                            state.lot_size = remaining
+                        else:
+                            logger.warning(
+                                "TP1 volume fallback | ticket=%s | MT5 position not found after partial close "
+                                "— using arithmetic estimate (%.2f - %.2f = %.2f lots)",
+                                ticket, state.lot_size, close_vol, max(0.01, state.lot_size - close_vol),
+                            )
+                            state.lot_size = max(0.01, state.lot_size - close_vol)
+                        profit_lock_dist = state.initial_risk * config.TP1_PROFIT_LOCK_R
                         if state.direction == Direction.BULLISH:
                             new_sl = state.entry + profit_lock_dist
                         else:
                             new_sl = state.entry - profit_lock_dist
                         self._tr.modify_sl(ticket, new_sl)
                         state.current_sl = new_sl
-                        logger.info("Profit‑lock SL moved to %.5f (entry + 0.3R)", new_sl)
+                        logger.info("Profit-lock SL moved to %.5f (entry + %.1fR)",
+                                    new_sl, config.TP1_PROFIT_LOCK_R)
                     else:
                         logger.error("Partial close failed for TP1 ticket=%s", ticket)
 
@@ -382,7 +505,19 @@ class ExecutionService:
                     closed = self._tr.partial_close_trade(ticket, close_vol, comment="ZoneBot TP2")
                     if closed:
                         state.tp2_hit = True
-                        state.lot_size -= close_vol
+                        if state.tp2_price:
+                            state.accumulated_pips += pip_calc.price_to_pips(
+                                abs(state.tp2_price - state.entry))
+                        remaining = self._tr.get_remaining_volume(ticket)
+                        if remaining is not None:
+                            state.lot_size = remaining
+                        else:
+                            logger.warning(
+                                "TP2 volume fallback | ticket=%s | MT5 position not found after partial close "
+                                "— using arithmetic estimate (%.2f - %.2f = %.2f lots)",
+                                ticket, state.lot_size, close_vol, max(0.01, state.lot_size - close_vol),
+                            )
+                            state.lot_size = max(0.01, state.lot_size - close_vol)
 
             # ── Monitor checks ────────────────────────────────────
             if not m1_bars:
@@ -446,6 +581,16 @@ class ExecutionService:
                                pip_calc.price_to_pips(abs(state.mfe_price - state.entry)))
                 if self._tr.close_trade(ticket):
                     self._log_trade_summary(pos, state, pip_calc)
+                    direction_sign = 1 if state.direction == Direction.BULLISH else -1
+                    final_pips = pip_calc.price_to_pips(abs(price - state.entry)) * direction_sign
+                    total_pips = state.accumulated_pips + final_pips
+                    if state.tp2_hit:
+                        _outcome = "WIN_FULL"
+                    elif state.tp1_hit or total_pips > 0:
+                        _outcome = "WIN_PARTIAL"
+                    else:
+                        _outcome = "MONITOR_CLOSE"
+                    self._journal_close(ticket, total_pips, _outcome)
                     del self._trade_states[ticket]
 
             elif action == "trail_sl" and new_sl != state.current_sl:
@@ -460,13 +605,17 @@ class ExecutionService:
             return False
         last_three = m5_window[-3:]
         if direction == Direction.BULLISH:
-            return (last_three[0].close > last_three[0].open and
-                    last_three[1].close > last_three[0].high and
-                    last_three[2].close > last_three[1].high)
+            return (
+                all(c.is_bullish for c in last_three) and
+                last_three[1].close > last_three[0].close and
+                last_three[2].close > last_three[1].close
+            )
         else:
-            return (last_three[0].close < last_three[0].open and
-                    last_three[1].close < last_three[0].low and
-                    last_three[2].close < last_three[1].low)
+            return (
+                all(c.is_bearish for c in last_three) and
+                last_three[1].close < last_three[0].close and
+                last_three[2].close < last_three[1].close
+            )
 
     def _log_trade_summary(self, trade: Trade, state: _OpenTradeState, pip_calc: PipCalculator) -> None:
         if trade.initial_risk <= 0:
@@ -495,27 +644,34 @@ class ExecutionService:
         if not self._trade_states:
             return
         open_tickets = {p.mt5_ticket or int(p.id) for p in self._tr.get_open_positions()}
-        now = datetime.now(tz=timezone.utc)
-        # Primary prune: remove any state whose ticket is no longer open in MT5.
-        # This handles normal bot-managed closes (TP hit, monitor close, time exit).
-        #
-        # TTL prune: also evict entries older than 24 h whose ticket is gone.
-        # This catches positions closed MANUALLY in MT5 — those bypass the normal
-        # close path so their state would otherwise linger in memory indefinitely.
-        # After months of trading this dict would grow without bound.
-        _TTL = timedelta(hours=24)
-        stale = [
-            t for t, s in self._trade_states.items()
-            if t not in open_tickets or (
-                s.created_at is not None and (now - s.created_at) > _TTL
-                and t not in open_tickets
-            )
-        ]
+        # Covers SL hits, manual closes from MT5 terminal, and bot-managed closes.
+        stale = [t for t in self._trade_states if t not in open_tickets]
         for t in stale:
+            state = self._trade_states[t]
+            pip_calc = PipCalculator(digits=state.digits)
+            # Best estimate: MT5 closed at or near the current SL level.
+            close_est = state.current_sl
+            direction_sign = 1 if state.direction == Direction.BULLISH else -1
+            final_pips = pip_calc.price_to_pips(abs(close_est - state.entry)) * direction_sign
+            total_pips = state.accumulated_pips + final_pips
+            if state.tp2_hit:
+                _outcome = "WIN_FULL"
+            elif state.tp1_hit or total_pips > 0:
+                _outcome = "WIN_PARTIAL"
+            else:
+                _outcome = "LOSS"
+            self._journal_close(t, total_pips, _outcome)
             del self._trade_states[t]
 
+    def _journal_close(self, ticket: int, pips: float, outcome: str) -> None:
+        if self._journal:
+            try:
+                self._journal.record_close(ticket, round(pips, 1), outcome)
+            except Exception as exc:
+                logger.warning("Journal record_close failed ticket=%s: %s", ticket, exc)
+
     def _build_trade(self, signal, broker_cost, pip_calc, tick_value,
-                     risk_pct_override=None, tp1_price=None, tp2_price=None):
+                     risk_pct_override=None):
         balance = self._tr.get_account_balance()
         if balance <= 0:
             return None
@@ -530,11 +686,9 @@ class ExecutionService:
         # round() would push e.g. 0.125 → 0.13 lots, overspending by ~4%.
         lot_size = max(0.01, math.floor(risk_params.lot_size(sl_pips, tick_value, pip_calc) * 100) / 100)
 
-        # Use provided TP1/TP2 if given, else compute from signal
+        # MT5 order carries the liquidity-pool TP as the final hard stop.
+        # TP1 and TP2 partial closes are managed by the monitor loop.
         final_tp = signal.take_profit
-        if tp1_price is not None and tp2_price is not None:
-            # For live, we set TP to TP2 (full target) and handle TP1 via monitor
-            pass
 
         return Trade(
             id=          str(uuid.uuid4()),

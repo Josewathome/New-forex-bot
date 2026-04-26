@@ -14,7 +14,7 @@
   .header-title{font-size:18px;font-weight:700;display:flex;align-items:center;gap:10px}
   .dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-  .header-meta{color:var(--muted);font-size:12px;text-align:right}
+  .header-meta{color:var(--muted);font-size:12px;text-align:right;display:flex;align-items:center;gap:16px}
   .tabs{background:var(--card);border-bottom:1px solid var(--border);display:flex;padding:0 24px}
   .tab{padding:14px 18px;cursor:pointer;border-bottom:2px solid transparent;color:var(--muted);font-weight:500;transition:.2s}
   .tab:hover{color:var(--text)}
@@ -53,6 +53,8 @@
   .btn-primary:hover{filter:brightness(1.15)}
   .btn-danger{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}
   .btn-danger:hover{background:rgba(239,68,68,.25)}
+  .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border)}
+  .btn-ghost:hover{color:var(--text);border-color:var(--text)}
   .btn-sm{padding:4px 12px;font-size:12px}
   .form-actions{padding:0 18px 18px;display:flex;gap:10px;align-items:center}
   .save-msg{font-size:12px;color:var(--green);opacity:0;transition:.3s}
@@ -83,9 +85,40 @@
   .slider:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.3s}
   input:checked+.slider{background:var(--accent)}
   input:checked+.slider:before{transform:translateX(18px)}
+  /* Login overlay */
+  #loginOverlay{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:9999}
+  .login-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:40px 36px;width:360px;max-width:92vw}
+  .login-title{font-size:22px;font-weight:700;text-align:center;margin-bottom:6px}
+  .login-sub{color:var(--muted);font-size:13px;text-align:center;margin-bottom:28px}
+  .login-error{background:rgba(239,68,68,.12);color:var(--red);border:1px solid rgba(239,68,68,.25);border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:13px;display:none}
+  .login-field{margin-bottom:16px}
+  .login-field label{display:block;font-size:12px;color:var(--muted);font-weight:500;margin-bottom:6px}
+  .login-field input{width:100%;background:#13151f;border:1px solid var(--border);color:var(--text);padding:11px 14px;border-radius:8px;font-size:14px;transition:.2s}
+  .login-field input:focus{outline:none;border-color:var(--accent)}
+  .login-btn{width:100%;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:600;cursor:pointer;transition:.2s;margin-top:4px}
+  .login-btn:hover{filter:brightness(1.12)}
+  .login-btn:disabled{opacity:.6;cursor:default}
 </style>
 </head>
 <body>
+
+<!-- ── Login overlay ──────────────────────────────────────────────── -->
+<div id="loginOverlay">
+  <div class="login-card">
+    <div class="login-title">Zone Bot</div>
+    <div class="login-sub">Enter your dashboard password to continue</div>
+    <div class="login-error" id="loginError"></div>
+    <div class="login-field">
+      <label>Password</label>
+      <input type="password" id="loginPassword" placeholder="Dashboard password"
+             onkeydown="if(event.key==='Enter')doLogin()"/>
+    </div>
+    <button class="login-btn" id="loginBtn" onclick="doLogin()">Sign In</button>
+  </div>
+</div>
+
+<!-- ── Main app ───────────────────────────────────────────────────── -->
+<div id="app" style="display:none">
 
 <div class="header">
   <div class="header-title">
@@ -93,8 +126,11 @@
     Zone Bot
   </div>
   <div class="header-meta">
-    <div id="serverTime">Loading...</div>
-    <div id="uptime" class="uptime"></div>
+    <div style="text-align:right">
+      <div id="serverTime">Loading...</div>
+      <div id="uptime" class="uptime"></div>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="doLogout()" title="Sign out">Sign out</button>
   </div>
 </div>
 
@@ -184,6 +220,17 @@
       <span class="save-msg" id="saveMsgTP">Saved!</span>
     </div>
   </div>
+
+  <div class="section">
+    <div class="section-header">Security</div>
+    <div style="padding:18px">
+      <p style="color:var(--muted);font-size:13px;margin-bottom:16px">
+        Rotating the JWT secret immediately invalidates all active sessions (including this one).
+        You will be redirected to sign in again.
+      </p>
+      <button class="btn btn-danger" onclick="rotateSecret()">Rotate JWT Secret</button>
+    </div>
+  </div>
 </div>
 
 <!-- LOGS -->
@@ -197,10 +244,120 @@
   </div>
 </div>
 
-<script>
-const API = '';  // same host
+</div><!-- #app -->
 
-// ── Tab navigation ─────────────────────────────────────────────
+<script>
+// ── Token storage ────────────────────────────────────────────────────
+// Access token in sessionStorage (cleared on tab close).
+// Refresh token in localStorage (persists across tabs/restarts).
+let accessToken  = sessionStorage.getItem('zb_access');
+let refreshToken = localStorage.getItem('zb_refresh');
+
+// ── Login / logout UI ────────────────────────────────────────────────
+function showLogin(msg) {
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('loginOverlay').style.display = 'flex';
+  document.getElementById('loginPassword').value = '';
+  if (msg) {
+    const el = document.getElementById('loginError');
+    el.textContent = msg;
+    el.style.display = 'block';
+  } else {
+    document.getElementById('loginError').style.display = 'none';
+  }
+}
+
+function showApp() {
+  document.getElementById('loginOverlay').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+}
+
+async function doLogin() {
+  const btn = document.getElementById('loginBtn');
+  const pw  = document.getElementById('loginPassword').value;
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pw}),
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      showLogin(d.error || 'Invalid password');
+      return;
+    }
+    accessToken  = d.access_token;
+    refreshToken = d.refresh_token;
+    sessionStorage.setItem('zb_access',  accessToken);
+    localStorage.setItem('zb_refresh',   refreshToken);
+    showApp();
+    loadConfig();
+    refresh();
+  } catch(e) {
+    showLogin('Could not reach server. Is the bot running?');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sign In';
+  }
+}
+
+async function doLogout() {
+  try {
+    if (refreshToken) {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({refresh_token: refreshToken}),
+      });
+    }
+  } catch(e) {}
+  accessToken  = null;
+  refreshToken = null;
+  sessionStorage.removeItem('zb_access');
+  localStorage.removeItem('zb_refresh');
+  showLogin();
+}
+
+// ── Authenticated fetch wrapper ───────────────────────────────────────
+// Transparently refreshes the access token on 401, then retries once.
+async function apiFetch(url, opts = {}) {
+  opts.headers = {...(opts.headers || {}), 'Authorization': `Bearer ${accessToken}`};
+  let r = await fetch(url, opts);
+
+  if (r.status === 401 && refreshToken) {
+    const refreshed = await tryRefresh();
+    if (!refreshed) { showLogin('Session expired. Please sign in again.'); throw new Error('unauthenticated'); }
+    opts.headers['Authorization'] = `Bearer ${accessToken}`;
+    r = await fetch(url, opts);
+  }
+
+  if (r.status === 401) { showLogin('Session expired. Please sign in again.'); throw new Error('unauthenticated'); }
+  return r;
+}
+
+async function tryRefresh() {
+  if (!refreshToken) return false;
+  try {
+    const r = await fetch('/api/auth/refresh', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({refresh_token: refreshToken}),
+    });
+    if (!r.ok) {
+      refreshToken = null;
+      localStorage.removeItem('zb_refresh');
+      return false;
+    }
+    const d = await r.json();
+    accessToken = d.access_token;
+    sessionStorage.setItem('zb_access', accessToken);
+    return true;
+  } catch(e) { return false; }
+}
+
+// ── Tab navigation ───────────────────────────────────────────────────
 function showTab(name) {
   document.querySelectorAll('.tab').forEach((t,i)=>{
     const names = ['analytics','pairs','config','logs'];
@@ -212,10 +369,10 @@ function showTab(name) {
   if(name==='logs') loadLogs();
 }
 
-// ── Status ─────────────────────────────────────────────────────
+// ── Status ───────────────────────────────────────────────────────────
 async function loadStatus() {
   try {
-    const r = await fetch(`${API}/api/status`);
+    const r = await apiFetch('/api/status');
     const d = await r.json();
     document.getElementById('serverTime').textContent = new Date(d.server_time).toLocaleTimeString();
     const u = d.uptime_seconds;
@@ -223,13 +380,15 @@ async function loadStatus() {
     document.getElementById('uptime').textContent = `Uptime: ${h}h ${m}m`;
     document.getElementById('statusDot').style.background = d.running ? 'var(--green)' : 'var(--red)';
   } catch(e) {
-    document.getElementById('serverTime').textContent = 'Offline';
-    document.getElementById('statusDot').style.background = 'var(--red)';
-    document.getElementById('statusDot').style.boxShadow = '0 0 6px var(--red)';
+    if (e.message !== 'unauthenticated') {
+      document.getElementById('serverTime').textContent = 'Offline';
+      document.getElementById('statusDot').style.background = 'var(--red)';
+      document.getElementById('statusDot').style.boxShadow = '0 0 6px var(--red)';
+    }
   }
 }
 
-// ── Analytics ──────────────────────────────────────────────────
+// ── Analytics ────────────────────────────────────────────────────────
 function pnlClass(v){ return v>0?'pnl-pos':v<0?'pnl-neg':''; }
 function outcomeBadge(o){
   const m = {WIN_FULL:'badge-green',WIN_PARTIAL:'badge-green',LOSS:'badge-red',OPEN:'badge-blue',MONITOR_CLOSE:'badge-yellow'};
@@ -238,7 +397,7 @@ function outcomeBadge(o){
 
 async function loadStats() {
   try {
-    const r = await fetch(`${API}/api/stats`);
+    const r = await apiFetch('/api/stats');
     const d = await r.json();
     const g = d.global;
     document.getElementById('sc-total').textContent   = g.total;
@@ -265,12 +424,12 @@ async function loadStats() {
         <td class="${pnlClass(s.total_pnl)}">${s.total_pnl>=0?'+':''}${s.total_pnl}</td>
         <td class="${pnlClass(s.avg_pnl)}">${s.avg_pnl>=0?'+':''}${s.avg_pnl}</td>
       </tr>`).join('');
-  } catch(e) { console.error('stats error', e); }
+  } catch(e) { if(e.message!=='unauthenticated') console.error('stats error', e); }
 }
 
 async function loadTrades() {
   try {
-    const r = await fetch(`${API}/api/trades?n=50`);
+    const r = await apiFetch('/api/trades?n=50');
     const d = await r.json();
     const trades = d.trades || [];
     document.getElementById('tradeCount').textContent = `${trades.length} shown`;
@@ -292,13 +451,13 @@ async function loadTrades() {
         <td>${opened}</td>
       </tr>`;
     }).join('');
-  } catch(e) { console.error('trades error', e); }
+  } catch(e) { if(e.message!=='unauthenticated') console.error('trades error', e); }
 }
 
-// ── Pairs ───────────────────────────────────────────────────────
+// ── Pairs ─────────────────────────────────────────────────────────────
 async function loadPairs() {
   try {
-    const r = await fetch(`${API}/api/symbols`);
+    const r = await apiFetch('/api/symbols');
     const d = await r.json();
     const list = document.getElementById('pairList');
     if(!d.symbols||!d.symbols.length){ list.innerHTML='<span style="color:var(--muted)">No symbols configured.</span>'; return; }
@@ -314,7 +473,7 @@ async function addPair() {
   const inp = document.getElementById('newPairInput');
   const sym = inp.value.trim().toUpperCase();
   if(!sym){ alert('Enter a symbol first.'); return; }
-  const r = await fetch(`${API}/api/symbols`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym})});
+  const r = await apiFetch('/api/symbols',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym})});
   const d = await r.json();
   if(d.ok){ inp.value=''; loadPairs(); }
   else alert(d.error||'Error');
@@ -322,16 +481,16 @@ async function addPair() {
 
 async function removePair(sym) {
   if(!confirm(`Remove ${sym} from trading?`)) return;
-  const r = await fetch(`${API}/api/symbols/${sym}`,{method:'DELETE'});
+  const r = await apiFetch(`/api/symbols/${sym}`,{method:'DELETE'});
   const d = await r.json();
   if(d.ok) loadPairs();
   else alert(d.error||'Error');
 }
 
-// ── Config ──────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────
 async function loadConfig() {
   try {
-    const r = await fetch(`${API}/api/config`);
+    const r = await apiFetch('/api/config');
     const d = await r.json();
     const map = {
       risk_pct:'cfg-risk_pct', min_rr:'cfg-min_rr', max_open_trades:'cfg-max_open_trades',
@@ -345,7 +504,7 @@ async function loadConfig() {
     }
     const tp = document.getElementById('cfg-tiered_tp_enabled');
     if(tp) tp.checked = !!d.tiered_tp_enabled;
-  } catch(e) { console.error('config load error', e); }
+  } catch(e) { if(e.message!=='unauthenticated') console.error('config load error', e); }
 }
 
 async function saveConfig() {
@@ -361,7 +520,7 @@ async function saveConfig() {
     breakeven_rr:        parseFloat(document.getElementById('cfg-breakeven_rr')?.value),
   };
   try {
-    const r = await fetch(`${API}/api/config`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(fields)});
+    const r = await apiFetch('/api/config',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(fields)});
     const d = await r.json();
     if(d.ok){
       ['saveMsg','saveMsgTP'].forEach(id=>{
@@ -369,30 +528,50 @@ async function saveConfig() {
         if(el){ el.classList.add('show'); setTimeout(()=>el.classList.remove('show'),2000); }
       });
     }
-  } catch(e) { alert('Error saving config: '+e); }
+  } catch(e) { if(e.message!=='unauthenticated') alert('Error saving config: '+e); }
 }
 
-// ── Logs ────────────────────────────────────────────────────────
+async function rotateSecret() {
+  const pw = prompt('Confirm your dashboard password to rotate the JWT secret:');
+  if (pw === null) return;
+  try {
+    const r = await fetch('/api/auth/rotate-secret', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pw}),
+    });
+    const d = await r.json();
+    if (!r.ok) { alert(d.error || 'Failed'); return; }
+    alert('JWT secret rotated. You will be signed out now.');
+    accessToken  = null;
+    refreshToken = null;
+    sessionStorage.removeItem('zb_access');
+    localStorage.removeItem('zb_refresh');
+    showLogin();
+  } catch(e) { alert('Error: ' + e); }
+}
+
+// ── Logs ──────────────────────────────────────────────────────────────
 async function loadLogs() {
   try {
-    const r = await fetch(`${API}/api/logs?n=200`);
+    const r = await apiFetch('/api/logs?n=200');
     const d = await r.json();
     const box = document.getElementById('logBox');
     if(!d.lines||!d.lines.length){ box.innerHTML='<div class="empty">No log entries yet.</div>'; return; }
     box.innerHTML = d.lines.map(line=>{
       let cls = 'INFO';
-      if(line.includes('[ERROR]'))    cls='ERROR';
+      if(line.includes('[ERROR]'))       cls='ERROR';
       else if(line.includes('[WARNING]')) cls='WARNING';
-      else if(line.includes('[CRITICAL]')) cls='CRITICAL';
+      else if(line.includes('[CRITICAL]'))cls='CRITICAL';
       return `<div class="log-line ${cls}">${escHtml(line)}</div>`;
     }).join('');
     box.scrollTop = box.scrollHeight;
-  } catch(e) { document.getElementById('logBox').innerHTML='<div class="empty">Could not load logs.</div>'; }
+  } catch(e) { if(e.message!=='unauthenticated') document.getElementById('logBox').innerHTML='<div class="empty">Could not load logs.</div>'; }
 }
 
 function escHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-// ── Init ────────────────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────────────
 function refresh() {
   loadStatus();
   loadStats();
@@ -400,8 +579,23 @@ function refresh() {
   loadPairs();
 }
 
-loadConfig();
-refresh();
+// If we already have tokens, show the app immediately; otherwise show login.
+if (accessToken) {
+  showApp();
+  loadConfig();
+  refresh();
+} else if (refreshToken) {
+  // Try silent refresh before showing login
+  tryRefresh().then(ok => {
+    if (ok) { showApp(); loadConfig(); refresh(); }
+    else showLogin();
+  });
+} else {
+  showLogin();
+}
+
+setInterval(refresh, 30000);    // auto-refresh every 30 s
+setInterval(loadConfig, 60000); // config refresh every 60 s
 </script>
 </body>
 </html>

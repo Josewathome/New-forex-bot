@@ -22,7 +22,7 @@ class NewsManager:
         self._repo             = news_repo
         self._windows:         List[NoTradeWindow] = []
         self._last_refresh:    Optional[datetime]  = None
-        self._refresh_interval = timedelta(minutes=30)
+        self._refresh_interval = timedelta(minutes=config.NEWS_REFRESH_INTERVAL_MINUTES)
 
     # ── Public API ────────────────────────────
 
@@ -85,6 +85,12 @@ class NewsManager:
 
             # Skip low-impact entirely if STRICT_NEWS_FILTER is on
             if impact == "low" and config.STRICT_NEWS_FILTER:
+                continue
+
+            # Skip zero-width windows — a buffer of 0 creates a window that only
+            # matches at the exact millisecond of the event (never blocks in practice)
+            # and wastes memory. Matches the backtester's _build_windows() behaviour.
+            if buffer.total_seconds() == 0:
                 continue
 
             is_all_day = (

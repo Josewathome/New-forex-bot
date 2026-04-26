@@ -180,11 +180,11 @@ class TradeMonitor:
                 should_close = True
                 for ev in events:
                     ev.action_taken = "closed_early"
-            elif unique_types >= trail_conv and current_sl == original_sl:
+            elif unique_types >= trail_conv:
                 swing_sl = find_swing_trail_sl(
                     direction=direction,
                     entry=entry,
-                    original_sl=original_sl,
+                    current_sl=current_sl,
                     m5_window=m5_window,
                     pip_calc=self._pip,
                     atr_price=self._atr,
@@ -197,7 +197,7 @@ class TradeMonitor:
                             ev.action_taken = "trailed_sl"
                             ev.new_sl = swing_sl
                     logger.info("MONITOR TRAIL | %s | SL %.5f → %.5f (swing-based)",
-                                self._sym, original_sl, swing_sl)
+                                self._sym, current_sl, swing_sl)
 
         return events, action, new_sl_val, should_close
 
@@ -264,7 +264,7 @@ class TradeMonitor:
 def find_swing_trail_sl(
     direction:   Direction,
     entry:       float,
-    original_sl: float,
+    current_sl:  float,
     m5_window:   List[Candle],
     pip_calc:    PipCalculator,
     atr_price:   float,
@@ -283,13 +283,16 @@ def find_swing_trail_sl(
             if not is_swing:
                 continue
             candidate_sl = c.low - buf
-            if candidate_sl > original_sl + min_imp and candidate_sl < entry:
+            # Must strictly improve on current SL (which may already be above
+            # entry after TP1 profit-lock). The old `< entry` guard was wrong —
+            # it prevented trailing into profit territory after TP1.
+            if candidate_sl > current_sl + min_imp:
                 return round(candidate_sl, 5)
         else:
             is_swing = c.high > prev.high and c.high > nxt.high
             if not is_swing:
                 continue
             candidate_sl = c.high + buf
-            if candidate_sl < original_sl - min_imp and candidate_sl > entry:
+            if candidate_sl < current_sl - min_imp:
                 return round(candidate_sl, 5)
     return None

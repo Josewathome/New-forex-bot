@@ -234,6 +234,42 @@ class MT5Gateway:
         tick = mt5.symbol_info_tick("EURUSD")
         return int(tick.time) if tick else None
 
+    def detect_utc_offset(self) -> int:
+        """
+        Detect the broker server's UTC offset by comparing the latest
+        EURUSD tick time (broker-local, encoded as epoch seconds) against
+        real wall-clock UTC.  Returns whole hours, e.g. 2 for UTC+2.
+
+        Falls back to 0 when no recent tick is available (weekend or
+        market closed), so callers should keep the config default as a
+        manual fallback for those cases.
+        """
+        import time as _time
+        if not self._ensure_ready():
+            return 0
+        tick = mt5.symbol_info_tick("EURUSD")
+        if tick is None:
+            logger.warning("detect_utc_offset: no EURUSD tick — defaulting to 0")
+            return 0
+        server_ts   = int(tick.time)
+        real_utc    = int(_time.time())
+        age_seconds = real_utc - server_ts
+        if age_seconds > 600:
+            # Tick older than 10 min → market closed, timestamp stale and unreliable
+            logger.warning(
+                "detect_utc_offset: EURUSD tick is %ds old (market closed?) "
+                "— defaulting to 0.", age_seconds,
+            )
+            return 0
+        offset = round((server_ts - real_utc) / 3600)
+        offset = max(-12, min(14, offset))   # clamp to valid timezone range
+        logger.info(
+            "Broker UTC offset detected: UTC%+d  "
+            "(server_ts=%d  real_utc=%d  age=%ds)",
+            offset, server_ts, real_utc, age_seconds,
+        )
+        return offset
+
     # ── Order Execution ───────────────────────────────────────────
 
     def place_order(self, order: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -371,6 +407,35 @@ class MT5Gateway:
 
 
 
+
+    def check_order_margin(self, order: Dict[str, Any]) -> Optional[float]:
+        """
+        Ask MT5 how much margin a potential order would consume, without
+        actually placing it.  Returns margin in account currency, or None
+        if MT5 cannot compute it (symbol not available, market closed, etc.).
+        """
+        if not self._ensure_ready():
+            return None
+        order_type = mt5.ORDER_TYPE_BUY if order["type"] == "BUY" else mt5.ORDER_TYPE_SELL
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": str(order["symbol"]),
+            "volume": float(order["volume"]),
+            "type":   order_type,
+            "price":  float(order["price"]),
+            "sl":     float(order.get("sl", 0.0)),
+            "tp":     float(order.get("tp", 0.0)),
+        }
+        result = mt5.order_check(request)
+        if result is None:
+            logger.warning("order_check returned None for %s", order["symbol"])
+            return None
+        # retcode 0 = OK; anything else means MT5 flagged a problem
+        if result.retcode != 0:
+            logger.warning("order_check retcode=%s (%s) for %s",
+                           result.retcode, result.comment, order["symbol"])
+            return None
+        return float(result.margin)
 
     def modify_position(self, ticket: int, sl: float, tp: float) -> Optional[Dict[str, Any]]:
         if not self._ensure_ready():
