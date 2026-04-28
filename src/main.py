@@ -351,22 +351,24 @@ def run_backtest() -> None:
     h1_buf = timedelta(hours=150)
     h4_buf = timedelta(hours=config.H4_CANDLE_COUNT * 4 + 40)
 
-    # Most brokers only retain ~60 days of M1 history in the terminal.
-    # Requesting the full backtest window returns -2 "Invalid params".
-    # Limit M1 to 60 days so we get precise bar data for recent trades;
-    # the simulator falls back to M5 automatically for older bars.
-    m1_start = max(start_dt, end_dt - timedelta(days=60))
-
+    # Request M1 from the full backtest start date.
+    # MT5 returns whatever it has cached — no error if older bars are missing,
+    # it simply returns fewer bars.  The simulator already falls back to M5
+    # for any gap.  Press Home on each symbol's M1 chart first to maximise
+    # the history the terminal has cached locally (up to ~5 months on HFM).
     candle_data = {}
     for sym in config.SYMBOLS:
         h1 = md.get_candles_range(sym, Timeframe.H1, start_dt-h1_buf, end_dt)
         m5 = md.get_candles_range(sym, Timeframe.M5, start_dt, end_dt)
-        m1 = md.get_candles_range(sym, Timeframe.M1, m1_start, end_dt)
+        m1 = md.get_candles_range(sym, Timeframe.M1, start_dt, end_dt)
         h4 = md.get_candles_range(sym, Timeframe.H4, start_dt-h4_buf, end_dt)
         if h1 and m5:
             candle_data[sym] = {Timeframe.H1:h1,Timeframe.M5:m5,Timeframe.M1:m1,Timeframe.H4:h4}
-            logger.info("  %s: H1=%d  M5=%d  M1=%d(last 60d)  H4=%d",
-                        sym, len(h1), len(m5), len(m1) if m1 else 0, len(h4) if h4 else 0)
+            m1_count = len(m1) if m1 else 0
+            m5_count = len(m5) if m5 else 0
+            m1_coverage = round(m1_count / max(m5_count * 5, 1) * 100, 1)
+            logger.info("  %s: H1=%d  M5=%d  M1=%d (%.1f%% coverage)  H4=%d",
+                        sym, len(h1), m5_count, m1_count, m1_coverage, len(h4) if h4 else 0)
         else:
             logger.warning("  %s: insufficient data (H1=%s M5=%s).",
                            sym, "ok" if h1 else "MISSING", "ok" if m5 else "MISSING")

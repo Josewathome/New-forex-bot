@@ -42,9 +42,11 @@ from src.application.analysis import (
     dynamic_risk,
     is_strong_trend,
     is_kill_zone,
+    evaluate_zone_health,
+    find_opposing_opportunity,
 )
 from src.application.diagnostics import DiagnosticsCollector
-from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl
+from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl, find_runner_protection_sl
 from src.infrastructure.news_client import ForexNewsClient
 from src.infrastructure.spread_calculator import FALLBACK_SPREAD_PIPS, DEFAULT_FALLBACK_PIPS
 
@@ -102,6 +104,9 @@ class Backtester:
         self._currency    = currency
         self._mapper      = ZoneMapper()
         self._tick_values = tick_values or {}
+        # Streak protection: track consecutive net-negative losses per symbol.
+        self._loss_streak:    Dict[str, int]      = {}
+        self._streak_pause:   Dict[str, datetime] = {}
 
     def _get_tick_value(self, symbol: str) -> float:
         if symbol in self._tick_values and self._tick_values[symbol] > 0:
@@ -188,7 +193,19 @@ class Backtester:
         zones, pool = self._mapper.map_zones(h1_win, symbol, Timeframe.H1)
         bar_time = h1[h1_idx].time
 
-        m5_win = [c for c in m5 if bar_time <= c.time < bar_time + timedelta(hours=3)]
+        # ── Consecutive loss streak protection ────────────────────────
+        # After MAX_CONSECUTIVE_LOSSES real losses (net-negative P&L) on a symbol,
+        # pause entries for LOSS_STREAK_PAUSE_HOURS.  GBPUSD had 3 consecutive
+        # -114/-113/-112 losses in Nov; USDCHF had 4 streaks.  The losing
+        # streak signals the market has invalidated our zone bias — sit out.
+        pause_until = self._streak_pause.get(symbol)
+        if pause_until and bar_time < pause_until:
+            if diag: diag.record_rejection(symbol, "streak_pause")
+            return None
+
+        # 6h window: live system keeps zones alive until mitigated — price often taps
+        # 4-8h after H1 bar close. 3h was the #1 cause of no_tap (2,600+ rejections).
+        m5_win = [c for c in m5 if bar_time <= c.time < bar_time + timedelta(hours=6)]
 
         if diag:
             diag.record_h1_bar(
@@ -230,14 +247,42 @@ class Backtester:
                 continue
             grade, rpct, min_rr = grade_setup(setup_score)
 
-            signal = find_m5_choch_signal(
-                m5_candles=m5_win, zone=zone, pip_calc=pip_calc,
-                spread_pips=bc.spread_pips, liquidity_pool=pool,
-                atr_price=h1_atr, diag=diag,
-                zone_buffer=zbuf, min_rr_override=min_rr,
-            )
-            if signal is None:
-                continue
+            # Re-evaluate zone at the moment price arrives.
+            healthy, reject_reason = evaluate_zone_health(
+                zone, h1_win, m5_win, h1_atr)
+
+            if not healthy:
+                if reject_reason == "m5_momentum_against_zone":
+                    # Institutional pressure runs AGAINST our zone.
+                    # Try to trade WITH that institution instead.
+                    opp = find_opposing_opportunity(
+                        rejected_zone=zone,
+                        m5_candles=m5_win,
+                        pip_calc=pip_calc,
+                        spread_pips=bc.spread_pips,
+                        liquidity_pool=pool,
+                        h1_atr=h1_atr,
+                        zone_buffer=zbuf,
+                        min_rr=min_rr,
+                        diag=diag,
+                    )
+                    if opp is None:
+                        if diag: diag.record_rejection(symbol, "flip_no_signal")
+                        continue
+                    signal, zone = opp   # trade the reversal instead
+                else:
+                    if diag: diag.record_rejection(symbol, reject_reason)
+                    continue
+            else:
+                signal = find_m5_choch_signal(
+                    m5_candles=m5_win, zone=zone, pip_calc=pip_calc,
+                    spread_pips=bc.spread_pips, liquidity_pool=pool,
+                    atr_price=h1_atr, diag=diag,
+                    zone_buffer=zbuf, min_rr_override=min_rr,
+                )
+                if signal is None:
+                    continue
+
             if self._in_news(signal.created_at, symbol, ntw):
                 if diag: diag.record_rejection(symbol, "news_block")
                 continue
@@ -247,8 +292,8 @@ class Backtester:
                 if diag: diag.record_rejection(symbol, "sl_too_tight")
                 continue
 
-            # Trade Scoring
-            htf_aligned = (h4_bias == zone.direction)
+            # Trade Scoring — use signal.direction so flipped trades score correctly.
+            htf_aligned = (h4_bias == signal.direction)
             liquidity_sweep = (zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count == 0)
             fvg_clean = (zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.size > h1_atr * 0.5)
             strong_displacement = (signal.volume_ratio >= 1.5)
@@ -277,6 +322,13 @@ class Backtester:
             tp2_price = (signal.entry_price + tp2_ratio * abs(signal.entry_price - signal.stop_loss)
                          if signal.direction == Direction.BULLISH
                          else signal.entry_price - tp2_ratio * abs(signal.entry_price - signal.stop_loss))
+            # Clamp TP2 to the liquidity pool.  When TP2 ratio pushes beyond
+            # the pool, MT5's full take_profit fires first — the partial close
+            # never triggers.  Skip TP2 so the runner runs straight to the pool.
+            if signal.direction == Direction.BULLISH and tp2_price >= signal.take_profit:
+                tp2_price = None
+            elif signal.direction == Direction.BEARISH and tp2_price <= signal.take_profit:
+                tp2_price = None
 
             # Position size
             rp = RiskParameters(account_balance=equity, risk_percent=risk_pct,
@@ -320,6 +372,7 @@ class Backtester:
                 pip_calc=pip_calc, zones=zones, monitor=monitor,
                 tp1_price=tp1_price, tp2_price=tp2_price,
                 trade_score=trade_score, tp1_ratio=tp1_ratio, tp2_ratio=tp2_ratio,
+                grade=grade,
             )
 
             if diag:
@@ -379,6 +432,21 @@ class Backtester:
                 trade_score,
             )
 
+            # ── Loss streak protection update ──────────────────────────────────
+            if pnl < 0:
+                streak = self._loss_streak.get(symbol, 0) + 1
+                self._loss_streak[symbol] = streak
+                max_streak = getattr(config, "MAX_CONSECUTIVE_LOSSES", 2)
+                if streak >= max_streak:
+                    pause_h = getattr(config, "LOSS_STREAK_PAUSE_HOURS", 4)
+                    self._streak_pause[symbol] = bar_time + timedelta(hours=pause_h)
+                    logger.info(
+                        "BT | streak_pause | %s | %d consecutive losses → pause until %s",
+                        symbol, streak, self._streak_pause[symbol].isoformat(),
+                    )
+            else:
+                self._loss_streak[symbol] = 0
+
             return BacktestResult(
                 trade=trade, outcome=outcome, pnl_usd=pnl,
                 pips_gain=pip_calc.price_to_pips(abs(
@@ -421,8 +489,14 @@ class Backtester:
         trade_score: int = 0,
         tp1_ratio: float = 1.8,
         tp2_ratio: float = 3.5,
+        grade: str = "C",
     ):
-        use_m1 = bool(future_m1)
+        # When BACKTEST_USE_M5_ONLY=True, always simulate on M5 regardless of M1
+        # availability.  MT5 retains M1 for ~60 days, giving 31.5% coverage on a
+        # 6-month test — the other 68.5% silently used M5 anyway, making the
+        # mixed result unreliable.  M5-only is slower but honest and consistent.
+        force_m5 = getattr(config, "BACKTEST_USE_M5_ONLY", False)
+        use_m1 = bool(future_m1) and not force_m5
         bars = future_m1 if use_m1 else future_m5
         if not bars:
             return "OPEN", 0.0, {
@@ -447,7 +521,53 @@ class Backtester:
         sl_pips = pip_calc.price_to_pips(sl_dist)
         comm = self._commission * lot_size
 
-        tp1_pct = getattr(config, "TIERED_TP1_CLOSE_PCT", 0.60)
+        # ── Limit-order fill check ─────────────────────────────────────
+        # The signal entry is a FVG limit price (below current price for
+        # bulls, above for bears). The displacement candle already moved
+        # price AWAY from entry, so price must retrace before the order
+        # fills.  Without this check, every signal is treated as an
+        # immediate fill — creating phantom wins whenever price runs to TP
+        # without ever touching the limit level.
+        fill_bar_idx: Optional[int] = None
+        for _fi, _fb in enumerate(bars):
+            if is_bull and _fb.low <= entry:
+                fill_bar_idx = _fi
+                break
+            elif not is_bull and _fb.high >= entry:
+                fill_bar_idx = _fi
+                break
+
+        if fill_bar_idx is None:
+            # Price never retraced to the limit — order expired unfilled.
+            return "NOT_FILLED", 0.0, {
+                "mfe_price": entry, "mfe_pips": 0.0,
+                "pips_to_tp_at_mfe": 0.0, "closed_at": signal.created_at,
+                "duration_minutes": 0.0, "reversal_zone_type": None,
+                "tp1_hit": False, "tp2_hit": False,
+                "realized_pnl": 0.0, "remaining_volume": lot_size,
+                "exit_reason": "limit_expired", "mfe": 0.0, "mae": 0.0,
+                "efficiency": 0.0,
+            }, []
+
+        # Trim bars so simulation starts only once the limit fills.
+        bars = bars[fill_bar_idx:]
+        if not bars:
+            return "NOT_FILLED", 0.0, {
+                "mfe_price": entry, "mfe_pips": 0.0,
+                "pips_to_tp_at_mfe": 0.0, "closed_at": signal.created_at,
+                "duration_minutes": 0.0, "reversal_zone_type": None,
+                "tp1_hit": False, "tp2_hit": False,
+                "realized_pnl": 0.0, "remaining_volume": lot_size,
+                "exit_reason": "limit_expired", "mfe": 0.0, "mae": 0.0,
+                "efficiency": 0.0,
+            }, []
+
+        if grade == "A+":
+            tp1_pct = getattr(config, "TIERED_TP1_CLOSE_PCT_A_PLUS", 0.40)
+        elif grade == "B":
+            tp1_pct = getattr(config, "TIERED_TP1_CLOSE_PCT_B", 0.50)
+        else:
+            tp1_pct = getattr(config, "TIERED_TP1_CLOSE_PCT", 0.60)
         tp2_pct = getattr(config, "TIERED_TP2_CLOSE_PCT", 0.25)
         runner_pct = 1.0 - tp1_pct - tp2_pct
         if runner_pct < 0:
@@ -570,6 +690,72 @@ class Backtester:
                     realized_pnl += profit_partial
                     remaining_vol -= close_vol
                     tp2_hit = True
+                    # Smart runner SL: scan M5 swings above TP1, use TP1 as floor.
+                    if tp1_price:
+                        virtual_sl = find_runner_protection_sl(
+                            direction=signal.direction,
+                            current_sl=virtual_sl,
+                            floor_sl=tp1_price,
+                            m5_window=m5_window,
+                            pip_calc=pip_calc,
+                            atr_price=monitor._atr,
+                        )
+
+            # ── TP1→TP2 corridor swing trail ──────────────────────
+            # After TP1, the SL sits at the profit-lock level (entry+0.3R)
+            # with no further adjustment until TP2 fires.  The monitor's
+            # breakeven_trigger is gated by current_sl==original_sl so it
+            # won't fire here.  This ratchets toward the nearest M5 swing
+            # that is strictly better than the current SL, capturing more
+            # profit if TP2 is never reached.  Floor = current SL so the
+            # profit-lock guarantee is preserved.
+            if tp1_hit and not tp2_hit and new_m5 and m5_window:
+                mid_sl = find_runner_protection_sl(
+                    direction=signal.direction,
+                    current_sl=virtual_sl,
+                    floor_sl=virtual_sl,
+                    m5_window=m5_window,
+                    pip_calc=pip_calc,
+                    atr_price=monitor._atr,
+                )
+                if mid_sl != virtual_sl:
+                    virtual_sl = mid_sl
+
+            # ── Post-TP2 runner ratchet ───────────────────────────
+            if tp2_hit and new_m5 and tp1_price and m5_window:
+                virtual_sl = find_runner_protection_sl(
+                    direction=signal.direction,
+                    current_sl=virtual_sl,
+                    floor_sl=tp1_price,
+                    m5_window=m5_window,
+                    pip_calc=pip_calc,
+                    atr_price=monitor._atr,
+                )
+
+            # ── TP3: runner to liquidity pool ─────────────────────
+            # Mirrors the MT5 take_profit order that auto-closes the
+            # remaining volume when price reaches the liquidity target.
+            # Without this the backtester never closes the runner on a
+            # full-target hit — those trades continue until SL or timeout,
+            # systematically under-reporting runner profits.
+            # Fires when: (a) both TP1+TP2 hit and runner remains, or
+            #             (b) TP1 hit but TP2 was skipped (pool < TP2 level).
+            if remaining_vol > 0:
+                _can_tp3 = tp2_hit or (tp1_hit and tp2_price is None)
+                if _can_tp3:
+                    tp3_reached = (
+                        (is_bull and bar.high >= signal.take_profit) or
+                        (not is_bull and bar.low <= signal.take_profit)
+                    )
+                    if tp3_reached:
+                        profit_runner = ppnl(signal.take_profit, remaining_vol)
+                        realized_pnl += profit_runner
+                        remaining_vol = 0.0
+                        return (
+                            "WIN_FULL", realized_pnl,
+                            meta(bar, exit_reason_str="TP3"),
+                            all_evts,
+                        )
 
             # ── SL check ──────────────────────────────────────────
             hit_sl = (is_bull and bar.low <= virtual_sl) or (not is_bull and bar.high >= virtual_sl)
@@ -617,15 +803,8 @@ class Backtester:
                 recent_sigs.extend((ev.signal_type, now) for ev in evts)
                 recent_sigs = [(st, t) for st, t in recent_sigs if t >= cutoff]
 
-            # Stall exit with conditions (profit > min ratio, not strong trend)
-            stall_event = next((e for e in evts if e.signal_type == "mfe_stall"), None)
-            if stall_event and getattr(config, "STALL_EXIT_REQUIRES_TP1", True):
-                current_profit_ratio = (abs(bar.close - entry) / sl_dist) if sl_dist > 0 else 0
-                min_profit_ratio = getattr(config, "MIN_PROFIT_RATIO_TO_CLOSE", 1.5)
-                if tp1_hit and not is_strong_trend(m5_window, signal.direction) and current_profit_ratio >= min_profit_ratio:
-                    should_close = True
-                    action = "close_now"
-                    exit_reason = "stall_exit"
+            # mfe_stall exit is handled entirely inside trade_monitor.update_dual().
+            # No duplicate logic here — live and backtest use the same code path.
 
             if action == "trail_sl" and new_sl != virtual_sl:
                 virtual_sl = new_sl
@@ -699,6 +878,7 @@ class Backtester:
         los = sum(1 for r in results if r.outcome == "LOSS")
         mc = sum(1 for r in results if r.outcome == "MONITOR_CLOSE")
         opn = sum(1 for r in results if r.outcome == "OPEN")
+        nf = sum(1 for r in results if r.outcome == "NOT_FILLED")
         res = wf + wp + los + mc
         wr = (wf + wp) / res * 100 if res else 0
         avg_eff = sum(r.efficiency for r in results if r.efficiency > 0) / max(1, len(results))
@@ -706,15 +886,27 @@ class Backtester:
 
         logger.info("═" * 65)
         logger.info("  BACKTEST v10  %s → %s", start_date, end_date)
-        logger.info("  WIN_FULL=%d  WIN_PARTIAL=%d  LOSS=%d  MC=%d  OPEN=%d",
-                    wf, wp, los, mc, opn)
+        logger.info("  WIN_FULL=%d  WIN_PARTIAL=%d  LOSS=%d  MC=%d  OPEN=%d  NOT_FILLED=%d",
+                    wf, wp, los, mc, opn, nf)
         logger.info("  Win rate (W_FULL+W_PARTIAL): %.1f%%  |  total resolved: %d", wr, res)
         logger.info("  Equity: %.0f %s  |  P&L: %+.0f", final_eq, self._currency, final_eq - self._account)
         logger.info("  Avg profit efficiency: %.1f%%", avg_eff)
         logger.info("  Avg trade score: %.1f", avg_score)
-        logger.info("  TP1 hit: %d / %d trades (%.0f%%)",
-                    sum(1 for r in results if r.tp1_hit), len(results),
-                    sum(1 for r in results if r.tp1_hit) / len(results) * 100 if results else 0)
+        tp1_n  = sum(1 for r in results if r.tp1_hit)
+        tp2_n  = sum(1 for r in results if r.tp2_hit)
+        tp3_n  = sum(1 for r in results if r.trade.exit_reason == "TP3")
+        n      = len(results) or 1
+        logger.info("  TP1 hit: %d / %d (%.0f%%)  TP2: %d / %d (%.0f%%)  TP3 (pool): %d / %d (%.0f%%)",
+                    tp1_n, len(results), tp1_n / n * 100,
+                    tp2_n, len(results), tp2_n / n * 100,
+                    tp3_n, len(results), tp3_n / n * 100)
+        avg_win = (sum(r.pnl_usd for r in results if r.pnl_usd > 0) /
+                   max(1, sum(1 for r in results if r.pnl_usd > 0)))
+        avg_loss = (sum(r.pnl_usd for r in results if r.pnl_usd < 0) /
+                    max(1, sum(1 for r in results if r.pnl_usd < 0)))
+        logger.info("  Avg win: %.0f %s  |  Avg loss: %.0f %s  |  Profit factor: %.2f",
+                    avg_win, self._currency, avg_loss, self._currency,
+                    abs(avg_win / avg_loss) if avg_loss != 0 else float("inf"))
         logger.info("═" * 65)
 
     def analyze_trade_features(self, results):

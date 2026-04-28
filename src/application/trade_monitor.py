@@ -165,6 +165,38 @@ class TradeMonitor:
                     ev.action_taken = "closed_early"
                 return events, action, new_sl_val, should_close
 
+            # mfe_stall alone is sufficient: 100% true-positive in backtest.
+            # Close when EITHER the R-ratio gate OR the absolute pip floor is met.
+            # The absolute floor catches tiny-MFE stalls (2-5 pip MFE on 50-pip SL
+            # = 0.04-0.10R) that the ratio gate misses — all 75 "no-action" stalls
+            # in the backtest went on to loss; even 2-pip exits beat a full SL hit.
+            if any(ev.signal_type == "mfe_stall" for ev in events):
+                min_ratio = getattr(config, "MIN_PROFIT_RATIO_TO_CLOSE", 0.3)
+                min_pips  = getattr(config, "MIN_STALL_MFE_PIPS", 5.0)
+                sl_dist_pips = self._pip.price_to_pips(sl_dist)
+                ratio_met = sl_dist_pips > 0 and mfe_pips / sl_dist_pips >= min_ratio
+                pips_met  = mfe_pips >= min_pips
+                if ratio_met or pips_met:
+                    should_close = True
+                    action = "close_now"
+                    for ev in events:
+                        ev.action_taken = "closed_early"
+                    return events, action, new_sl_val, should_close
+
+            # reverse_choch alone: 79.5% true-positive.
+            # Require a minimum MFE before closing — avoids dumping trades for
+            # +2/+6 pips when the structure flip happens too close to entry.
+            # REVERSE_CHOCH_MIN_MFE_R = 0 means "any positive MFE" (old behaviour).
+            min_mfe_r = getattr(config, "REVERSE_CHOCH_MIN_MFE_R", 0.5)
+            sl_dist_pips = self._pip.price_to_pips(sl_dist)
+            choch_mfe_threshold = sl_dist_pips * min_mfe_r
+            if any(ev.signal_type == "reverse_choch" for ev in events) and mfe_pips >= choch_mfe_threshold:
+                should_close = True
+                action = "close_now"
+                for ev in events:
+                    ev.action_taken = "closed_early"
+                return events, action, new_sl_val, should_close
+
             now = m1_bar.time
             window_bars = getattr(config, "MONITOR_CONFIRM_WINDOW_M5", 3)
             window_cutoff = now - timedelta(minutes=window_bars * 5)
@@ -296,3 +328,55 @@ def find_swing_trail_sl(
             if candidate_sl < current_sl - min_imp:
                 return round(candidate_sl, 5)
     return None
+
+
+def find_runner_protection_sl(
+    direction:            Direction,
+    current_sl:           float,
+    floor_sl:             float,
+    m5_window:            List[Candle],
+    pip_calc:             PipCalculator,
+    atr_price:            float,
+    min_improvement_pips: float = 1.0,
+) -> float:
+    """
+    Structure-aware SL for the final runner after TP2.
+
+    Scans M5 swing pivots for the best protection level that is strictly
+    above floor_sl (bulls) or below floor_sl (bears) — i.e. better than
+    the TP1 guarantee.  Applies an ATR buffer so normal volatility does
+    not clip the runner.
+
+    Returns the best qualifying swing SL, or floor_sl when no swing
+    qualifies.  The result NEVER regresses below floor_sl (bull) or
+    above floor_sl (bear) so the TP1-level guarantee is always honoured.
+    """
+    # Start with the guaranteed floor — improve from here, never regress.
+    best = floor_sl
+
+    if len(m5_window) < 3 or atr_price <= 0:
+        return round(best, 5)
+
+    buf     = atr_price * getattr(config, "MONITOR_TRAIL_ATR_BUFFER", 0.5)
+    min_imp = pip_calc.pips_to_price(min_improvement_pips)
+
+    if direction == Direction.BULLISH:
+        for i in range(1, len(m5_window) - 1):
+            c, prev, nxt = m5_window[i], m5_window[i - 1], m5_window[i + 1]
+            if not (c.low < prev.low and c.low < nxt.low):
+                continue
+            candidate = c.low - buf
+            # Must be above the guaranteed floor AND strictly better than
+            # current best (prevents tiny rounding movements triggering MT5).
+            if candidate >= floor_sl and candidate > best + min_imp:
+                best = candidate
+    else:
+        for i in range(1, len(m5_window) - 1):
+            c, prev, nxt = m5_window[i], m5_window[i - 1], m5_window[i + 1]
+            if not (c.high > prev.high and c.high > nxt.high):
+                continue
+            candidate = c.high + buf
+            if candidate <= floor_sl and candidate < best - min_imp:
+                best = candidate
+
+    return round(best, 5)

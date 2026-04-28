@@ -33,9 +33,11 @@ from src.application.analysis import (
     dynamic_risk,
     is_strong_trend,
     is_kill_zone,
+    evaluate_zone_health,
+    find_opposing_opportunity,
 )
 from src.application.news_manager import NewsManager
-from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl
+from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl, find_runner_protection_sl
 from src.infrastructure.spread_calculator import SpreadCalculator
 from src.infrastructure.trade_journal import TradeJournal
 
@@ -83,7 +85,7 @@ class EntryCandidate:
     grade:       str
     risk_pct:    float
     tp1_price:   float
-    tp2_price:   float
+    tp2_price:   Optional[float]
     broker_cost: BrokerCost
     pip_calc:    PipCalculator
     tick_value:  float
@@ -121,6 +123,8 @@ class ExecutionService:
         self._journal     = journal
         self._zone_mapper = ZoneMapper()
         self._trade_states: Dict[int, _OpenTradeState] = {}
+        self._loss_streak:  Dict[str, int]      = {}
+        self._streak_pause: Dict[str, datetime] = {}
 
     def run_zone_mapping(self, symbol: str) -> None:
         h1 = self._md.get_candles(symbol, Timeframe.H1, config.H1_CANDLE_COUNT)
@@ -173,6 +177,12 @@ class ExecutionService:
         if not is_in_trading_session(now):
             return None
 
+        # Streak protection: skip entry if we hit MAX_CONSECUTIVE_LOSSES recently
+        pause_until = self._streak_pause.get(symbol)
+        if pause_until and now < pause_until:
+            logger.debug("streak_pause | %s | blocked until %s", symbol, pause_until.isoformat())
+            return None
+
         broker_cost = self._spread.get_broker_cost(symbol)
         # 100 H1 bars: 14 for ATR warmup + 50 for baseline_atr + headroom.
         h1_short   = self._md.get_candles(symbol, Timeframe.H1, 100)
@@ -222,14 +232,42 @@ class ExecutionService:
             if not m5:
                 continue
 
-            signal = find_m5_choch_signal(
-                m5_candles=m5, zone=zone, pip_calc=pip_calc,
-                spread_pips=broker_cost.spread_pips, liquidity_pool=pool,
-                atr_price=h1_atr, zone_buffer=zone_buf,
-                min_rr_override=min_rr,
-            )
-            if signal is None:
-                continue
+            # Re-evaluate zone at the moment price arrives.
+            healthy, reject_reason = evaluate_zone_health(
+                zone, h1_short, m5, h1_atr)
+
+            if not healthy:
+                if reject_reason == "m5_momentum_against_zone":
+                    # Institutional pressure is moving AGAINST our zone.
+                    # Try to trade WITH that institution instead of fighting it.
+                    opp = find_opposing_opportunity(
+                        rejected_zone=zone,
+                        m5_candles=m5,
+                        pip_calc=pip_calc,
+                        spread_pips=broker_cost.spread_pips,
+                        liquidity_pool=pool,
+                        h1_atr=h1_atr,
+                        zone_buffer=zone_buf,
+                        min_rr=min_rr,
+                    )
+                    if opp is None:
+                        logger.info("ZONE FLIP | %s %s | no opposing setup — skipping",
+                                    symbol, zone.id[:8])
+                        continue
+                    signal, zone = opp   # trade the reversal instead
+                else:
+                    logger.info("ZONE STALE | %s %s | %s — skipping",
+                                symbol, zone.id[:8], reject_reason)
+                    continue
+            else:
+                signal = find_m5_choch_signal(
+                    m5_candles=m5, zone=zone, pip_calc=pip_calc,
+                    spread_pips=broker_cost.spread_pips, liquidity_pool=pool,
+                    atr_price=h1_atr, zone_buffer=zone_buf,
+                    min_rr_override=min_rr,
+                )
+                if signal is None:
+                    continue
 
             sl_pips = pip_calc.price_to_pips(abs(signal.entry_price - signal.stop_loss))
             if not check_min_sl_pips(symbol, sl_pips):
@@ -237,7 +275,8 @@ class ExecutionService:
                 continue
 
             # ── Trade Scoring ──────────────────────────────────────
-            htf_aligned         = (h4_bias == zone.direction)
+            # Use signal.direction (not zone.direction) so flipped trades score correctly.
+            htf_aligned         = (h4_bias == signal.direction)
             liquidity_sweep     = (zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count == 0)
             fvg_clean           = (zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.size > h1_atr * 0.5)
             strong_displacement = (signal.volume_ratio >= 1.5)
@@ -268,6 +307,13 @@ class ExecutionService:
                 if signal.direction == Direction.BULLISH
                 else signal.entry_price - tp2_ratio * abs(signal.entry_price - signal.stop_loss)
             )
+            # Clamp TP2 to the liquidity pool.  If TP2 ratio pushes beyond
+            # the pool, MT5's full take_profit fires first — the partial close
+            # never triggers.  Skip TP2 so the runner goes straight to the pool.
+            if signal.direction == Direction.BULLISH and tp2_price >= signal.take_profit:
+                tp2_price = None
+            elif signal.direction == Direction.BEARISH and tp2_price <= signal.take_profit:
+                tp2_price = None
 
             return EntryCandidate(
                 symbol=symbol,      signal=signal,       zone=zone,
@@ -393,6 +439,12 @@ class ExecutionService:
             if ticket not in self._trade_states:
                 tp1 = compute_tp1_price(pos.direction, pos.entry_price, pos.stop_loss)
                 tp2 = compute_tp2_price(pos.direction, pos.entry_price, pos.stop_loss)
+                # Clamp TP2 to not exceed MT5's take_profit (the liquidity pool).
+                if tp2 is not None and pos.take_profit:
+                    if pos.direction == Direction.BULLISH and tp2 >= pos.take_profit:
+                        tp2 = None
+                    elif pos.direction == Direction.BEARISH and tp2 <= pos.take_profit:
+                        tp2 = None
                 self._trade_states[ticket] = _OpenTradeState(
                     ticket=ticket, symbol=symbol, direction=pos.direction,
                     entry=pos.entry_price, original_sl=pos.stop_loss,
@@ -453,7 +505,12 @@ class ExecutionService:
                     (state.direction == Direction.BEARISH and price <= state.tp1_price)
                 )
                 if tp1_reached:
-                    close_pct = getattr(config, "TIERED_TP1_CLOSE_PCT", 0.50)
+                    if state.grade == "A+":
+                        close_pct = getattr(config, "TIERED_TP1_CLOSE_PCT_A_PLUS", 0.40)
+                    elif state.grade == "B":
+                        close_pct = getattr(config, "TIERED_TP1_CLOSE_PCT_B", 0.50)
+                    else:
+                        close_pct = getattr(config, "TIERED_TP1_CLOSE_PCT", 0.60)
                     # Floor to avoid closing more lots than intended (round() can overshoot)
                     close_vol = max(0.01, math.floor(state.lot_size * close_pct * 100) / 100)
                     logger.info(
@@ -518,6 +575,71 @@ class ExecutionService:
                                 ticket, state.lot_size, close_vol, max(0.01, state.lot_size - close_vol),
                             )
                             state.lot_size = max(0.01, state.lot_size - close_vol)
+                        # After TP2: find the best structure-based SL for the runner.
+                        # Scans M5 swings above TP1 — uses TP1 as the guaranteed floor.
+                        # This avoids blindly jumping to TP1 when a swing level
+                        # between TP2 and current price offers tighter, smarter protection.
+                        if state.tp1_price:
+                            runner_sl = find_runner_protection_sl(
+                                direction=state.direction,
+                                current_sl=state.current_sl,
+                                floor_sl=state.tp1_price,
+                                m5_window=state.m5_window,
+                                pip_calc=pip_calc,
+                                atr_price=h1_atr,
+                            )
+                            self._tr.modify_sl(ticket, runner_sl)
+                            state.current_sl = runner_sl
+                            logger.info(
+                                "TP2 runner SL | %s ticket=%s | SL → %.5f "
+                                "(swing-based, TP1 floor=%.5f)",
+                                symbol, ticket, runner_sl, state.tp1_price,
+                            )
+
+            # ── TP1→TP2 corridor swing trail ──────────────────────
+            # After TP1 the SL sits at the profit-lock level (entry+0.3R)
+            # with no further movement until TP2 fires.  The monitor's
+            # breakeven_trigger is gated by current_sl==original_sl so it
+            # won't fire here.  Ratchet toward the nearest M5 swing that is
+            # strictly better than the current SL so we capture more profit
+            # if TP2 is never reached.  Floor = current SL (no regression).
+            if state.tp1_hit and not state.tp2_hit and new_m5 and state.m5_window:
+                mid_sl = find_runner_protection_sl(
+                    direction=state.direction,
+                    current_sl=state.current_sl,
+                    floor_sl=state.current_sl,
+                    m5_window=state.m5_window,
+                    pip_calc=pip_calc,
+                    atr_price=h1_atr,
+                )
+                if mid_sl != state.current_sl:
+                    if self._tr.modify_sl(ticket, mid_sl):
+                        logger.info(
+                            "TP1→TP2 trail | %s ticket=%s | SL %.5f → %.5f",
+                            symbol, ticket, state.current_sl, mid_sl,
+                        )
+                        state.current_sl = mid_sl
+
+            # ── Post-TP2 runner ratchet ───────────────────────────
+            # Every new M5 bar after TP2: re-evaluate swing structure and
+            # tighten the runner SL if a better pivot has formed above TP1.
+            # Floor = tp1_price so the guarantee never regresses.
+            if state.tp2_hit and new_m5 and state.tp1_price and state.m5_window:
+                runner_sl = find_runner_protection_sl(
+                    direction=state.direction,
+                    current_sl=state.current_sl,
+                    floor_sl=state.tp1_price,
+                    m5_window=state.m5_window,
+                    pip_calc=pip_calc,
+                    atr_price=h1_atr,
+                )
+                if runner_sl != state.current_sl:
+                    if self._tr.modify_sl(ticket, runner_sl):
+                        logger.info(
+                            "Runner ratchet | %s ticket=%s | SL %.5f → %.5f",
+                            symbol, ticket, state.current_sl, runner_sl,
+                        )
+                        state.current_sl = runner_sl
 
             # ── Monitor checks ────────────────────────────────────
             if not m1_bars:
@@ -591,6 +713,7 @@ class ExecutionService:
                     else:
                         _outcome = "MONITOR_CLOSE"
                     self._journal_close(ticket, total_pips, _outcome)
+                    self._update_streak(symbol, total_pips)
                     del self._trade_states[ticket]
 
             elif action == "trail_sl" and new_sl != state.current_sl:
@@ -661,7 +784,24 @@ class ExecutionService:
             else:
                 _outcome = "LOSS"
             self._journal_close(t, total_pips, _outcome)
+            self._update_streak(state.symbol, total_pips)
             del self._trade_states[t]
+
+    def _update_streak(self, symbol: str, total_pips: float) -> None:
+        now = datetime.now(tz=timezone.utc)
+        if total_pips < 0:
+            streak = self._loss_streak.get(symbol, 0) + 1
+            self._loss_streak[symbol] = streak
+            max_streak = getattr(config, "MAX_CONSECUTIVE_LOSSES", 2)
+            if streak >= max_streak:
+                pause_h = getattr(config, "LOSS_STREAK_PAUSE_HOURS", 4)
+                self._streak_pause[symbol] = now + timedelta(hours=pause_h)
+                logger.warning(
+                    "streak_pause | %s | %d consecutive losses → pause until %s",
+                    symbol, streak, self._streak_pause[symbol].isoformat(),
+                )
+        else:
+            self._loss_streak[symbol] = 0
 
     def _journal_close(self, ticket: int, pips: float, outcome: str) -> None:
         if self._journal:

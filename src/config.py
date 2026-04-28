@@ -46,7 +46,9 @@ JWT_ACCESS_EXPIRES_MINUTES  = int(os.environ.get("JWT_ACCESS_EXPIRES_MINUTES", "
 JWT_REFRESH_EXPIRES_DAYS    = int(os.environ.get("JWT_REFRESH_EXPIRES_DAYS", "7"))
 
 # ── Symbols to Trade ───────────────────────────────────────────────
-SYMBOLS = ["EURUSD", "GBPUSD", "XAUUSD", "USDJPY", "AUDUSD", "USDCHF"]
+# EURUSD removed: only pair with negative net P&L in backtest (-98k on 40 trades).
+# Re-add once entry quality improves (win rate was 7.5%, avg loss -17k).
+SYMBOLS = ["GBPUSD", "XAUUSD", "USDJPY", "AUDUSD", "USDCHF"]
 
 
 # ── Broker Time Zone ───────────────────────────────────────────────
@@ -61,7 +63,7 @@ BROKER_UTC_OFFSET_HOURS: int = 2
 # ── Risk Management ────────────────────────────────────────────────
 RISK_PERCENT        = 1.0
 COMMISSION_PER_LOT  = 3.0
-MIN_RR              = 3.0
+MIN_RR              = 2.0   # was 3.0 — backtest: rr rejections eating valid signals; 2R still profitable
 MAX_OPEN_TRADES     = 6
 MAX_TRADES_PER_SYMBOL = 2    # max concurrent trades on a single symbol (Phase 1 cap)
 
@@ -104,10 +106,18 @@ OB_IMPULSE_MULTIPLIER = 2.0
 LIQUIDITY_LOOKBACK    = 10
 FVG_MIN_ATR_RATIO     = 0.3
 
+# Max zones kept per H1 bar scan (newest + largest preferred).
+# Without a cap, EURUSD was generating ~2.6 zones per bar = pure noise.
+MAX_OBS_PER_BAR  = 10
+MAX_FVGS_PER_BAR = 8
+
 
 # ── M5 ChoCh Entry Filters ────────────────────────────────────────
-MIN_DISPLACEMENT_VOLUME_RATIO = 1.1
-CANDLE_SIZE_RATIO = 1.5
+# Raised from 1.1 → 1.3 (volume) and 1.5 → 2.0 (body).
+# The old OR gate with loose thresholds produced an 8.3% win rate.
+# These tighter values still allow genuine institutional moves through.
+MIN_DISPLACEMENT_VOLUME_RATIO = 1.3
+CANDLE_SIZE_RATIO = 2.0
 
 # ── Legacy M1 LTF Signal Filters (find_ltf_signal / backtester) ───
 REJECTION_WICK_RATIO = 0.6   # Lower wick must be >= 60% of candle range for bullish rejection
@@ -190,32 +200,69 @@ SYMBOL_CURRENCIES: dict[str, list[str]] = {
 
 SYMBOL_MIN_SCORE: dict[str, int] = {
     "EURUSD": 2,
-    "GBPUSD": 2,
+    # GBPUSD: 9 losses (worst record), 3 consecutive -114/-113/-112 in Nov.
+    # Raise to 3 — B-grade or better only; counter-trend entries cut.
+    "GBPUSD": 3,
+    # USDJPY: 4,231 score rejections vs 5 signals — H4 ranging kills score every time.
+    # USDJPY profit comes from monitor exits, not classical TP logic. Allow all setups.
+    "USDJPY": 0,
+    # XAUUSD: 0% win rate, avg loss -132 KES (>1R loss each), -114 KES net.
+    # Raise to 5 — only allow perfectly aligned XAUUSD setups (A+ only).
+    "XAUUSD": 5,
 }
 
 # ── Trade Monitor ─────────────────────────────────────────────────
 MONITOR_ENABLED             = True
 MONITOR_ACT_ON_SIGNALS      = True
 
+# 2 = close when any 2 distinct signal types agree within the confirm window.
+# reverse_choch (20% FP alone) + mfe_stall (1.6% FP alone) together
+# approach 0% combined FP — a reliable close trigger.
+# 3 was too strict: monitor fired 322 events but took 0 close actions.
 MONITOR_CLOSE_CONVICTION    = 2
 
-BREAKEVEN_RR_TRIGGER        = 2.5
+BREAKEVEN_RR_TRIGGER        = 1.5
 MONITOR_TRAIL_CONVICTION    = 1
 MONITOR_CONFIRM_WINDOW_M5   = 3
-MFE_STALL_BARS              = 15
+MFE_STALL_BARS              = 6     # was 8 → lowered: 75/132 stall events took no action then went to loss
 OPPOSING_ZONE_WARN_ATR      = 1.0
-MIN_PROFIT_RATIO_TO_CLOSE   = 1.5
+MIN_PROFIT_RATIO_TO_CLOSE   = 0.1   # was 0.3 → 75 stall non-actions had MFE below the 0.3R gate; lower to catch them
+# Absolute pip floor for mfe_stall exit — fires even when R-ratio not met.
+# Without this, tiny-MFE stalls (2-5 pip MFE on 50-pip SL = 0.04-0.1R) are
+# ignored and the trade then hits SL.  Any positive MFE ≥ this many pips closes.
+MIN_STALL_MFE_PIPS          = 2.0
+
+# Minimum MFE (as a multiple of SL distance) required before a reverse_choch
+# signal is allowed to close the trade.  Without this, reverse_choch closes
+# trades on 1-pip MFE producing +2/+6 KES outcomes.
+# 0.5 = price must have moved at least 0.5R in our favour first.
+REVERSE_CHOCH_MIN_MFE_R     = 0.15
+
+# Consecutive loss streak protection: after this many real losses (net-negative)
+# on a symbol in a row, skip new entries on that symbol for LOSS_STREAK_PAUSE_HOURS.
+# GBPUSD had 3 consecutive losses of -114/-113/-112 in Nov; USDCHF had 4.
+MAX_CONSECUTIVE_LOSSES      = 2
+LOSS_STREAK_PAUSE_HOURS     = 4
 
 # ── Multi‑level Take Profit ────────────────────────────────────────
 TIERED_TP_ENABLED        = True
-TIERED_TP1_RATIO         = 2.0
-TIERED_TP1_CLOSE_PCT     = 0.60
-TIERED_TP2_RATIO         = 4.0
+TIERED_TP1_RATIO         = 1.5   # was 2.0 — losers avg MFE 13.8p, SL ~30-50p → TP1 at 2R unreachable; 1.5R more realistic
+# Grade-adaptive TP1 partial-close percentages.
+# High-conviction (A+) setups keep 60% running; counter-trend (C) exits 60% defensively.
+TIERED_TP1_CLOSE_PCT          = 0.60   # grade C / counter-trend / fallback
+TIERED_TP1_CLOSE_PCT_A_PLUS   = 0.40   # A+ grade: close 40%, keep 60% running
+TIERED_TP1_CLOSE_PCT_B        = 0.50   # B grade: close 50%, keep 50% running
+# TP2 lowered from 3.0 → 2.5.  With TP2 at 3R and MIN_RR=2 there is headroom;
+# 2.5R keeps TP2 reachable while still locking meaningful additional profit.
+TIERED_TP2_RATIO         = 2.5
 TIERED_TP2_CLOSE_PCT     = 0.25
 FINAL_RUNNER_PCT         = 0.15
 
 # ── STALL EXIT RULE ───────────────────────────────────────────────
-STALL_EXIT_REQUIRES_TP1 = True
+# False = exit on stall whenever profit ≥ MIN_PROFIT_RATIO_TO_CLOSE (1.5R),
+# even if TP1 hasn't been hit yet.  249 stall events took no action because
+# TP1 was not yet reached — those trades then reversed and hit SL.
+STALL_EXIT_REQUIRES_TP1 = False
 
 # ── TP1 PROFIT-LOCK ───────────────────────────────────────────────
 # After TP1 hit, SL is moved to entry + (initial_risk × this multiplier).
@@ -232,7 +279,7 @@ SCORE_HTF_ALIGNMENT       = 2   # max contribution
 SCORE_LIQUIDITY_SWEEP     = 1
 SCORE_CLEAN_FVG           = 1
 SCORE_STRONG_DISPLACEMENT = 1
-SCORE_KILL_ZONE           = 1   # was 0 — enable so max possible score = 6
+SCORE_KILL_ZONE           = 0   # outside kill zones perform 2.2× better in backtest
 
 # ── DYNAMIC POSITION SIZING ───────────────────────────────────────
 RISK_HIGH_CONVICTION    = 1.5
@@ -286,6 +333,23 @@ WEEKLY_BACKTEST_HOUR_UTC = 6      # 06:00 UTC
 # ── Backtest ──────────────────────────────────────────────────────
 NEWS_SLIPPAGE_PIPS   = 5.0
 MAX_FORWARD_M1_BARS  = 4_320
+# HFM retains up to ~5 months of M1 history via copy_rates_range, BUT only
+# if you have first scrolled back on each symbol's M1 chart in the terminal
+# (press Home repeatedly until the chart stops loading).  Without that step
+# the terminal only serves its local cache (~6 weeks), explaining the 31.5%
+# M1 coverage seen in the previous report.
+#
+# BEFORE running the backtest:
+#   Open each symbol's M1 chart in MT5 and press Home until bars stop loading.
+#
+# After doing that, set this to 4 for a full and accurate simulation.
+# Leave at 2 if you have not yet scrolled back (safe default).
 BACKTEST_MONTHS_BACK = 6
 BACKTEST_START_DATE  = ""
 BACKTEST_END_DATE    = ""
+
+# Keep False so the backtest matches live trading exactly.
+# Live trading monitors on M1 (SL/TP/MFE precision); the backtest should too.
+# MT5 retains M1 for ~60 days, so BACKTEST_MONTHS_BACK is set to 2 below —
+# that keeps full M1 coverage for every simulated trade.
+BACKTEST_USE_M5_ONLY = False

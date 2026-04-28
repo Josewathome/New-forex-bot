@@ -583,16 +583,17 @@ def find_m5_choch_signal(
 
             disp = c
 
-            # Displacement quality gate (OR logic):
-            # A valid displacement must show EITHER a volume spike OR a large body.
-            # Requiring BOTH would double-filter and kill too many valid setups.
+            # Displacement quality gate (AND logic):
+            # A genuine institutional displacement must show BOTH a volume spike
+            # AND a large body.  The old OR gate (either alone sufficed) allowed
+            # random noise candles through, producing only 8.3% entry win rate.
             volume_ok = avg_volume > 0 and (disp.volume / avg_volume) >= config.MIN_DISPLACEMENT_VOLUME_RATIO
             body_ok = False
             if i >= 3:
                 prior_avg_body = sum(m5_candles[i - k].body_size for k in range(1, 4)) / 3.0
                 body_ok = prior_avg_body > 0 and disp.body_size >= prior_avg_body * config.CANDLE_SIZE_RATIO
 
-            if not volume_ok and not body_ok:
+            if not volume_ok or not body_ok:
                 if diag:
                     diag.record_rejection(symbol, "choch_weak_displacement")
                 continue
@@ -614,14 +615,14 @@ def find_m5_choch_signal(
 
             disp = c
 
-            # Displacement quality gate (OR logic — same as bullish)
+            # Displacement quality gate (AND logic — same as bullish)
             volume_ok = avg_volume > 0 and (disp.volume / avg_volume) >= config.MIN_DISPLACEMENT_VOLUME_RATIO
             body_ok = False
             if i >= 3:
                 prior_avg_body = sum(m5_candles[i - k].body_size for k in range(1, 4)) / 3.0
                 body_ok = prior_avg_body > 0 and disp.body_size >= prior_avg_body * config.CANDLE_SIZE_RATIO
 
-            if not volume_ok and not body_ok:
+            if not volume_ok or not body_ok:
                 if diag:
                     diag.record_rejection(symbol, "choch_weak_displacement")
                 continue
@@ -799,13 +800,16 @@ def compute_dynamic_tp(
 
     ratio = atr / baseline_atr
     if ratio < 0.8:
-        # Low volatility: tighter targets still well above MIN_RR
-        tp1, tp2 = 2.0, 3.5
+        # Low volatility: use config defaults — smaller ATR means TPs are already
+        # harder to reach, so don't push them further out.
+        tp1, tp2 = config.TIERED_TP1_RATIO, config.TIERED_TP2_RATIO
     elif ratio > 1.2:
-        # High volatility: extended runners
-        tp1, tp2 = 2.5, 5.0
+        # High volatility: extend runners — big ATR means price can travel further.
+        # Scale up 33% from config to capture momentum without over-extending.
+        tp1 = round(config.TIERED_TP1_RATIO * 1.33, 2)
+        tp2 = round(config.TIERED_TP2_RATIO * 1.40, 2)
     else:
-        # Normal: match static defaults
+        # Normal regime: match static defaults
         tp1, tp2 = config.TIERED_TP1_RATIO, config.TIERED_TP2_RATIO
     return tp1, tp2
 
@@ -870,6 +874,180 @@ def is_kill_zone(dt: datetime) -> bool:
         if start <= hour < end:
             return True
     return False
+
+
+# ─────────────────────────────────────────────
+#  Zone Health Re-Evaluator
+# ─────────────────────────────────────────────
+
+def evaluate_zone_health(
+    zone:       "Zone",
+    h1_candles: List["Candle"],
+    m5_candles: List["Candle"],
+    h1_atr:     float,
+) -> tuple[bool, str]:
+    """
+    Re-evaluate a zone's validity at the exact moment price arrives at it.
+
+    Called just before any entry signal search begins.  Zones are mapped
+    on H1 bar close — by the time price actually taps the zone, hours may
+    have passed and the market may have flipped.  Four checks run in order
+    of severity; the first failure short-circuits and rejects the zone.
+
+    Returns:
+        (True,  "ok")           — zone is still valid, proceed to signal search
+        (False, "<reason>")     — zone is stale/consumed/flipped, skip it
+
+    Checks (in order):
+      1. H1 candle CLOSED through the zone after it was created
+         → liquidity was consumed; trading it again is trading into nothing.
+      2. Three consecutive H1 candles closed against the zone direction
+         (all bearish + descending for a bullish zone, vice versa)
+         → market structure has flipped since the zone formed.
+      3. Touch count exceeded the zone type's durability limit
+         (FVG: 1 reuse max; OB: 2 retests max)
+         → institutional orders have been absorbed over repeated taps.
+      4. Last four M5 candles are ALL against the zone direction AND at
+         least two carry above-average volume
+         → a local displacement is forming against the zone right now.
+    """
+    # ── Check 1: H1 close-through (mitigation) ──────────────────────
+    # Only examine candles that formed AFTER the zone was created so we
+    # don't penalise a zone for the very candle that built it.
+    post_zone_h1 = [c for c in h1_candles if c.time > zone.created_at]
+    for candle in post_zone_h1:
+        if zone.direction == Direction.BULLISH and candle.close < zone.low:
+            return False, "h1_close_mitigated"
+        if zone.direction == Direction.BEARISH and candle.close > zone.high:
+            return False, "h1_close_mitigated"
+
+    # ── Check 2: H1 structure flipped against zone ───────────────────
+    if len(post_zone_h1) >= 3:
+        last3 = post_zone_h1[-3:]
+        if zone.direction == Direction.BULLISH:
+            if (all(c.is_bearish for c in last3) and
+                    last3[2].close < last3[1].close < last3[0].close):
+                return False, "h1_structure_flipped"
+        else:
+            if (all(c.is_bullish for c in last3) and
+                    last3[2].close > last3[1].close > last3[0].close):
+                return False, "h1_structure_flipped"
+
+    # ── Check 3: Touch count — zone liquidity exhausted ─────────────
+    if zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.touch_count >= 2:
+        return False, "fvg_over_tapped"
+    if zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count >= 3:
+        return False, "ob_over_tapped"
+
+    # ── Check 4: M5 momentum displacement against zone ───────────────
+    # 4/4 recent M5 candles oppose the zone AND at least 2 carry volume
+    # spike (>1.3× avg) → a real institutional move is forming against us.
+    if len(m5_candles) >= 5:
+        last4 = m5_candles[-4:]
+        vol_sample = [c.volume for c in m5_candles[-11:-1]]
+        avg_vol = sum(vol_sample) / len(vol_sample) if vol_sample else 0.0
+        if zone.direction == Direction.BULLISH:
+            against = [c for c in last4 if c.is_bearish]
+            strong  = sum(1 for c in against
+                          if avg_vol > 0 and c.volume >= avg_vol * 1.3)
+        else:
+            against = [c for c in last4 if c.is_bullish]
+            strong  = sum(1 for c in against
+                          if avg_vol > 0 and c.volume >= avg_vol * 1.3)
+        if len(against) == 4 and strong >= 2:
+            return False, "m5_momentum_against_zone"
+
+    return True, "ok"
+
+
+# ─────────────────────────────────────────────
+#  Opposing Opportunity Finder
+# ─────────────────────────────────────────────
+
+def find_opposing_opportunity(
+    rejected_zone:  "Zone",
+    m5_candles:     List["Candle"],
+    pip_calc:       "PipCalculator",
+    spread_pips:    float,
+    liquidity_pool: "LiquidityPool",
+    h1_atr:         float,
+    zone_buffer:    float = 0.0,
+    min_rr:         float = 2.0,
+    diag:           Optional["DiagnosticsCollector"] = None,
+) -> Optional[Tuple["TradeSignal", "Zone"]]:
+    """
+    When institutional momentum fires AGAINST a mapped zone, evaluate
+    whether that opposing move qualifies as a valid entry in the new direction.
+
+    The displacement that invalidated the original zone IS a ChoCh — just
+    in the opposite direction.  A synthetic zone is constructed at the
+    rejection point and the standard ChoCh signal finder is reused unchanged.
+
+    Concept (bullish zone rejected bearishly):
+      • The zone HIGH becomes institutional supply — price rejected from there.
+      • Synthetic BEARISH zone spans from zone.high down to zone.mid.
+      • find_m5_choch_signal looks for: tap of that supply → brief pullback →
+        bearish displacement (already forming in the m5 candles we detected).
+      • SL goes above zone.high; TP targets pool.low.
+
+    Returns (TradeSignal, synthetic_zone) if valid, else None.
+    """
+    if not m5_candles:
+        return None
+
+    opp_direction = (
+        Direction.BEARISH
+        if rejected_zone.direction == Direction.BULLISH
+        else Direction.BULLISH
+    )
+
+    # Build synthetic zone at the institutional rejection level.
+    # For a rejected bullish zone: price bounced OFF zone.high → that's supply.
+    # For a rejected bearish zone: price bounced OFF zone.low  → that's demand.
+    if opp_direction == Direction.BEARISH:
+        syn_high = rejected_zone.high + zone_buffer
+        syn_low  = rejected_zone.mid
+    else:
+        syn_high = rejected_zone.mid
+        syn_low  = rejected_zone.low - zone_buffer
+
+    synthetic_zone = Zone(
+        id=          str(uuid.uuid4()),
+        symbol=      rejected_zone.symbol,
+        zone_type=   ZoneType.ORDER_BLOCK,
+        direction=   opp_direction,
+        high=        round(syn_high, 5),
+        low=         round(syn_low,  5),
+        created_at=  m5_candles[-1].time,
+        timeframe=   Timeframe.M5,
+    )
+
+    signal = find_m5_choch_signal(
+        m5_candles=      m5_candles,
+        zone=            synthetic_zone,
+        pip_calc=        pip_calc,
+        spread_pips=     spread_pips,
+        liquidity_pool=  liquidity_pool,
+        atr_price=       h1_atr,
+        zone_buffer=     zone_buffer,
+        min_rr_override= min_rr,
+        diag=            diag,
+    )
+
+    if signal is None:
+        return None
+
+    logger.info(
+        "ZONE FLIP ✓ | %s %s | opposing %s entry found | "
+        "entry=%.5f SL=%.5f TP=%.5f RR=%.2f",
+        rejected_zone.symbol, rejected_zone.direction.value,
+        opp_direction.value,
+        signal.entry_price, signal.stop_loss, signal.take_profit,
+        signal.risk_reward,
+    )
+    return signal, synthetic_zone
+
+
 # ─────────────────────────────────────────────
 #  Zone Mapper
 # ─────────────────────────────────────────────
@@ -887,9 +1065,33 @@ class ZoneMapper:
         obs       = find_order_blocks(candles, symbol, timeframe)
         fvgs      = find_fair_value_gaps(candles, symbol, timeframe, atr_value=h1_atr)
         pool      = find_liquidity_pool(candles, symbol, timeframe)
+
+        # ── Zone quality cap ──────────────────────────────────────
+        # Without a cap every 100-bar window spawns dozens of zones, most of
+        # which are old and thin.  We keep only the top-N by a composite score:
+        #   60% recency  (newer created_at = more relevant to current price)
+        #   40% size     (larger zone relative to ATR = more institutional weight)
+        # OBs and FVGs are capped separately so neither type crowds out the other.
+        if h1_atr > 0:
+            newest_ts = max((z.created_at for z in obs + fvgs), default=None)
+            oldest_ts = min((z.created_at for z in obs + fvgs), default=None)
+            ts_range  = (newest_ts - oldest_ts).total_seconds() if (newest_ts and oldest_ts and newest_ts != oldest_ts) else 1.0
+
+            def _score(z: Zone) -> float:
+                age_norm = (z.created_at - oldest_ts).total_seconds() / ts_range if ts_range > 0 else 0.0
+                size_norm = (z.high - z.low) / h1_atr
+                return 0.6 * age_norm + 0.4 * size_norm
+
+            obs.sort(key=_score, reverse=True)
+            fvgs.sort(key=_score, reverse=True)
+
+        max_obs  = getattr(config, "MAX_OBS_PER_BAR",  10)
+        max_fvgs = getattr(config, "MAX_FVGS_PER_BAR",  8)
+        obs  = obs[:max_obs]
+        fvgs = fvgs[:max_fvgs]
+
         all_zones = obs + fvgs
-        logger.info("[%s] %d OBs, %d FVGs (ATR=%.5f, min_fvg=%.5f)  pool=H%.5f/L%.5f",
+        logger.info("[%s] %d OBs, %d FVGs after cap (ATR=%.5f)  pool=H%.5f/L%.5f",
                     symbol, len(obs), len(fvgs), h1_atr,
-                    h1_atr * config.FVG_MIN_ATR_RATIO,
                     pool.high if pool else 0, pool.low if pool else 0)
         return all_zones, pool
