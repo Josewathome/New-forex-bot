@@ -94,11 +94,13 @@ def build_services(gw: MT5Gateway, journal=None):
     else:
         news_client = mt5_news
         logger.info("News guardian: MT5 built-in calendar (NEWS_API_KEY not set)")
-    news_manager = NewsManager(news_client)
-    commission   = _commission_in_account_ccy(config.COMMISSION_PER_LOT)
+    news_manager    = NewsManager(news_client)
+    commission      = _commission_in_account_ccy(config.COMMISSION_PER_LOT)
+    commission_map  = _build_commission_map()
     spread_calc  = SpreadCalculator(
         market_data=       market_data,
         commission_per_lot=commission,
+        commission_map=    commission_map,
     )
     execution = ExecutionService(
         market_data=       market_data,
@@ -119,10 +121,35 @@ def build_services(gw: MT5Gateway, journal=None):
 def _commission_in_account_ccy(usd: float) -> float:
     rates = {
         "USD": 1.0, "EUR": 0.92, "GBP": 0.79,
-        "KES": config.KES_PER_USD,   # single source of truth from config
+        "KES": config.KES_PER_USD,
         "NGN": 1550.0, "ZAR": 18.5,
     }
     return usd * rates.get(config.ACCOUNT_CURRENCY.upper(), 1.0)
+
+
+def _build_commission_map() -> dict:
+    """
+    Build a per-symbol commission dict in account currency.
+
+    Zero Spread: each symbol has its own USD rate (XAUUSD = $5/lot, majors = $3/lot).
+    Premium/Pro: commission is zero — spread covers broker cost.
+    """
+    acct_type = getattr(config, "HFM_ACCOUNT_TYPE", "ZERO_SPREAD").upper()
+    logger.info("HFM account type: %s", acct_type)
+
+    if acct_type in ("PREMIUM", "PRO"):
+        logger.info("Commission model: $0 (spread-based account)")
+        return {sym: 0.0 for sym in config.SYMBOLS}
+
+    comm_usd_map = getattr(config, "HFM_COMMISSION_USD", {})
+    default_usd  = getattr(config, "HFM_COMMISSION_USD_DEFAULT", 3.0)
+    result = {}
+    for sym in config.SYMBOLS:
+        usd_rate = comm_usd_map.get(sym, default_usd)
+        result[sym] = _commission_in_account_ccy(usd_rate)
+        logger.info("  Commission %s: $%.2f USD → %.2f %s/lot",
+                    sym, usd_rate, result[sym], config.ACCOUNT_CURRENCY)
+    return result
 
 
 class H1ClockWatcher:
@@ -139,6 +166,32 @@ class H1ClockWatcher:
             self._last = h
             return True
         return False
+
+
+class _BarClockWatcher:
+    """
+    Generic closed-bar detector for any timeframe with a fixed bar size.
+
+    Fires once per bar close — i.e. when the current bar boundary
+    (floor(now / bar_seconds) * bar_seconds) changes from the last seen value.
+    Pre-seeded at construction so the first loop tick never fires spuriously.
+    """
+    def __init__(self, bar_seconds: int) -> None:
+        self._bar_seconds = bar_seconds
+        now = datetime.now(tz=timezone.utc)
+        self._last = int(now.timestamp()) // bar_seconds * bar_seconds
+
+    def should_remap(self, now: datetime) -> bool:
+        current = int(now.timestamp()) // self._bar_seconds * self._bar_seconds
+        if self._last != current:
+            self._last = current
+            return True
+        return False
+
+
+# Convenience aliases — used in run_live() to create watchers with clear names.
+M30ClockWatcher = lambda: _BarClockWatcher(30 * 60)   # fires every 30 min
+M5ClockWatcher  = lambda: _BarClockWatcher(5  * 60)   # fires every 5 min
 
 
 def run_live() -> None:
@@ -212,9 +265,13 @@ def run_live() -> None:
         except Exception as exc:
             logger.exception("Zone mapping [%s]: %s", sym, exc)
 
-    logger.info("Bot live. Watching: %s", " | ".join(config.SYMBOLS))
+    logger.info("Bot live. Account type: %s | Watching: %s",
+                getattr(config, "HFM_ACCOUNT_TYPE", "ZERO_SPREAD"),
+                " | ".join(config.SYMBOLS))
 
     h1_watcher      = H1ClockWatcher()
+    m30_watcher     = M30ClockWatcher()
+    m5_watcher      = M5ClockWatcher()
     last_checkpoint = datetime.now(tz=timezone.utc)
     cp_interval     = getattr(config,"CHECKPOINT_INTERVAL_MIN",15) * 60
     loop_n          = 0
@@ -224,14 +281,33 @@ def run_live() -> None:
         try:
             news_manager.refresh_if_needed(loop_start)
 
+            # ── H1 zone remap (every H1 close) ────────────────────
             if h1_watcher.should_remap(loop_start):
-                logger.info("H1 close - re-mapping zones.")
+                logger.info("H1 close - re-mapping H1 zones.")
                 for sym in config.SYMBOLS:
                     try:
                         execution.run_zone_mapping(sym)
                         zone_store.save_snapshot(sym, zone_repo.get_active_zones(sym), zone_repo.get_liquidity_pool(sym))
                     except Exception as exc:
-                        logger.exception("Zone remap [%s]: %s", sym, exc)
+                        logger.exception("H1 zone remap [%s]: %s", sym, exc)
+
+            # ── M30 zone remap (every M30 close) ──────────────────
+            if getattr(config, "M30_ZONE_MAPPING_ENABLED", True) and m30_watcher.should_remap(loop_start):
+                logger.info("M30 close - re-mapping M30 zones.")
+                for sym in config.SYMBOLS:
+                    try:
+                        execution.run_m30_zone_mapping(sym)
+                    except Exception as exc:
+                        logger.exception("M30 zone remap [%s]: %s", sym, exc)
+
+            # ── M5 zone remap (every M5 close) ────────────────────
+            if getattr(config, "M5_ZONE_MAPPING_ENABLED", True) and m5_watcher.should_remap(loop_start):
+                logger.debug("M5 close - re-mapping M5 zones.")
+                for sym in config.SYMBOLS:
+                    try:
+                        execution.run_m5_zone_mapping(sym)
+                    except Exception as exc:
+                        logger.exception("M5 zone remap [%s]: %s", sym, exc)
 
             # ── Monitoring pass (all symbols first) ───────────────
             for sym in config.SYMBOLS:
@@ -356,19 +432,23 @@ def run_backtest() -> None:
     # it simply returns fewer bars.  The simulator already falls back to M5
     # for any gap.  Press Home on each symbol's M1 chart first to maximise
     # the history the terminal has cached locally (up to ~5 months on HFM).
+    d1_buf = timedelta(days=config.D1_CANDLE_COUNT + 10)
     candle_data = {}
     for sym in config.SYMBOLS:
         h1 = md.get_candles_range(sym, Timeframe.H1, start_dt-h1_buf, end_dt)
         m5 = md.get_candles_range(sym, Timeframe.M5, start_dt, end_dt)
         m1 = md.get_candles_range(sym, Timeframe.M1, start_dt, end_dt)
         h4 = md.get_candles_range(sym, Timeframe.H4, start_dt-h4_buf, end_dt)
+        d1 = md.get_candles_range(sym, Timeframe.D1, start_dt-d1_buf, end_dt)
         if h1 and m5:
-            candle_data[sym] = {Timeframe.H1:h1,Timeframe.M5:m5,Timeframe.M1:m1,Timeframe.H4:h4}
+            candle_data[sym] = {Timeframe.H1:h1,Timeframe.M5:m5,Timeframe.M1:m1,
+                                Timeframe.H4:h4,Timeframe.D1:d1}
             m1_count = len(m1) if m1 else 0
             m5_count = len(m5) if m5 else 0
             m1_coverage = round(m1_count / max(m5_count * 5, 1) * 100, 1)
-            logger.info("  %s: H1=%d  M5=%d  M1=%d (%.1f%% coverage)  H4=%d",
-                        sym, len(h1), m5_count, m1_count, m1_coverage, len(h4) if h4 else 0)
+            logger.info("  %s: H1=%d  M5=%d  M1=%d (%.1f%% coverage)  H4=%d  D1=%d",
+                        sym, len(h1), m5_count, m1_count, m1_coverage,
+                        len(h4) if h4 else 0, len(d1) if d1 else 0)
         else:
             logger.warning("  %s: insufficient data (H1=%s M5=%s).",
                            sym, "ok" if h1 else "MISSING", "ok" if m5 else "MISSING")

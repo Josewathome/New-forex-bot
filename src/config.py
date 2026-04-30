@@ -30,7 +30,7 @@ if not MT5_SERVER:
     raise RuntimeError("MT5_SERVER environment variable is not set.")
 ACCOUNT_NICKNAME = "Demojose"
 ACCOUNT_CURRENCY = "KES"
-ACCOUNT_BALANCE  = 10_000
+ACCOUNT_BALANCE  = 30_000
 LEVERAGE         = "1:400"
 
 MT5_PATH = ""
@@ -60,9 +60,29 @@ SYMBOLS = ["GBPUSD", "XAUUSD", "USDJPY", "AUDUSD", "USDCHF"]
 # permanently on a different offset and you start the bot off-hours.
 BROKER_UTC_OFFSET_HOURS: int = 2
 
+# ── HFM Account Type ──────────────────────────────────────────────
+# "ZERO_SPREAD" : raw spread ≈ 0.0 pips + fixed commission per lot (best for bots)
+# "PREMIUM"     : spread-based pricing, no commission (~1.2+ pips on EURUSD)
+# "PRO"         : spread-based pricing, no commission (~0.5+ pips on EURUSD)
+# Set via .env:  HFM_ACCOUNT_TYPE=ZERO_SPREAD
+HFM_ACCOUNT_TYPE: str = os.environ.get("HFM_ACCOUNT_TYPE", "ZERO_SPREAD")
+
+# Per-symbol opening commission in USD per standard lot — Zero Spread account only.
+# $3.00 / side  ($6.00 round-trip) for major forex pairs.
+# $5.00 / side  ($10.00 round-trip) for Gold (XAUUSD / XAGUSD).
+# Values are ignored when HFM_ACCOUNT_TYPE is "PREMIUM" or "PRO".
+HFM_COMMISSION_USD: dict[str, float] = {
+    "EURUSD": 3.0, "GBPUSD": 3.0, "USDJPY": 3.0,
+    "AUDUSD": 3.0, "USDCHF": 3.0, "NZDUSD": 3.0,
+    "EURGBP": 3.0, "USDCAD": 3.0, "EURJPY": 3.0, "GBPJPY": 3.0,
+    "XAUUSD": 5.0, "XAGUSD": 5.0,
+}
+HFM_COMMISSION_USD_DEFAULT: float = 3.0  # fallback for symbols not in the map above
+
+
 # ── Risk Management ────────────────────────────────────────────────
-RISK_PERCENT        = 1.0
-COMMISSION_PER_LOT  = 3.0
+RISK_PERCENT        = 2.0
+COMMISSION_PER_LOT  = 3.0  # USD/lot (per side) — Zero Spread default for major pairs
 MIN_RR              = 2.0   # was 3.0 — backtest: rr rejections eating valid signals; 2R still profitable
 MAX_OPEN_TRADES     = 6
 MAX_TRADES_PER_SYMBOL = 2    # max concurrent trades on a single symbol (Phase 1 cap)
@@ -86,8 +106,9 @@ MARGIN_SAFETY_FACTOR: float = 2.0
 ATR_SL_MULTIPLIERS: dict[str, float] = {
     "EURUSD": 0.20, "GBPUSD": 0.20, "AUDUSD": 0.20,
     "USDJPY": 0.25, "EURJPY": 0.25, "GBPJPY": 0.25,
-    "XAUUSD": 0.30, "XAGUSD": 0.30,
-    "USDCHF": 0.20,
+    "XAUUSD": 0.15,  # was 0.30 — gold H1 ATR ~120p; 0.30× = 36p SL buffer pushing
+    "XAGUSD": 0.20,  # total SL to 50-80p, making MIN_RR=2 require 100-160p TP (50-80%
+    "USDCHF": 0.20,  # of gold daily range).  0.15× = 18p buffer — achievable RR.
 }
 ATR_SL_MULTIPLIER_DEFAULT = 0.20
 
@@ -111,6 +132,15 @@ FVG_MIN_ATR_RATIO     = 0.3
 MAX_OBS_PER_BAR  = 10
 MAX_FVGS_PER_BAR = 8
 
+# ── H4 Zone Confluence ─────────────────────────────────────────────
+# When an H1 zone overlaps with an H4 OB/FVG of the same direction,
+# score_setup() awards an extra bonus.  Two institutional timeframes
+# pointing at the same price level is a significantly stronger setup.
+H4_ZONE_CONFLUENCE_BONUS: int   = 2    # extra score points when H1+H4 zones align
+H4_ZONE_MIN_OVERLAP_PCT:  float = 0.2  # ≥20% of the smaller zone must overlap
+H4_ZONE_MAX_OBS:          int   = 5    # cap H4 OBs so stale ones don't dominate
+H4_ZONE_MAX_FVGS:         int   = 4    # cap H4 FVGs
+
 
 # ── M5 ChoCh Entry Filters ────────────────────────────────────────
 # Raised from 1.1 → 1.3 (volume) and 1.5 → 2.0 (body).
@@ -119,13 +149,48 @@ MAX_FVGS_PER_BAR = 8
 MIN_DISPLACEMENT_VOLUME_RATIO = 1.3
 CANDLE_SIZE_RATIO = 2.0
 
+# ── Per-Symbol ChoCh Displacement Overrides ───────────────────────
+# Gold (XAUUSD) M5 candles are 5-10× larger than forex M5 candles
+# (~15-25p body vs ~1.5p on GBPUSD).  Applying the same 2.0× body
+# ratio and 1.3× volume ratio to gold over-filters: a 20-pip gold
+# displacement body is already exceptional, but the 3-bar average
+# body on gold is also 10-15p — so 2.0× requires a 20-30p body which
+# is rare.  Lowering thresholds specifically for gold lets genuine
+# institutional gold moves through without degrading forex filtering.
+SYMBOL_DISPLACEMENT_VOLUME_RATIO: dict[str, float] = {
+    "XAUUSD": 1.1,   # gold volume spikes are smaller relative to avg
+    "XAGUSD": 1.1,
+}
+SYMBOL_CANDLE_SIZE_RATIO: dict[str, float] = {
+    "XAUUSD": 1.5,   # gold avg body is already large; 1.5× is sufficient
+    "XAGUSD": 1.5,
+}
+
+# ── M1 Predictive Signal Filters (find_m1_predictive_signal) ─────
+# M1 operates on much smaller candles (~0.8 pip range vs ~2.5 pip on M5).
+# Thresholds are raised significantly to overcome M1 noise floor.
+# These are separate from M5 thresholds so each timeframe is calibrated
+# independently — changing M5 values does not affect M1 and vice versa.
+M1_MIN_WAVE_CANDLES          = 5     # minimum M1 candles in retracement wave before ChoCh
+                                      # (_is_swing_high needs 4-candle structure + 1 retracement)
+M1_DISPLACEMENT_VOLUME_RATIO = 1.8   # M5 uses 1.3; M1 noise requires higher bar
+M1_CANDLE_SIZE_RATIO         = 3.0   # M5 uses 2.0; 3× avg body filters micro-noise
+M1_BODY_MIN_PRICE            = 0.00015  # absolute body floor = ~1.5 pips on 5-digit pairs
+                                         # ensures displacement body ≥ typical spread
+M1_MIN_ZONE_SIZE_PIPS        = 6.0   # zone must be ≥6 pips tall for M1 wave to have
+                                      # meaningful internal structure before zone.low
+# M1 SL uses zone.mid rather than zone.low so the stop survives normal
+# liquidity sweeps inside the zone while still being 4× tighter than M5 ChoCh.
+# After M5 candle confirms bullish, execution_service moves SL to zone.low - buffer.
+M1_SL_USE_ZONE_MID           = True
+
 # ── Legacy M1 LTF Signal Filters (find_ltf_signal / backtester) ───
 REJECTION_WICK_RATIO = 0.6   # Lower wick must be >= 60% of candle range for bullish rejection
 VOLUME_RATIO_MIN     = 1.0   # Volume must be >= 1× average to count as valid rejection candle
 
 
 # ── Weighted Scoring ──────────────────────────────────────────────
-SETUP_SCORE_THRESHOLD = 2
+SETUP_SCORE_THRESHOLD = 3
 # Risk fractions returned by grade_setup() (A+/B/C grades).
 # NOTE: execution_service overrides these with dynamic_risk() (score-based)
 # after placing the trade, so only COUNTER_TREND_MIN_RR has a hard effect
@@ -137,12 +202,69 @@ COUNTER_TREND_MIN_RR  = 1.5   # Min RR required for C-grade (counter-trend) setu
 
 ZONE_ATR_BUFFER_PCT = 0.15
 
+# ── Trend Filters (commission protection) ────────────────────────
+# REQUIRE_H4_BIAS: False = allow trades when H4 is ranging, as long as the
+# zone score still passes SYMBOL_MIN_SCORE (D1 alignment can compensate).
+# True = hard-block all entries when H4 structure is ambiguous.
+# Keep False — forex consolidates often; a ranging H4 + clear D1 trend
+# is still a valid trade.  The scoring system already penalises no-trend
+# setups (they lose the +3 H4 bonus and need D1+equilibrium to pass).
+REQUIRE_H4_BIAS:      bool = False
+
+# BLOCK_COUNTER_D1: False = let D1 work as a scoring BONUS only (preferred).
+# A counter-D1 setup that has H4 + equilibrium still scores 5 = A+ and is a
+# genuine trade.  Hard-blocking it removes too many valid setups and kills
+# trade frequency.  The D1 bonus (+2) naturally makes aligned trades larger
+# via dynamic_risk, and counter-D1 trades smaller — that is the right balance.
+BLOCK_COUNTER_D1:     bool = False
+
 H4_CANDLE_COUNT  = 50
 H1_CANDLE_COUNT  = 100
+M30_CANDLE_COUNT = 60   # 30 bars = 15 hours of M30 context for zone mapping
 M5_CANDLE_COUNT  = 60
-M1_CANDLE_COUNT  = 30
+M1_CANDLE_COUNT  = 60   # raised from 30: M1 predictive signal needs ~30 bars of context
+                         # + 30 bars lookback for wave detection inside the current M5 period
+D1_CANDLE_COUNT  = 30   # ~6 weeks of daily data for D1 trend detection
 
 H4_EQUILIBRIUM_LOOKBACK = 20
+D1_EQUILIBRIUM_LOOKBACK = 15  # daily swing pivot lookback
+
+# ── M5 / M30 Intra-Hour Zone Mapping ─────────────────────────────
+# M30 zones re-map every 30-minute close.  They sit between H1 and M5
+# in the hierarchy — a price level confirmed on BOTH H1 and M30 is
+# significantly stronger than one appearing only on H1.
+# M5 zones re-map every 5-minute close.  They provide the tightest
+# structural context for M1 entries.
+#
+# Confluence bonus: when the active H1 zone overlaps an M30 zone of
+# the same direction, the setup score receives +1.  When it also
+# overlaps an M5 zone, another +1 is awarded.  This is additive with
+# the existing H4 zone confluence bonus — max total score rises from
+# 9 to 11 but thresholds are not changed, so existing A+/B grades
+# are not disrupted and no good trades are blocked.
+#
+# If NO M30/M5 zone overlaps, trade still proceeds as before — the
+# confluence is a BONUS, never a hard block.  This is the key design
+# principle: add information, never remove trade opportunities.
+M30_ZONE_MAPPING_ENABLED  : bool  = True
+M5_ZONE_MAPPING_ENABLED   : bool  = True
+
+M30_ZONE_MAX_OBS          : int   = 4   # cap M30 OBs per scan
+M30_ZONE_MAX_FVGS         : int   = 3   # cap M30 FVGs per scan
+M5_ZONE_MAX_OBS           : int   = 3   # cap M5 OBs per scan
+M5_ZONE_MAX_FVGS          : int   = 3   # cap M5 FVGs per scan
+
+# Minimum overlap fraction for M30/M5 zone to count as confluent with H1.
+# 20% overlap (same as H4 confluence) keeps the bar meaningful without
+# being so strict that close-but-not-perfect zones are missed.
+M30_ZONE_MIN_OVERLAP_PCT  : float = 0.2
+M5_ZONE_MIN_OVERLAP_PCT   : float = 0.2
+
+# Score bonuses awarded when M30/M5 zones overlap the active H1 zone.
+# Kept at +1 each (vs +2 for H4) because lower-TF zones are less
+# institutionally significant than H4 — they confirm, not lead.
+M30_ZONE_CONFLUENCE_BONUS : int   = 1
+M5_ZONE_CONFLUENCE_BONUS  : int   = 1
 
 # ── News Guardrail ────────────────────────────────────────────────
 HIGH_IMPACT_BUFFER_MINS    = 30
@@ -199,16 +321,18 @@ SYMBOL_CURRENCIES: dict[str, list[str]] = {
 }
 
 SYMBOL_MIN_SCORE: dict[str, int] = {
-    "EURUSD": 2,
-    # GBPUSD: 9 losses (worst record), 3 consecutive -114/-113/-112 in Nov.
-    # Raise to 3 — B-grade or better only; counter-trend entries cut.
+    "EURUSD": 3,
     "GBPUSD": 3,
-    # USDJPY: 4,231 score rejections vs 5 signals — H4 ranging kills score every time.
-    # USDJPY profit comes from monitor exits, not classical TP logic. Allow all setups.
-    "USDJPY": 0,
-    # XAUUSD: 0% win rate, avg loss -132 KES (>1R loss each), -114 KES net.
-    # Raise to 5 — only allow perfectly aligned XAUUSD setups (A+ only).
-    "XAUUSD": 5,
+    # USDJPY: 2 — most profit comes from monitor exits on H4/D1-equilibrium
+    # setups; score 3 killed too many valid entries in previous backtests.
+    "USDJPY": 2,
+    # XAUUSD lowered 5→3: backtest showed 1,620 score rejections vs 25 signals
+    # (64.8 rejects per signal vs 24.3 for GBPUSD — gold was 2.7× over-filtered).
+    # The 23 trades that did execute produced the highest avg MC profit (+146 KES)
+    # of any symbol.  Score 3 (H4 aligned) is sufficient quality control.
+    "XAUUSD": 3,
+    "AUDUSD": 3,
+    "USDCHF": 3,
 }
 
 # ── Trade Monitor ─────────────────────────────────────────────────
@@ -225,6 +349,12 @@ BREAKEVEN_RR_TRIGGER        = 1.5
 MONITOR_TRAIL_CONVICTION    = 1
 MONITOR_CONFIRM_WINDOW_M5   = 3
 MFE_STALL_BARS              = 6     # was 8 → lowered: 75/132 stall events took no action then went to loss
+# After TP1 hits the position is 40-60% smaller and SL is at breakeven —
+# no downside to giving the runner more room.  The standard 6-bar stall
+# was killing runners in 30 min (one M30 candle) before TP2 was reached.
+# Backtest showed 0 WIN_FULL in 145 trades; extending post-TP1 tolerance
+# to 12 bars (60 min) gives the runner time to reach TP2 at 2.0R.
+MFE_STALL_BARS_POST_TP1    = 12
 OPPOSING_ZONE_WARN_ATR      = 1.0
 MIN_PROFIT_RATIO_TO_CLOSE   = 0.1   # was 0.3 → 75 stall non-actions had MFE below the 0.3R gate; lower to catch them
 # Absolute pip floor for mfe_stall exit — fires even when R-ratio not met.
@@ -252,9 +382,12 @@ TIERED_TP1_RATIO         = 1.5   # was 2.0 — losers avg MFE 13.8p, SL ~30-50p 
 TIERED_TP1_CLOSE_PCT          = 0.60   # grade C / counter-trend / fallback
 TIERED_TP1_CLOSE_PCT_A_PLUS   = 0.40   # A+ grade: close 40%, keep 60% running
 TIERED_TP1_CLOSE_PCT_B        = 0.50   # B grade: close 50%, keep 50% running
-# TP2 lowered from 3.0 → 2.5.  With TP2 at 3R and MIN_RR=2 there is headroom;
-# 2.5R keeps TP2 reachable while still locking meaningful additional profit.
-TIERED_TP2_RATIO         = 2.5
+# TP2 lowered 2.5→2.0R: backtest showed 0 WIN_FULL in 145 trades over 6 months.
+# Root cause: MFE_STALL_BARS=6 (30 min = 1 M30 candle) was closing runners before
+# TP2 at 35p (2.5×14p SL) was reached.  At 2.0R, TP2 = 28p — well within the
+# monitor's avg 51.9p MFE at stall fire.  Combined with MFE_STALL_BARS_POST_TP1=12,
+# TP2 hits should now occur regularly on the stronger setups.
+TIERED_TP2_RATIO         = 2.0
 TIERED_TP2_CLOSE_PCT     = 0.25
 FINAL_RUNNER_PCT         = 0.15
 
@@ -284,7 +417,7 @@ SCORE_KILL_ZONE           = 0   # outside kill zones perform 2.2× better in bac
 # ── DYNAMIC POSITION SIZING ───────────────────────────────────────
 RISK_HIGH_CONVICTION    = 1.5
 RISK_MEDIUM_CONVICTION  = 1.0
-RISK_LOW_CONVICTION     = 0.5
+RISK_LOW_CONVICTION     = 1.0   # was 0.5 — half-size entries at 0.5% produce sub-commission profit on small accounts
 
 # ── TIME‑BASED EXIT ───────────────────────────────────────────────
 MAX_TRADE_DURATION_MINUTES = 600
@@ -299,7 +432,8 @@ KILL_ZONES = {
 MIN_SL_PIPS: dict[str, float] = {
     "EURUSD": 3.0, "GBPUSD": 3.0, "AUDUSD": 3.0,
     "USDJPY": 5.0, "EURJPY": 5.0, "GBPJPY": 5.0,
-    "XAUUSD": 50.0, "XAGUSD": 30.0,
+    "XAUUSD": 30.0,  # was 50.0 — combined with ATR buffer 0.15 (down from 0.30)
+    "XAGUSD": 20.0,  # total gold SL now ~30-50p instead of 50-80p; RR gate passable
     "USDCHF": 3.0,
 }
 MIN_SL_PIPS_DEFAULT = 3.0

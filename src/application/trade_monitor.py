@@ -75,6 +75,7 @@ class TradeMonitor:
         m5_bars_since_mfe:  int,
         new_m5_bar:         bool,
         recent_signals:     List[Tuple[str, datetime]],
+        tp1_hit:            bool = False,
     ) -> Tuple[List[MonitorEvent], str, float, bool]:
         events: List[MonitorEvent] = []
         action = "none"
@@ -141,7 +142,10 @@ class TradeMonitor:
                 events.append(ev)
 
         # Signal 4: MFE stall (M5 only)
-        stall_limit = getattr(config, "MFE_STALL_BARS", 6)
+        stall_limit = (
+            getattr(config, "MFE_STALL_BARS_POST_TP1", 12) if tp1_hit
+            else getattr(config, "MFE_STALL_BARS", 6)
+        )
         if new_m5_bar and m5_bars_since_mfe >= stall_limit and mfe_pips > 0:
             ev = MonitorEvent(
                 trade_id=trade_id, symbol=self._sym,
@@ -249,7 +253,8 @@ class TradeMonitor:
 
     def check_live_dual(self, trade_id, direction, entry, current_sl, original_sl, take_profit,
                         current_m1, current_m5, opposing_zones, mfe_price,
-                        m1_bars_since_mfe, m5_bars_since_mfe, new_m5_bar, recent_signals):
+                        m1_bars_since_mfe, m5_bars_since_mfe, new_m5_bar, recent_signals,
+                        tp1_hit: bool = False):
         if not current_m1:
             return [], "none", current_sl, False
         return self.update_dual(
@@ -262,6 +267,7 @@ class TradeMonitor:
             m5_bars_since_mfe=m5_bars_since_mfe,
             new_m5_bar=new_m5_bar,
             recent_signals=recent_signals,
+            tp1_hit=tp1_hit,
         )
 
     def _check_zone(self, direction, price, opposing):

@@ -93,33 +93,126 @@ def is_in_trading_session(dt: datetime) -> bool:
 #  Weighted Setup Scorer
 # ─────────────────────────────────────────────
 
+def find_htf_zone_confluence(h1_zone: "Zone", h4_zones: List["Zone"]) -> bool:
+    """
+    Return True if the H1 zone overlaps with any same-direction H4 zone.
+
+    Two institutional timeframes pointing at the same price level signals
+    a significantly stronger area of interest. An H1 OB/FVG nested inside
+    or sharing meaningful overlap with an H4 OB/FVG is treated as
+    double-confirmed institutional supply/demand.
+
+    Overlap is considered meaningful when it covers at least
+    config.H4_ZONE_MIN_OVERLAP_PCT (20%) of the smaller zone's height.
+    A zone fully nested inside a larger one also qualifies.
+    """
+    if not h4_zones:
+        return False
+    min_overlap_pct = getattr(config, "H4_ZONE_MIN_OVERLAP_PCT", 0.2)
+    for h4z in h4_zones:
+        if h4z.direction != h1_zone.direction:
+            continue
+        overlap_low  = max(h1_zone.low,  h4z.low)
+        overlap_high = min(h1_zone.high, h4z.high)
+        if overlap_high > overlap_low:
+            overlap_size  = overlap_high - overlap_low
+            smaller_size  = min(h1_zone.size, h4z.size)
+            if smaller_size > 0 and overlap_size / smaller_size >= min_overlap_pct:
+                return True
+    return False
+
+
+def find_m30_zone_confluence(h1_zone: "Zone", m30_zones: List["Zone"]) -> bool:
+    """
+    Return True if the H1 zone overlaps a same-direction M30 zone.
+
+    M30 zones sit one step below H1 in the hierarchy.  When an H1 OB/FVG
+    is also confirmed by an M30 OB/FVG at the same price level, the area
+    has been printed as significant on two timeframes — stronger institutional
+    interest.  Overlap threshold mirrors the H4 confluence check (20%).
+    """
+    if not m30_zones:
+        return False
+    min_overlap_pct = getattr(config, "M30_ZONE_MIN_OVERLAP_PCT", 0.2)
+    for z in m30_zones:
+        if z.direction != h1_zone.direction:
+            continue
+        overlap_low  = max(h1_zone.low,  z.low)
+        overlap_high = min(h1_zone.high, z.high)
+        if overlap_high > overlap_low:
+            overlap_size = overlap_high - overlap_low
+            smaller_size = min(h1_zone.size, z.size)
+            if smaller_size > 0 and overlap_size / smaller_size >= min_overlap_pct:
+                return True
+    return False
+
+
+def find_m5_zone_confluence(h1_zone: "Zone", m5_zones: List["Zone"]) -> bool:
+    """
+    Return True if the H1 zone overlaps a same-direction M5 zone.
+
+    M5 zones are the tightest structural confirmation — an M5 OB/FVG inside
+    an H1 demand zone means the most recent M5 bar close confirmed the level.
+    This is the closest thing to real-time institutional confirmation before
+    the M1 entry fires.  Same 20% overlap threshold as M30/H4 checks.
+    """
+    if not m5_zones:
+        return False
+    min_overlap_pct = getattr(config, "M5_ZONE_MIN_OVERLAP_PCT", 0.2)
+    for z in m5_zones:
+        if z.direction != h1_zone.direction:
+            continue
+        overlap_low  = max(h1_zone.low,  z.low)
+        overlap_high = min(h1_zone.high, z.high)
+        if overlap_high > overlap_low:
+            overlap_size = overlap_high - overlap_low
+            smaller_size = min(h1_zone.size, z.size)
+            if smaller_size > 0 and overlap_size / smaller_size >= min_overlap_pct:
+                return True
+    return False
+
+
 def score_setup(
-    zone_direction: "Direction",
-    h4_bias:        Optional["Direction"],
-    bar_price:      float,
-    h4_eq:          Optional[float],
+    zone_direction:     "Direction",
+    h4_bias:            Optional["Direction"],
+    bar_price:          float,
+    h4_eq:              Optional[float],
+    d1_bias:            Optional["Direction"] = None,
+    h4_zone_confluent:  bool = False,
+    m30_zone_confluent: bool = False,
+    m5_zone_confluent:  bool = False,
 ) -> int:
     """
     Return a weighted setup score for a zone in its current market context.
 
-    This replaces the old binary kill-switches (H4 bias conflict → skip,
-    premium/discount mismatch → skip) with a probabilistic scoring system
-    where multiple "Maybes" can total to a "Yes".
-
     Points awarded:
-        +3 — Zone direction matches H4 bias (trend-following trade)
+        +2 — Zone direction matches D1 macro bias (all three TFs aligned)
+        +3 — Zone direction matches H4 bias (primary trend filter)
         +2 — Price is on the correct side of H4 equilibrium
                (discount for bulls, premium for bears)
+        +2 — H1 zone overlaps a same-direction H4 OB/FVG (zone confluence)
+        +1 — H1 zone overlaps a same-direction M30 OB/FVG (intra-hour confirm)
+        +1 — H1 zone overlaps a same-direction M5 OB/FVG  (real-time confirm)
 
-    Grade mapping (for the caller to apply):
-        score ≥ 5  →  A+ setup  →  full risk (SETUP_RISK_A_PLUS)
-        score ≥ 3  →  B  setup  →  half risk (SETUP_RISK_B)
-        score < 3  →  C  setup  →  quarter risk counter-trend (SETUP_RISK_C)
+    Max score: 11  (D1 + H4 bias + equilibrium + H4 + M30 + M5 confluence)
 
-    Returns:
-        Integer score 0–5.
+    The M30 and M5 bonuses are intentionally small (+1 each) — they confirm
+    the H1 zone is still active right now, but they never override the macro
+    picture.  A trade with no M30/M5 confluence still gets the full D1/H4
+    score and is never blocked.  A trade WITH M30/M5 confluence scores higher
+    → gets larger position size via dynamic_risk() → more profit when right.
+
+    Grade thresholds are unchanged (A+ ≥ 5, B ≥ 3) so existing good trades
+    are not disrupted and no new hard blocks are introduced.
+
+    Callers must apply REQUIRE_H4_BIAS and BLOCK_COUNTER_D1 pre-filters
+    BEFORE calling this function — this function only scores, never blocks.
     """
     score = 0
+
+    # D1 macro alignment (+2) — bonus for triple-timeframe confluence
+    if d1_bias is not None and zone_direction == d1_bias:
+        score += 2
 
     # H4 bias alignment (+3)
     if h4_bias is not None and zone_direction == h4_bias:
@@ -131,6 +224,18 @@ def score_setup(
             score += 2   # buying in the cheap half → good pricing
         elif zone_direction == Direction.BEARISH and bar_price >= h4_eq:
             score += 2   # selling in the expensive half → good pricing
+
+    # H4 zone confluence (+2) — H1 zone nested inside / overlapping H4 zone
+    if h4_zone_confluent:
+        score += getattr(config, "H4_ZONE_CONFLUENCE_BONUS", 2)
+
+    # M30 zone confluence (+1) — intra-hour structural confirmation
+    if m30_zone_confluent:
+        score += getattr(config, "M30_ZONE_CONFLUENCE_BONUS", 1)
+
+    # M5 zone confluence (+1) — real-time bar-level confirmation
+    if m5_zone_confluent:
+        score += getattr(config, "M5_ZONE_CONFLUENCE_BONUS", 1)
 
     return score
 
@@ -274,6 +379,56 @@ def find_h4_bias(h4_candles: List[Candle]) -> Optional[Direction]:
     return None  # ranging; caller decides whether to trade or skip
 
 
+def find_d1_bias(d1_candles: List[Candle]) -> Optional[Direction]:
+    """
+    Determine the macro daily trend bias from D1 market structure.
+
+    Uses identical HH/HL pivot logic as find_h4_bias but on the daily
+    timeframe — giving a ~1-month macro view to anchor H4 entries.
+
+    Returns:
+        Direction.BULLISH  — daily trend is up (higher highs + higher lows)
+        Direction.BEARISH  — daily trend is down (lower highs + lower lows)
+        None               — daily structure is ranging / ambiguous
+    """
+    lookback = getattr(config, "D1_EQUILIBRIUM_LOOKBACK", 15)
+    if not d1_candles or len(d1_candles) < lookback:
+        return None
+
+    window = d1_candles[-lookback:]
+
+    swing_highs: List[float] = []
+    swing_lows:  List[float] = []
+    for i in range(1, len(window) - 1):
+        if window[i].high > window[i - 1].high and window[i].high > window[i + 1].high:
+            swing_highs.append(window[i].high)
+        if window[i].low < window[i - 1].low and window[i].low < window[i + 1].low:
+            swing_lows.append(window[i].low)
+
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        if swing_highs[-1] > swing_highs[-2] and swing_lows[-1] > swing_lows[-2]:
+            logger.debug("D1 bias: BULLISH (HH+HL)")
+            return Direction.BULLISH
+        if swing_highs[-1] < swing_highs[-2] and swing_lows[-1] < swing_lows[-2]:
+            logger.debug("D1 bias: BEARISH (LH+LL)")
+            return Direction.BEARISH
+
+    # Slope fallback
+    mid = len(window) // 2
+    first_avg  = sum(c.close for c in window[:mid])  / mid
+    second_avg = sum(c.close for c in window[mid:])  / (len(window) - mid)
+    threshold  = 0.003   # 0.3% drift — daily needs a wider gate than H4
+    if second_avg > first_avg * (1 + threshold):
+        logger.debug("D1 bias: BULLISH (slope)")
+        return Direction.BULLISH
+    if second_avg < first_avg * (1 - threshold):
+        logger.debug("D1 bias: BEARISH (slope)")
+        return Direction.BEARISH
+
+    logger.debug("D1 bias: RANGING")
+    return None
+
+
 def compute_h4_equilibrium(h4_candles: List[Candle]) -> Tuple[float, float, float]:
     """
     Compute the premium / discount range from the active H4 window.
@@ -404,6 +559,76 @@ def find_liquidity_pool(
         lookback_candles=config.LIQUIDITY_LOOKBACK,
         created_at=datetime.now(tz=timezone.utc),
     )
+
+
+def find_m30_structural_tp(
+    direction:   Direction,
+    entry:       float,
+    m30_zones:   List["Zone"],
+    pip_calc:    PipCalculator,
+    fallback_tp: float,
+) -> float:
+    """
+    Find the nearest unmitigated M30 OB/FVG edge as a TP1 target.
+
+    Why this beats the liquidity-pool TP:
+      Backtest showed avg 86.3 pips to TP at trade's best point, while
+      the monitor was closing trades at avg 51.9 pip MFE.  The market
+      consistently stalled ~34 pips before the liquidity-pool TP.
+      M30 OB/FVG edges are structural resistance/support levels that
+      price reacts to in real time — they sit in that 20-40 pip range
+      where the market actually delivers, not the 86-pip distant pool.
+
+    Logic (bullish example):
+      Scan m30_zones for same-direction zones whose LOW edge is above
+      entry (price has not yet reached them — they are the next draw).
+      Return the LOWEST such edge (nearest target first).
+      If no M30 zone qualifies, return fallback_tp (liquidity pool).
+
+    Bearish: scan for same-direction zones whose HIGH edge is below entry,
+    return the HIGHEST such edge (nearest target).
+
+    Args:
+        direction:   trade direction
+        entry:       entry price
+        m30_zones:   list of Zone objects from run_m30_zone_mapping()
+        pip_calc:    pip calculator for the symbol
+        fallback_tp: liquidity pool TP to use when no M30 zone found
+
+    Returns:
+        float — TP price (M30 structural level or liquidity pool fallback)
+    """
+    if not m30_zones:
+        return fallback_tp
+
+    # Minimum meaningful distance: must be at least 1 pip beyond entry
+    # so we never accidentally set TP at or below entry.
+    min_dist = pip_calc.pips_to_price(1.0)
+
+    candidates: List[float] = []
+
+    for z in m30_zones:
+        if z.direction != direction:
+            continue
+        if direction == Direction.BULLISH:
+            # The zone's LOW edge is the first price that will be tested
+            # when price approaches from below — that's the TP target.
+            if z.low > entry + min_dist:
+                candidates.append(z.low)
+        else:
+            # Bearish: zone HIGH edge is the first price tested from above.
+            if z.high < entry - min_dist:
+                candidates.append(z.high)
+
+    if not candidates:
+        return fallback_tp
+
+    # Nearest structural level wins — closest target is most reachable.
+    if direction == Direction.BULLISH:
+        return min(candidates)   # nearest level above entry
+    return max(candidates)       # nearest level below entry
+
+
 def compute_tp1_price(
     direction:  Direction,
     entry:      float,
@@ -513,6 +738,8 @@ def find_m5_choch_signal(
     diag:            Optional["DiagnosticsCollector"] = None,
     zone_buffer:     float = 0.0,
     min_rr_override: Optional[float] = None,
+    m30_zones:       Optional[List["Zone"]] = None,
+    symbol:          str = "",
 ) -> Optional[TradeSignal]:
     """
     M5 Change of Character (ChoCh) entry — replaces the old M1 engulfing scan.
@@ -550,6 +777,10 @@ def find_m5_choch_signal(
     avg_volume = sum(c.volume for c in m5_candles[-11:-1]) / 10.0
     sl_buffer  = _compute_sl_buffer(symbol, atr_price, pip_calc, spread_pips)
     min_rr     = min_rr_override if min_rr_override is not None else config.MIN_RR
+    vol_ratio  = getattr(config, "SYMBOL_DISPLACEMENT_VOLUME_RATIO", {}).get(
+        symbol, config.MIN_DISPLACEMENT_VOLUME_RATIO)
+    body_ratio = getattr(config, "SYMBOL_CANDLE_SIZE_RATIO", {}).get(
+        symbol, config.CANDLE_SIZE_RATIO)
 
     zone_tapped           = False
     retracement_start_idx = None
@@ -587,11 +818,11 @@ def find_m5_choch_signal(
             # A genuine institutional displacement must show BOTH a volume spike
             # AND a large body.  The old OR gate (either alone sufficed) allowed
             # random noise candles through, producing only 8.3% entry win rate.
-            volume_ok = avg_volume > 0 and (disp.volume / avg_volume) >= config.MIN_DISPLACEMENT_VOLUME_RATIO
+            volume_ok = avg_volume > 0 and (disp.volume / avg_volume) >= vol_ratio
             body_ok = False
             if i >= 3:
                 prior_avg_body = sum(m5_candles[i - k].body_size for k in range(1, 4)) / 3.0
-                body_ok = prior_avg_body > 0 and disp.body_size >= prior_avg_body * config.CANDLE_SIZE_RATIO
+                body_ok = prior_avg_body > 0 and disp.body_size >= prior_avg_body * body_ratio
 
             if not volume_ok or not body_ok:
                 if diag:
@@ -604,8 +835,12 @@ def find_m5_choch_signal(
             pre_disp = m5_candles[i - 2]
             entry    = pre_disp.high if pre_disp.high < disp.low else disp.open
 
-            sl = zone.low - sl_buffer
-            tp = liquidity_pool.high
+            sl = disp.low - sl_buffer
+            tp = find_m30_structural_tp(
+                direction=Direction.BULLISH, entry=entry,
+                m30_zones=m30_zones or [], pip_calc=pip_calc,
+                fallback_tp=liquidity_pool.high,
+            )
 
         else:  # BEARISH
             # wave_low = lowest low of retracement BEFORE displacement candle
@@ -616,11 +851,11 @@ def find_m5_choch_signal(
             disp = c
 
             # Displacement quality gate (AND logic — same as bullish)
-            volume_ok = avg_volume > 0 and (disp.volume / avg_volume) >= config.MIN_DISPLACEMENT_VOLUME_RATIO
+            volume_ok = avg_volume > 0 and (disp.volume / avg_volume) >= vol_ratio
             body_ok = False
             if i >= 3:
                 prior_avg_body = sum(m5_candles[i - k].body_size for k in range(1, 4)) / 3.0
-                body_ok = prior_avg_body > 0 and disp.body_size >= prior_avg_body * config.CANDLE_SIZE_RATIO
+                body_ok = prior_avg_body > 0 and disp.body_size >= prior_avg_body * body_ratio
 
             if not volume_ok or not body_ok:
                 if diag:
@@ -632,8 +867,12 @@ def find_m5_choch_signal(
             pre_disp = m5_candles[i - 2]
             entry    = pre_disp.low if pre_disp.low > disp.high else disp.open
 
-            sl = zone.high + sl_buffer
-            tp = liquidity_pool.low
+            sl = disp.high + sl_buffer
+            tp = find_m30_structural_tp(
+                direction=Direction.BEARISH, entry=entry,
+                m30_zones=m30_zones or [], pip_calc=pip_calc,
+                fallback_tp=liquidity_pool.low,
+            )
 
         # ── Step 9: RR gate (uses grade-specific min_rr) ──────────
         sl_dist = abs(entry - sl)
@@ -672,6 +911,285 @@ def find_m5_choch_signal(
 
     if not zone_tapped and diag:
         diag.record_rejection(symbol, "no_zone_tap")
+
+    return None
+
+
+# ─────────────────────────────────────────────
+#  NEW: M1 Predictive Signal (Candle Range Theory / ICT 2022 Model)
+# ─────────────────────────────────────────────
+
+def find_m1_predictive_signal(
+    m1_candles:      List[Candle],
+    zone:            Zone,
+    pip_calc:        PipCalculator,
+    spread_pips:     float,
+    liquidity_pool:  LiquidityPool,
+    current_m5:      Optional[Candle]    = None,
+    atr_price:       float               = 0.0,
+    diag:            Optional["DiagnosticsCollector"] = None,
+    zone_buffer:     float               = 0.0,
+    min_rr_override: Optional[float]     = None,
+    m30_zones:       Optional[List["Zone"]] = None,
+) -> Optional[TradeSignal]:
+    """
+    M1 Predictive Entry — ICT Candle Range Theory (CRT) implementation.
+
+    Core concept: every M5 candle is a range of M1 price action.  When M1
+    prints a Liquidity Sweep → Market Structure Shift (MSS) → FVG sequence
+    INSIDE an H1 zone, the M5 candle containing those M1 bars is biased to
+    close in the MSS direction.  We enter on M1 instead of waiting for the
+    full M5 displacement to close — getting a tighter stop and better RR.
+
+    Entry sequence (bullish example):
+      1. Zone tap confirmed — at least one M1 candle has traded inside the
+         H1 demand zone (low ≤ zone.high + buffer, high ≥ zone.low − buffer).
+      2. Liquidity sweep — a subsequent M1 candle wicks BELOW the lowest M1
+         swing low seen since the zone tap (the stop hunt that fuels the move).
+      3. MSS / ChoCh — an M1 displacement candle CLOSES above the highest M1
+         swing high seen since the zone tap.  This is the directional flip.
+      4. Quality gates (AND logic — both must pass):
+           • Volume : displacement volume ≥ M1_DISPLACEMENT_VOLUME_RATIO × 10-bar avg
+           • Body   : displacement body ≥ M1_CANDLE_SIZE_RATIO × 3-bar avg body
+                      AND body ≥ M1_BODY_MIN_PRICE (absolute pip floor)
+      5. M1 FVG — the 3-candle imbalance left by the displacement:
+           entry = candle[i−2].high  (bottom of the FVG gap)
+           If no clean gap exists, entry falls back to displacement candle open.
+      6. M5 candle-colour gate — the M5 candle currently forming must be
+         bullish (close > open).  A bearish M5 while M1 shows a ChoCh means
+         ~50% of signals are noise; this single filter halves the false-signal
+         rate without waiting for M5 to fully close.
+      7. Zone size gate — zone must be ≥ M1_MIN_ZONE_SIZE_PIPS tall so M1
+         wave structure has room to form before zone.low invalidates.
+      8. SL = zone.mid − ATR sl_buffer  (NOT below M1 FVG — too tight to
+         survive institutional sweeps that reach zone.mid before reversing).
+         This gives ~7-pip SL vs ~14-pip SL in the M5 ChoCh approach.
+      9. TP = liquidity pool (same as M5 ChoCh).
+     10. RR gate — same MIN_RR as M5 ChoCh; will now pass at 30-pip TP where
+         M5 ChoCh fails (RR 2.36 vs 1.24 at 30-pip target).
+
+    Bearish logic is the exact mirror.
+
+    Returns None when:
+      - Fewer than 10 M1 candles available
+      - Zone is narrower than M1_MIN_ZONE_SIZE_PIPS
+      - No zone tap found in the M1 window
+      - M1 wave is shorter than M1_MIN_WAVE_CANDLES
+      - Volume or body quality gates fail
+      - Current M5 candle colour opposes the trade direction
+      - RR < min_rr_override (or config.MIN_RR)
+
+    On success returns a TradeSignal identical in structure to find_m5_choch_signal
+    so the caller needs no special handling — it's a drop-in with better RR.
+    """
+    if len(m1_candles) < 10:
+        return None
+
+    symbol    = zone.symbol
+    pip_value = pip_calc.pips_to_price(1.0)
+
+    # ── Zone size gate ─────────────────────────────────────────────
+    min_zone_price = pip_calc.pips_to_price(
+        getattr(config, "M1_MIN_ZONE_SIZE_PIPS", 6.0)
+    )
+    if zone.size < min_zone_price:
+        if diag:
+            diag.record_rejection(symbol, "m1_zone_too_narrow")
+        return None
+
+    # ── M5 candle-colour gate ──────────────────────────────────────
+    # If the currently-forming M5 candle is already bearish (for a bullish
+    # setup), the M1 ChoCh is likely noise inside a larger bearish M5 wave.
+    # Skip now; the M5 ChoCh fallback will re-evaluate once M5 closes.
+    if current_m5 is not None:
+        if zone.direction == Direction.BULLISH and current_m5.close < current_m5.open:
+            if diag:
+                diag.record_rejection(symbol, "m1_m5_colour_mismatch")
+            return None
+        if zone.direction == Direction.BEARISH and current_m5.close > current_m5.open:
+            if diag:
+                diag.record_rejection(symbol, "m1_m5_colour_mismatch")
+            return None
+
+    # ── Precompute thresholds ──────────────────────────────────────
+    avg_volume   = sum(c.volume for c in m1_candles[-11:-1]) / 10.0
+    sl_buffer    = _compute_sl_buffer(symbol, atr_price, pip_calc, spread_pips)
+    min_rr       = min_rr_override if min_rr_override is not None else config.MIN_RR
+    vol_ratio    = getattr(config, "M1_DISPLACEMENT_VOLUME_RATIO", 1.8)
+    body_ratio   = getattr(config, "M1_CANDLE_SIZE_RATIO",         3.0)
+    body_min     = getattr(config, "M1_BODY_MIN_PRICE",            0.00015)
+    min_wave     = getattr(config, "M1_MIN_WAVE_CANDLES",          5)
+
+    zone_tapped           = False
+    sweep_occurred        = False
+    retracement_start_idx = None
+    sweep_extreme         = None   # lowest low seen after tap (bullish) / highest high (bearish)
+
+    for i in range(1, len(m1_candles) - 1):
+        c = m1_candles[i]
+
+        # ── Step 1: zone tap ───────────────────────────────────────
+        if not zone_tapped:
+            if c.low <= zone.high + zone_buffer and c.high >= zone.low - zone_buffer:
+                zone_tapped           = True
+                retracement_start_idx = i
+                sweep_extreme = c.low if zone.direction == Direction.BULLISH else c.high
+            continue
+
+        # ── Step 2: track sweep extreme & detect liquidity sweep ──
+        # For bullish: track the lowest low after tap — the sweep is the
+        # candle whose wick goes below the most recent M1 swing low.
+        # We record the sweep extreme without requiring a closed candle
+        # below it; the sweep is the wick extension itself.
+        if zone.direction == Direction.BULLISH:
+            if c.low < sweep_extreme:
+                sweep_extreme  = c.low
+                sweep_occurred = True   # any new low = liquidity taken
+        else:
+            if c.high > sweep_extreme:
+                sweep_extreme  = c.high
+                sweep_occurred = True
+
+        # ── Step 3: wave length gate ───────────────────────────────
+        wave = m1_candles[retracement_start_idx: i]
+        if len(wave) < min_wave:
+            continue
+
+        # ── Step 4: MSS / ChoCh + quality gates ───────────────────
+        if zone.direction == Direction.BULLISH:
+            wave_high = max(c2.high for c2 in wave)
+            if c.close <= wave_high:
+                continue
+
+            # Require a prior liquidity sweep before accepting the ChoCh.
+            # Without this, random M1 oscillation inside the zone fires.
+            if not sweep_occurred:
+                if diag:
+                    diag.record_rejection(symbol, "m1_no_sweep_before_choch")
+                continue
+
+            disp = c
+
+            # Volume gate
+            volume_ok = avg_volume > 0 and (disp.volume / avg_volume) >= vol_ratio
+
+            # Body gate: ratio AND absolute floor
+            body_ok = False
+            if i >= 3:
+                prior_avg_body = sum(
+                    m1_candles[i - k].body_size for k in range(1, 4)
+                ) / 3.0
+                body_ok = (
+                    prior_avg_body > 0
+                    and disp.body_size >= prior_avg_body * body_ratio
+                    and disp.body_size >= body_min
+                )
+
+            if not volume_ok or not body_ok:
+                if diag:
+                    diag.record_rejection(symbol, "m1_weak_displacement")
+                continue
+
+            # ── Step 5: M1 FVG entry ──────────────────────────────
+            if i < 2:
+                continue
+            pre_disp = m1_candles[i - 2]
+            entry    = pre_disp.high if pre_disp.high < disp.low else disp.open
+
+            # ── Step 8: SL at zone.mid − buffer ───────────────────
+            # zone.mid is the midpoint of the H1 zone.  Using this instead
+            # of zone.low gives ~7-pip SL — tight enough to improve RR
+            # dramatically vs M5 ChoCh (~14 pip), but wide enough to survive
+            # standard institutional sweeps that reach zone midpoint.
+            use_mid = getattr(config, "M1_SL_USE_ZONE_MID", True)
+            sl_anchor = zone.mid if use_mid else zone.low
+            sl        = sl_anchor - sl_buffer
+            tp        = find_m30_structural_tp(
+                direction=Direction.BULLISH, entry=entry,
+                m30_zones=m30_zones or [], pip_calc=pip_calc,
+                fallback_tp=liquidity_pool.high,
+            )
+
+        else:  # BEARISH
+            wave_low = min(c2.low for c2 in wave)
+            if c.close >= wave_low:
+                continue
+
+            if not sweep_occurred:
+                if diag:
+                    diag.record_rejection(symbol, "m1_no_sweep_before_choch")
+                continue
+
+            disp = c
+
+            volume_ok = avg_volume > 0 and (disp.volume / avg_volume) >= vol_ratio
+            body_ok   = False
+            if i >= 3:
+                prior_avg_body = sum(
+                    m1_candles[i - k].body_size for k in range(1, 4)
+                ) / 3.0
+                body_ok = (
+                    prior_avg_body > 0
+                    and disp.body_size >= prior_avg_body * body_ratio
+                    and disp.body_size >= body_min
+                )
+
+            if not volume_ok or not body_ok:
+                if diag:
+                    diag.record_rejection(symbol, "m1_weak_displacement")
+                continue
+
+            if i < 2:
+                continue
+            pre_disp = m1_candles[i - 2]
+            entry    = pre_disp.low if pre_disp.low > disp.high else disp.open
+
+            use_mid   = getattr(config, "M1_SL_USE_ZONE_MID", True)
+            sl_anchor = zone.mid if use_mid else zone.high
+            sl        = sl_anchor + sl_buffer
+            tp        = find_m30_structural_tp(
+                direction=Direction.BEARISH, entry=entry,
+                m30_zones=m30_zones or [], pip_calc=pip_calc,
+                fallback_tp=liquidity_pool.low,
+            )
+
+        # ── Step 10: RR gate ──────────────────────────────────────
+        sl_dist = abs(entry - sl)
+        tp_dist = abs(tp - entry)
+        if sl_dist == 0:
+            continue
+        rr = tp_dist / sl_dist
+
+        if rr < min_rr:
+            if diag:
+                diag.record_rejection(symbol, "m1_rr")
+            continue
+
+        if diag:
+            diag.record_signal(symbol)
+
+        logger.info(
+            "M1 Predictive signal ✓ | %s %s | entry=%.5f SL=%.5f TP=%.5f | "
+            "RR=%.2f | vol_ratio=%.1f | sweep_extreme=%.5f | zone_mid=%.5f",
+            symbol, zone.direction.value, entry, sl, tp, rr,
+            disp.volume / avg_volume if avg_volume > 0 else 0,
+            sweep_extreme or 0, zone.mid,
+        )
+        return TradeSignal(
+            symbol=       zone.symbol,
+            direction=    zone.direction,
+            entry_price=  entry,
+            stop_loss=    sl,
+            take_profit=  tp,
+            zone=         zone,
+            signal_type=  SignalType.BULLISH_ENGULFING,
+            volume_ratio= disp.volume / avg_volume if avg_volume > 0 else 1.0,
+            created_at=   disp.time,
+            risk_reward=  rr,
+        )
+
+    if not zone_tapped and diag:
+        diag.record_rejection(symbol, "m1_no_zone_tap")
 
     return None
 
@@ -1085,8 +1603,18 @@ class ZoneMapper:
             obs.sort(key=_score, reverse=True)
             fvgs.sort(key=_score, reverse=True)
 
-        max_obs  = getattr(config, "MAX_OBS_PER_BAR",  10)
-        max_fvgs = getattr(config, "MAX_FVGS_PER_BAR",  8)
+        if timeframe == Timeframe.H4:
+            max_obs  = getattr(config, "H4_ZONE_MAX_OBS",   5)
+            max_fvgs = getattr(config, "H4_ZONE_MAX_FVGS",  4)
+        elif timeframe == Timeframe.M30:
+            max_obs  = getattr(config, "M30_ZONE_MAX_OBS",  4)
+            max_fvgs = getattr(config, "M30_ZONE_MAX_FVGS", 3)
+        elif timeframe == Timeframe.M5:
+            max_obs  = getattr(config, "M5_ZONE_MAX_OBS",   3)
+            max_fvgs = getattr(config, "M5_ZONE_MAX_FVGS",  3)
+        else:
+            max_obs  = getattr(config, "MAX_OBS_PER_BAR",  10)
+            max_fvgs = getattr(config, "MAX_FVGS_PER_BAR",  8)
         obs  = obs[:max_obs]
         fvgs = fvgs[:max_fvgs]
 

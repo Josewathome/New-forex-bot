@@ -18,7 +18,9 @@ from src.domain.value_objects import BrokerCost, PipCalculator, RiskParameters
 from src.application.analysis import (
     ZoneMapper, atr,
     find_m5_choch_signal,
+    find_m1_predictive_signal,
     find_h4_bias,
+    find_d1_bias,
     compute_h4_equilibrium,
     score_setup,
     grade_setup,
@@ -35,6 +37,9 @@ from src.application.analysis import (
     is_kill_zone,
     evaluate_zone_health,
     find_opposing_opportunity,
+    find_htf_zone_confluence,
+    find_m30_zone_confluence,
+    find_m5_zone_confluence,
 )
 from src.application.news_manager import NewsManager
 from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl, find_runner_protection_sl
@@ -125,6 +130,12 @@ class ExecutionService:
         self._trade_states: Dict[int, _OpenTradeState] = {}
         self._loss_streak:  Dict[str, int]      = {}
         self._streak_pause: Dict[str, datetime] = {}
+        # M30 and M5 zones are stored in lightweight per-symbol dicts here
+        # rather than in the zone_repo (which holds H1 zones used for entry).
+        # They are read-only during signal evaluation — only replaced on each
+        # M30/M5 bar close.  Dict key = symbol, value = List[Zone].
+        self._m30_zones: Dict[str, List[Zone]] = {}
+        self._m5_zones:  Dict[str, List[Zone]] = {}
 
     def run_zone_mapping(self, symbol: str) -> None:
         h1 = self._md.get_candles(symbol, Timeframe.H1, config.H1_CANDLE_COUNT)
@@ -137,6 +148,43 @@ class ExecutionService:
             self._zr.save_zone(z)
         if pool:
             self._zr.save_liquidity_pool(pool)
+
+    def run_m30_zone_mapping(self, symbol: str) -> None:
+        """
+        Re-map M30 OBs and FVGs on every 30-minute bar close.
+
+        Results are stored in self._m30_zones[symbol] — a lightweight
+        in-memory list that is read during signal evaluation to check
+        whether the active H1 zone has M30 confirmation.  No zone_repo
+        writes: M30 zones are supplementary context, not entry zones.
+        """
+        if not getattr(config, "M30_ZONE_MAPPING_ENABLED", True):
+            return
+        m30 = self._md.get_candles(symbol, Timeframe.M30,
+                                   getattr(config, "M30_CANDLE_COUNT", 60))
+        if not m30:
+            return
+        zones, _ = self._zone_mapper.map_zones(m30, symbol, Timeframe.M30)
+        self._m30_zones[symbol] = zones
+        logger.debug("M30 zones remapped | %s | %d zones", symbol, len(zones))
+
+    def run_m5_zone_mapping(self, symbol: str) -> None:
+        """
+        Re-map M5 OBs and FVGs on every 5-minute bar close.
+
+        Results are stored in self._m5_zones[symbol].  M5 zones are the
+        tightest structural layer — when an M5 OB/FVG sits inside the H1
+        zone at the moment price arrives, the level has very recent bar-level
+        confirmation and the M1 entry is higher probability.
+        """
+        if not getattr(config, "M5_ZONE_MAPPING_ENABLED", True):
+            return
+        m5 = self._md.get_candles(symbol, Timeframe.M5, config.M5_CANDLE_COUNT)
+        if not m5:
+            return
+        zones, _ = self._zone_mapper.map_zones(m5, symbol, Timeframe.M5)
+        self._m5_zones[symbol] = zones
+        logger.debug("M5 zones remapped | %s | %d zones", symbol, len(zones))
 
     # ── Phase helpers ─────────────────────────────────────────────────
 
@@ -201,6 +249,13 @@ class ExecutionService:
 
         h4_bias         = find_h4_bias(h4)
         _, _, h4_eq     = compute_h4_equilibrium(h4)
+
+        # H4 zone map — OBs/FVGs on H4 for confluence scoring
+        h4_zones, _ = self._zone_mapper.map_zones(h4, symbol, Timeframe.H4) if len(h4) >= 20 else ([], None)
+
+        # ── D1 macro trend ─────────────────────────────────────────
+        d1         = self._md.get_candles(symbol, Timeframe.D1, config.D1_CANDLE_COUNT)
+        d1_bias    = find_d1_bias(d1) if d1 else None
         ask             = self._md.get_current_price(symbol)
         if ask == 0.0:
             return None
@@ -215,10 +270,34 @@ class ExecutionService:
         baseline_atr  = atr(h1_short[-50:]) if len(h1_short) >= 50 else h1_atr
 
         for zone in zones:
-            setup_score = score_setup(zone.direction, h4_bias, ask, h4_eq)
+            # ── Trend pre-filters ──────────────────────────────────
+            # Block entries when H4 has no clear direction — ranging
+            # markets produce low-quality setups that commission destroys.
+            if getattr(config, "REQUIRE_H4_BIAS", True) and h4_bias is None:
+                logger.debug("H4 RANGING | %s | no trend — skipping", symbol)
+                break  # same for every zone on this symbol; no need to loop
+
+            # Block setups that go against the D1 macro trend.
+            # Commission is only worth paying when all timeframes agree.
+            if (getattr(config, "BLOCK_COUNTER_D1", True)
+                    and d1_bias is not None
+                    and d1_bias != zone.direction):
+                logger.debug("COUNTER-D1 | %s | zone=%s d1=%s — skipped",
+                             symbol, zone.direction.value, d1_bias.value)
+                continue
+
+            h4_confluent  = find_htf_zone_confluence(zone, h4_zones)
+            m30_confluent = find_m30_zone_confluence(zone, self._m30_zones.get(symbol, []))
+            m5_confluent  = find_m5_zone_confluence(zone,  self._m5_zones.get(symbol,  []))
+
+            setup_score = score_setup(
+                zone.direction, h4_bias, ask, h4_eq, d1_bias,
+                h4_confluent, m30_confluent, m5_confluent,
+            )
             if setup_score < sym_min_score:
-                logger.debug("SCORE BELOW SYM MIN | %s | %d < %d",
-                             symbol, setup_score, sym_min_score)
+                logger.debug("SCORE BELOW SYM MIN | %s | %d < %d (H4=%s M30=%s M5=%s)",
+                             symbol, setup_score, sym_min_score,
+                             h4_confluent, m30_confluent, m5_confluent)
                 continue
 
             # grade / min_rr used for ChoCh RR gate; risk_pct overwritten by dynamic_risk()
@@ -260,12 +339,49 @@ class ExecutionService:
                                 symbol, zone.id[:8], reject_reason)
                     continue
             else:
-                signal = find_m5_choch_signal(
-                    m5_candles=m5, zone=zone, pip_calc=pip_calc,
-                    spread_pips=broker_cost.spread_pips, liquidity_pool=pool,
-                    atr_price=h1_atr, zone_buffer=zone_buf,
-                    min_rr_override=min_rr,
-                )
+                # ── M1 Predictive Signal (primary) ────────────────
+                # Read M1 candles and attempt a tighter ICT CRT entry.
+                # The current M5 candle (m5[-1]) is passed so the function
+                # can gate on M5 colour — if M5 is still bearish, the M1
+                # ChoCh is likely noise and we fall through to the M5 ChoCh.
+                m1 = self._md.get_candles(symbol, Timeframe.M1, config.M1_CANDLE_COUNT)
+                current_m5_candle = m5[-1] if m5 else None
+                signal = None
+
+                if m1:
+                    signal = find_m1_predictive_signal(
+                        m1_candles=     m1,
+                        zone=           zone,
+                        pip_calc=       pip_calc,
+                        spread_pips=    broker_cost.spread_pips,
+                        liquidity_pool= pool,
+                        current_m5=     current_m5_candle,
+                        atr_price=      h1_atr,
+                        zone_buffer=    zone_buf,
+                        min_rr_override=min_rr,
+                        m30_zones=      self._m30_zones.get(symbol, []),
+                    )
+                    if signal:
+                        logger.info(
+                            "M1 PREDICTIVE ENTRY | %s %s | RR=%.2f | "
+                            "entry=%.5f SL=%.5f (zone.mid=%.5f)",
+                            symbol, zone.direction.value,
+                            signal.risk_reward, signal.entry_price,
+                            signal.stop_loss, zone.mid,
+                        )
+
+                # ── M5 ChoCh Signal (fallback) ────────────────────
+                # Fires when M1 signal is unavailable (no M1 data, zone too
+                # narrow, M5 colour mismatch, thresholds not met).
+                if signal is None:
+                    signal = find_m5_choch_signal(
+                        m5_candles=m5, zone=zone, pip_calc=pip_calc,
+                        spread_pips=broker_cost.spread_pips, liquidity_pool=pool,
+                        atr_price=h1_atr, zone_buffer=zone_buf,
+                        min_rr_override=min_rr,
+                        m30_zones=self._m30_zones.get(symbol, []),
+                    )
+
                 if signal is None:
                     continue
 
@@ -511,8 +627,14 @@ class ExecutionService:
                         close_pct = getattr(config, "TIERED_TP1_CLOSE_PCT_B", 0.50)
                     else:
                         close_pct = getattr(config, "TIERED_TP1_CLOSE_PCT", 0.60)
-                    # Floor to avoid closing more lots than intended (round() can overshoot)
-                    close_vol = max(0.01, math.floor(state.lot_size * close_pct * 100) / 100)
+                    # Floor to avoid closing more lots than intended (round() can overshoot).
+                    # If the resulting partial vol == the full position (lot too small to split),
+                    # close everything and mark tp2_hit too so we don't attempt a phantom TP2.
+                    computed_vol = math.floor(state.lot_size * close_pct * 100) / 100
+                    close_vol = max(0.01, computed_vol)
+                    if close_vol >= state.lot_size:
+                        close_vol = state.lot_size  # full close — lot too small to split
+                        state.tp2_hit = True         # suppress phantom TP2 attempt
                     logger.info(
                         "TP1 HIT | %s ticket=%s | closing %.2f lots @ ~%.5f",
                         symbol, ticket, close_vol, price,
@@ -660,6 +782,7 @@ class ExecutionService:
                 m5_bars_since_mfe= state.m5_no_mfe,
                 new_m5_bar=        new_m5,
                 recent_signals=    state.recent_signals,
+                tp1_hit=           state.tp1_hit,
             )
 
             if events:
@@ -816,18 +939,17 @@ class ExecutionService:
         if balance <= 0:
             return None
         eff_risk = risk_pct_override if risk_pct_override is not None else self._risk_pct
+        # Use per-symbol commission from broker_cost (XAUUSD differs from forex pairs on HFM).
+        sym_commission = broker_cost.commission_usd
         risk_params = RiskParameters(
             account_balance=balance, risk_percent=eff_risk,
-            commission_per_lot=self._commission,
+            commission_per_lot=sym_commission,
             min_rr_ratio=self._min_rr, account_currency=self._currency,
         )
         sl_pips = pip_calc.price_to_pips(abs(signal.entry_price - signal.stop_loss))
         # Floor (not round) to 2 decimal places so we never exceed the calculated risk.
-        # round() would push e.g. 0.125 → 0.13 lots, overspending by ~4%.
         lot_size = max(0.01, math.floor(risk_params.lot_size(sl_pips, tick_value, pip_calc) * 100) / 100)
 
-        # MT5 order carries the liquidity-pool TP as the final hard stop.
-        # TP1 and TP2 partial closes are managed by the monitor loop.
         final_tp = signal.take_profit
 
         return Trade(
@@ -840,6 +962,6 @@ class ExecutionService:
             lot_size=    lot_size,
             status=      TradeStatus.PENDING,
             created_at=  datetime.now(tz=timezone.utc),
-            commission=  self._commission * lot_size,
+            commission=  sym_commission * lot_size,
             spread_cost= broker_cost.spread_pips,
         )

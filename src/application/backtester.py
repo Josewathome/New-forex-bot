@@ -28,6 +28,7 @@ from src.application.analysis import (
     ZoneMapper, atr,
     find_m5_choch_signal,
     find_h4_bias,
+    find_d1_bias,
     compute_h4_equilibrium,
     score_setup,
     grade_setup,
@@ -44,6 +45,7 @@ from src.application.analysis import (
     is_kill_zone,
     evaluate_zone_health,
     find_opposing_opportunity,
+    find_htf_zone_confluence,
 )
 from src.application.diagnostics import DiagnosticsCollector
 from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl, find_runner_protection_sl
@@ -156,8 +158,9 @@ class Backtester:
             m5 = td.get(Timeframe.M5, []) or td.get(Timeframe.M1, [])
             m1 = td.get(Timeframe.M1, [])
             h4 = td.get(Timeframe.H4, [])
+            d1 = td.get(Timeframe.D1, [])
             if h1 and m5:
-                sym_data[sym] = {"h1": h1, "m5": m5, "m1": m1, "h4": h4}
+                sym_data[sym] = {"h1": h1, "m5": m5, "m1": m1, "h4": h4, "d1": d1}
 
         H1W = 100
         s_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -174,7 +177,7 @@ class Backtester:
         logger.info("Processing %d H1 events …", len(all_evts))
         for bar_time, sym, h1_idx in all_evts:
             d = sym_data[sym]
-            r = self._process_h1_bar(sym, d["h1"], d["m5"], d["m1"], d["h4"],
+            r = self._process_h1_bar(sym, d["h1"], d["m5"], d["m1"], d["h4"], d["d1"],
                                      h1_idx, no_trade_windows, equity, diag)
             if r:
                 equity += r.pnl_usd
@@ -184,7 +187,7 @@ class Backtester:
         self.analyze_trade_features(results)
         return results
 
-    def _process_h1_bar(self, symbol, h1, m5, m1, h4,
+    def _process_h1_bar(self, symbol, h1, m5, m1, h4, d1,
                         h1_idx, ntw, equity, diag):
         digits = config.SYMBOL_DIGITS.get(symbol, 5)
         tv = self._get_tick_value(symbol)
@@ -221,6 +224,14 @@ class Backtester:
         h4_win = [c for c in h4 if c.time < bar_time][-config.H4_CANDLE_COUNT:]
         h4_bias = find_h4_bias(h4_win) if len(h4_win) >= 10 else None
         h4_eq = compute_h4_equilibrium(h4_win)[2] if len(h4_win) >= 4 else None
+
+        # H4 zone map — OBs/FVGs on H4 used for confluence scoring
+        h4_zones, _ = self._mapper.map_zones(h4_win, symbol, Timeframe.H4) if len(h4_win) >= 20 else ([], None)
+
+        # D1 macro trend — use all D1 bars up to (but not including) the current bar_time
+        d1_win   = [c for c in d1 if c.time < bar_time][-getattr(config, "D1_CANDLE_COUNT", 30):]
+        d1_bias  = find_d1_bias(d1_win) if len(d1_win) >= getattr(config, "D1_EQUILIBRIUM_LOOKBACK", 15) else None
+
         bar_px = h1[h1_idx].open
         h1_atr = atr(h1_win)
         zbuf = calculate_zone_buffer(h1_atr)
@@ -241,7 +252,19 @@ class Backtester:
         sym_min_score = config.SYMBOL_MIN_SCORE.get(symbol, config.SETUP_SCORE_THRESHOLD)
 
         for zone in zones:
-            setup_score = score_setup(zone.direction, h4_bias, bar_px, h4_eq)
+            # ── Trend pre-filters ──────────────────────────────────
+            if getattr(config, "REQUIRE_H4_BIAS", True) and h4_bias is None:
+                if diag: diag.record_rejection(symbol, "h4_ranging")
+                break  # applies to all zones for this bar
+
+            if (getattr(config, "BLOCK_COUNTER_D1", True)
+                    and d1_bias is not None
+                    and d1_bias != zone.direction):
+                if diag: diag.record_rejection(symbol, "counter_d1")
+                continue
+
+            h4_confluent = find_htf_zone_confluence(zone, h4_zones)
+            setup_score = score_setup(zone.direction, h4_bias, bar_px, h4_eq, d1_bias, h4_confluent)
             if setup_score < sym_min_score:
                 if diag: diag.record_rejection(symbol, "below_score_threshold")
                 continue
@@ -330,12 +353,17 @@ class Backtester:
             elif signal.direction == Direction.BEARISH and tp2_price <= signal.take_profit:
                 tp2_price = None
 
-            # Position size
+            # Position size.
+            # TICK_VALUE_USD is in $/pip/lot; lot_size() expects account-currency/pip/lot.
+            # Multiply by KES_PER_USD so sizing matches live MT5 on a KES account.
+            # self._commission is already in account currency (converted in run_backtest).
+            kes_per_usd = getattr(config, "KES_PER_USD", 130.0)
+            tv_kes = tv * kes_per_usd
             rp = RiskParameters(account_balance=equity, risk_percent=risk_pct,
                                 commission_per_lot=self._commission,
                                 min_rr_ratio=min_rr,
                                 account_currency=self._currency)
-            lot = max(0.01, min(round(rp.lot_size(sl_pips, tv, pip_calc), 2), 100.0))
+            lot = max(0.01, min(round(rp.lot_size(sl_pips, tv_kes, pip_calc), 2), 100.0))
             ram = equity * (risk_pct / 100)
 
             max_m1 = config.MAX_FORWARD_M1_BARS
@@ -519,6 +547,8 @@ class Backtester:
 
         sl_dist = abs(entry - original_sl)
         sl_pips = pip_calc.price_to_pips(sl_dist)
+        # self._commission is already in account currency (KES for this account).
+        # _commission_in_account_ccy() was applied in run_backtest() before passing here.
         comm = self._commission * lot_size
 
         # ── Limit-order fill check ─────────────────────────────────────
@@ -682,7 +712,7 @@ class Backtester:
                         virtual_sl = entry - profit_lock_dist
 
             # ── TP2 ───────────────────────────────────────────────
-            if tp1_hit and not tp2_hit and tp2_price:
+            if tp1_hit and not tp2_hit and tp2_price and remaining_vol > 0:
                 tp2_reached = (is_bull and bar.high >= tp2_price) or (not is_bull and bar.low <= tp2_price)
                 if tp2_reached:
                     close_vol = max(0.01, math.floor(remaining_vol * tp2_pct * 100) / 100)
@@ -770,6 +800,10 @@ class Backtester:
                     outcome = "WIN_FULL"
                 elif tp1_hit:
                     outcome = "WIN_PARTIAL"
+                elif total_pnl > 0:
+                    # SL was trailed above entry by monitor before TP1 hit;
+                    # net result is profitable — not a loss.
+                    outcome = "WIN_PARTIAL"
                 else:
                     outcome = "LOSS"
                 return outcome, total_pnl, meta(bar, exit_reason_str=exit_reason), all_evts
@@ -793,6 +827,7 @@ class Backtester:
                 m5_bars_since_mfe=m5_no_mfe,
                 new_m5_bar=new_m5,
                 recent_signals=recent_sigs,
+                tp1_hit=tp1_hit,
             )
             all_evts.extend(evts)
 
