@@ -122,6 +122,7 @@ done
 # ── START BOT ─────────────────────────────────────────────────────
 # Wine reports os.name == "nt" so mt5_gateway.py uses direct
 # MetaTrader5 import — no RPyC bridge, no latency.
+# BOT_MODE=backtest in .env triggers backtest mode; anything else = live.
 echo "  🚀 Starting bot in Wine Python..."
 # PYTHONUTF8=1 forces UTF-8 everywhere.
 # Without it Wine Python defaults to cp1252 and crashes on any

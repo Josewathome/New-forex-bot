@@ -211,12 +211,18 @@ ZONE_ATR_BUFFER_PCT = 0.15
 # setups (they lose the +3 H4 bonus and need D1+equilibrium to pass).
 REQUIRE_H4_BIAS:      bool = False
 
-# BLOCK_COUNTER_D1: False = let D1 work as a scoring BONUS only (preferred).
-# A counter-D1 setup that has H4 + equilibrium still scores 5 = A+ and is a
-# genuine trade.  Hard-blocking it removes too many valid setups and kills
-# trade frequency.  The D1 bonus (+2) naturally makes aligned trades larger
-# via dynamic_risk, and counter-D1 trades smaller — that is the right balance.
+# BLOCK_COUNTER_D1: False = soft gate (counter-D1 trades require COUNTER_D1_MIN_SCORE).
+# True = hard-block ALL counter-D1 trades regardless of score.
+# Soft gate is preferred: a genuine H4+H4-zone+equilibrium counter-D1 setup
+# still scores 7+ and should be taken.  Pure counter-D1 with only equilibrium
+# alignment (score 5) is blocked — those are the trades that lose in trending months.
 BLOCK_COUNTER_D1:     bool = False
+
+# Minimum setup score required for a counter-D1 trade to proceed.
+# Score 7 = H4 bias (3) + H4 confluence (2) + equilibrium (2) — meaning
+# institutions on H4 AND a confirmed H4 OB/FVG AND price in the correct
+# premium/discount zone.  A trade missing any of these is rejected.
+COUNTER_D1_MIN_SCORE: int  = 7
 
 H4_CANDLE_COUNT  = 50
 H1_CANDLE_COUNT  = 100
@@ -228,6 +234,58 @@ D1_CANDLE_COUNT  = 30   # ~6 weeks of daily data for D1 trend detection
 
 H4_EQUILIBRIUM_LOOKBACK = 20
 D1_EQUILIBRIUM_LOOKBACK = 15  # daily swing pivot lookback
+
+# ── M5 Zone Story Reader ──────────────────────────────────────────
+# read_m5_zone_story() reads the sub-bar narrative inside the H1 zone.
+# MIN_ZONE_STORY_BARS: minimum M5 bars with bodies inside the zone before
+#   we trust the story.  Below this the story is "neutral" (not enough data).
+# ZONE_STORY_WINDOW: how many of those bars to use for the current story
+#   (uses the most recent N to avoid stale early-arrival data dominating).
+# ZONE_STORY_VOL_THRESH: volume multiplier to classify a candle as "strong".
+# ZONE_STORY_DIST_MAJORITY: fraction of bars that must be against the zone
+#   direction for the story to be called "distributing".
+# ZONE_STORY_ABS_MAJORITY: fraction of bars that must support the zone for
+#   the story to be called "absorbing".
+MIN_ZONE_STORY_BARS       : int   = 3
+ZONE_STORY_WINDOW         : int   = 6
+ZONE_STORY_VOL_THRESH     : float = 1.2
+ZONE_STORY_DIST_MAJORITY  : float = 0.6
+ZONE_STORY_ABS_MAJORITY   : float = 0.5
+
+# ── M30 Story Reader ──────────────────────────────────────────────
+# Number of recent M30 bars to fetch when reading the M30 story.
+# 8 bars = 4 hours of M30 context — captures the last two H4 bar's worth
+# of M30 data so we know what the last meaningful M30 structure was.
+M30_STORY_LOOKBACK        : int   = 8
+
+# ── Zone Health Early Warning ─────────────────────────────────────
+# Thresholds for evaluate_zone_health check 4 (M5 momentum against zone).
+# Lowered from 4/4 + 2-strong to 3/4 + 1-strong to catch distribution
+# EARLIER — the old 4/4 gate fired after 20+ pip adverse move.
+ZONE_HEALTH_AGAINST_MIN   : int   = 3    # minimum M5 bars against zone (of last 4)
+ZONE_HEALTH_STRONG_MIN    : int   = 1    # minimum volume-spike bars among them
+ZONE_HEALTH_VOL_SPIKE     : float = 1.5  # volume ratio to classify as spike
+
+# ── M5 Precision Entry Zone ───────────────────────────────────────
+# find_m5_precision_entry() locates the M5 OB inside the H1 zone.
+# M5_PRECISION_MIN_PIPS: the M5 OB must be at least this many pips tall
+# to be meaningful — smaller OBs are noise inside the H1 zone.
+M5_PRECISION_MIN_PIPS     : float = 2.0
+
+# ── M1 Bar-Position Gate ──────────────────────────────────────────
+# m1_is_early_in_m5_bar(): M1 ChoCh must fire within the first N minutes
+# of the M5 bar to have predictive value.  After minute 3 the M5 bar is
+# already 60%+ complete and the M1 signal describes history, not the future.
+M1_EARLY_BAR_MINUTES      : int   = 3
+
+# ── M1 ChoCh vs M5 Swing Validation ──────────────────────────────
+# m1_choch_breaks_m5_swing(): the level broken by the M1 ChoCh must be
+# within M1_M5_SWING_PROXIMITY_PIPS of an M5 swing high/low.
+# M1_M5_SWING_LOOKBACK: how many M5 bars to scan for the matching swing.
+# Set M1_REQUIRE_M5_SWING_BREAK=False to disable (not recommended).
+M1_REQUIRE_M5_SWING_BREAK  : bool  = True
+M1_M5_SWING_LOOKBACK        : int   = 12
+M1_M5_SWING_PROXIMITY_PIPS  : float = 3.0
 
 # ── M5 / M30 Intra-Hour Zone Mapping ─────────────────────────────
 # M30 zones re-map every 30-minute close.  They sit between H1 and M5
@@ -481,6 +539,7 @@ MAX_FORWARD_M1_BARS  = 4_320
 BACKTEST_MONTHS_BACK = 6
 BACKTEST_START_DATE  = ""
 BACKTEST_END_DATE    = ""
+BACKTEST_REPORT_NAME ="Last_6_months"
 
 # Keep False so the backtest matches live trading exactly.
 # Live trading monitors on M1 (SL/TP/MFE precision); the backtest should too.

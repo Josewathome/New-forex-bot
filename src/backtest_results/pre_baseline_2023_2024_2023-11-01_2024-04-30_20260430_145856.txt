@@ -1,0 +1,467 @@
+══════════════════════════════════════════════════════════════════════
+  ZONE-REACTIVE BOT — BACKTEST DIAGNOSTIC REPORT  (v6)
+══════════════════════════════════════════════════════════════════════
+  Generated : 2026-04-30 14:58:56 UTC
+  Duration  : 0:14:50
+
+══════════════════════════════════════════════════════════════════════
+  CONFIG SNAPSHOT
+══════════════════════════════════════════════════════════════════════
+  Account  : Demojose  (57427774)
+  Balance  : 30,000 KES
+  Symbols  : GBPUSD, XAUUSD, USDJPY, AUDUSD, USDCHF
+  Risk     : 2.0%  |  MinRR: 2.0
+  Monitor  : enabled=True  act=True  conviction=2  BE_trigger=1.5×SL  stall_bars=6
+
+══════════════════════════════════════════════════════════════════════
+  MT5 DATA FETCHED
+══════════════════════════════════════════════════════════════════════
+  Symbol           H1      H1 from        H1 to        M1  M1 coverage
+──────────────────────────────────────────────────────────────────────
+  GBPUSD        3,141   2023-10-25   2024-04-30   180,076        96.8%
+  XAUUSD        2,981   2023-10-25   2024-04-29   171,575        96.3%
+  USDJPY        3,141   2023-10-25   2024-04-30   180,039        96.8%
+  AUDUSD        3,141   2023-10-25   2024-04-30   180,464        96.8%
+  USDCHF        3,141   2023-10-25   2024-04-30   180,553        96.8%
+
+══════════════════════════════════════════════════════════════════════
+  NEWS API
+══════════════════════════════════════════════════════════════════════
+  MyFxBook  2023-11-01 → 2024-04-30
+  Events: 0  (high: 0)
+
+
+  ── No-trade windows: 0
+──────────────────────────────────────────────────────────────────────
+
+══════════════════════════════════════════════════════════════════════
+  PER-SYMBOL SIGNAL FUNNEL
+══════════════════════════════════════════════════════════════════════
+  AUDUSD
+    H1 bars total   : 3,039
+    Bars processed  : 2,558  (84.2%)
+    OBs / FVGs      : 4,591 / 3,660
+    Signals         : 94
+    Rejected (top)  : no_tap=2,497  rr=13  score=952
+
+  GBPUSD
+    H1 bars total   : 3,039
+    Bars processed  : 2,483  (81.7%)
+    OBs / FVGs      : 4,452 / 3,320
+    Signals         : 101
+    Rejected (top)  : no_tap=2,184  rr=6  score=949
+
+  USDCHF
+    H1 bars total   : 3,036
+    Bars processed  : 2,422  (79.8%)
+    OBs / FVGs      : 4,195 / 2,718
+    Signals         : 92
+    Rejected (top)  : no_tap=2,082  rr=12  score=877
+
+  USDJPY
+    H1 bars total   : 3,018
+    Bars processed  : 2,697  (89.4%)
+    OBs / FVGs      : 5,953 / 3,564
+    Signals         : 152
+    Rejected (top)  : no_tap=3,374  rr=29  score=279
+
+  XAUUSD
+    H1 bars total   : 2,881
+    Bars processed  : 2,497  (86.7%)
+    OBs / FVGs      : 4,768 / 3,235
+    Signals         : 140
+    Rejected (top)  : no_tap=2,663  rr=14  score=739
+
+
+══════════════════════════════════════════════════════════════════════
+  TRADE OUTCOMES PER SYMBOL
+══════════════════════════════════════════════════════════════════════
+  Symbol      WIN_F  WIN_P  LOSS    BE    MC  OPEN  TOTAL
+──────────────────────────────────────────────────────────────────────
+  AUDUSD          0      5     0     0    16     0     21
+  GBPUSD          0     33     1     0    21     0     55
+  USDCHF          0     14     1     0     7     0     22
+  USDJPY          0     36     8     0    40     0     84
+  XAUUSD          0      0     0     0     0     0      0
+──────────────────────────────────────────────────────────────────────
+  TOTAL           0     88    10     0    84     0    182
+
+  Win rate (resolved): 48.4%
+  WIN_FULL            : 0   (both TP1 and TP2 hit + runner SL)
+  WIN_PARTIAL         : 88   (TP1 hit, runner closed by SL/monitor)
+  Breakeven saves   : 0  (losses avoided by monitor moving SL to entry)
+  Monitor closes    : 84  (trades closed early by monitor)
+
+══════════════════════════════════════════════════════════════════════
+  SYMBOL PERFORMANCE RANKING  (BEST → WORST)
+══════════════════════════════════════════════════════════════════════
+  #    Symbol   Trades  Wins  Loss    MC   Win%         Net P&L     Avg Win    Avg Loss   % of Gain  Verdict
+──────────────────────────────────────────────────────────────────────
+  1    USDJPY       88    36     8    40  42.9%         +74,344      +1,505      -1,357      +42.7%  ✓ PROFITABLE
+  2    GBPUSD       55    33     1    21  60.0%         +66,931      +1,452      -1,672      +38.5%  ✓ PROFITABLE
+  3    USDCHF       22    14     1     7  63.6%         +20,712      +1,505      -1,727      +11.9%  ✓ PROFITABLE
+  4    AUDUSD       21     5     0    16  23.8%         +11,969      +1,161          +0       +6.9%  ✓ PROFITABLE
+──────────────────────────────────────────────────────────────────────
+                                                        Total gain :       +173,956
+
+══════════════════════════════════════════════════════════════════════
+  PER-SYMBOL DEEP DIVE
+══════════════════════════════════════════════════════════════════════
+  Scan this section to identify which symbols to keep, tune, or cut.
+
+
+  ── USDJPY
+──────────────────────────────────────────────────────────────────────
+  Trades        : 88  (WIN_FULL+PARTIAL: 36  |  LOSS: 8  |  MC: 40)
+  Win rate      : 42.9%  (resolved trades only, excl. OPEN)
+  Net P&L       : +74,344    (+42.7% of total backtest gain)
+  Avg win       : +1,505    |  Avg loss : -1,357    |  Avg MC : +776
+  Best trade    : +3,010    |  Worst    : -1,671
+  Max consec. losses : 3
+
+  Verdict → ✓ PROFITABLE — solid win rate; strategy working well on this pair
+
+  ── GBPUSD
+──────────────────────────────────────────────────────────────────────
+  Trades        : 55  (WIN_FULL+PARTIAL: 33  |  LOSS: 1  |  MC: 21)
+  Win rate      : 60.0%  (resolved trades only, excl. OPEN)
+  Net P&L       : +66,931    (+38.5% of total backtest gain)
+  Avg win       : +1,452    |  Avg loss : -1,672    |  Avg MC : +985
+  Best trade    : +2,879    |  Worst    : -1,672
+  Max consec. losses : 1
+
+  Verdict → ✓ PROFITABLE — solid win rate; strategy working well on this pair
+
+  ── USDCHF
+──────────────────────────────────────────────────────────────────────
+  Trades        : 22  (WIN_FULL+PARTIAL: 14  |  LOSS: 1  |  MC: 7)
+  Win rate      : 63.6%  (resolved trades only, excl. OPEN)
+  Net P&L       : +20,712    (+11.9% of total backtest gain)
+  Avg win       : +1,505    |  Avg loss : -1,727    |  Avg MC : +196
+  Best trade    : +2,459    |  Worst    : -1,727
+  Max consec. losses : 1
+
+  Verdict → ✓ PROFITABLE — solid win rate; strategy working well on this pair
+
+  ── AUDUSD
+──────────────────────────────────────────────────────────────────────
+  Trades        : 21  (WIN_FULL+PARTIAL: 5  |  LOSS: 0  |  MC: 16)
+  Win rate      : 23.8%  (resolved trades only, excl. OPEN)
+  Net P&L       : +11,969    (+6.9% of total backtest gain)
+  Avg win       : +1,161    |  Avg loss : +0    |  Avg MC : +385
+  Best trade    : +2,473    |  Worst    : -365
+  Max consec. losses : 0
+
+  Verdict → ✓ PROFITABLE — solid win rate; strategy working well on this pair
+
+══════════════════════════════════════════════════════════════════════
+  LOSS ANALYSIS — MFE & REVERSAL BREAKDOWN
+══════════════════════════════════════════════════════════════════════
+  Losses: 10  Winners: 88
+
+  MFE on losers:
+    Avg  : 4.5 pips
+    Max  : 7.8 pips
+    Min  : 0.6 pips
+
+  Pips to TP at MFE:
+    Avg  : 35.8  (on avg 35.8 pips short at best point)
+    Min  : 11.7 pips
+
+  Duration  — losses avg : 18 min  winners avg : 17 min
+
+  Reversal zone at MFE:
+    unknown                      10  (100.0%)
+
+══════════════════════════════════════════════════════════════════════
+  MONITOR PERFORMANCE — SIGNAL ACCURACY  (V6)
+══════════════════════════════════════════════════════════════════════
+  How to read this section:
+    true_positive  = signal fired AND trade went on to LOSS/BE/MC
+    false_positive = signal fired BUT trade went on to WIN
+    A good signal type has high TP% and fires with meaningful MFE.
+
+  Signal type               Fired     TP     FP    TP%   AvgMFE    Actions
+──────────────────────────────────────────────────────────────────────
+  breakeven_trigger             0
+  opposing_zone                14     14      0 100.0%    19.6p         14
+  reverse_choch                30     30      0 100.0%    38.8p         30
+  mfe_stall                    41     41      0 100.0%    12.7p         41
+
+
+  ── opposing_zone — 14 events
+──────────────────────────────────────────────────────────────────────
+  True positives  : 14  (100.0%)
+  False positives : 0  (0.0%)
+  Avg MFE at fire : 19.6 pips
+  Avg pips to TP  : 38.4 pips
+  Actions taken:
+    closed_early                 : 14
+  Sample events (first 5):
+    [2023-11-01T19:55] USDCHF  MFE=0.2p left=30.0p → MONITOR_CLOSE  (✓)
+    [2023-11-09T20:00] AUDUSD  MFE=0.2p left=20.3p → MONITOR_CLOSE  (✓)
+    [2023-11-21T21:05] GBPUSD  MFE=4.4p left=5.6p → MONITOR_CLOSE  (✓)
+    [2023-11-27T11:53] USDJPY  MFE=30.2p left=53.5p → MONITOR_CLOSE  (✓)
+    [2023-11-27T11:53] USDJPY  MFE=30.2p left=53.5p → MONITOR_CLOSE  (✓)
+
+
+  ── reverse_choch — 30 events
+──────────────────────────────────────────────────────────────────────
+  True positives  : 30  (100.0%)
+  False positives : 0  (0.0%)
+  Avg MFE at fire : 38.8 pips
+  Avg pips to TP  : 47.4 pips
+  Actions taken:
+    closed_early                 : 30
+  Sample events (first 5):
+    [2023-11-15T17:30] USDJPY  MFE=27.0p left=49.0p → MONITOR_CLOSE  (✓)
+    [2023-11-21T20:05] GBPUSD  MFE=16.5p left=8.0p → MONITOR_CLOSE  (✓)
+    [2023-11-22T19:45] GBPUSD  MFE=24.4p left=62.9p → MONITOR_CLOSE  (✓)
+    [2023-11-29T17:15] USDJPY  MFE=70.1p left=32.0p → MONITOR_CLOSE  (✓)
+    [2023-11-30T17:05] USDJPY  MFE=118.8p left=88.0p → MONITOR_CLOSE  (✓)
+
+
+  ── mfe_stall — 41 events
+──────────────────────────────────────────────────────────────────────
+  True positives  : 41  (100.0%)
+  False positives : 0  (0.0%)
+  Avg MFE at fire : 12.7 pips
+  Avg pips to TP  : 42.8 pips
+  Actions taken:
+    closed_early                 : 41
+  Sample events (first 5):
+    [2023-11-06T19:10] GBPUSD  MFE=19.8p left=28.2p → MONITOR_CLOSE  (✓)
+    [2023-11-06T19:10] GBPUSD  MFE=19.8p left=30.3p → MONITOR_CLOSE  (✓)
+    [2023-11-06T19:10] GBPUSD  MFE=19.8p left=30.3p → MONITOR_CLOSE  (✓)
+    [2023-11-07T19:15] AUDUSD  MFE=19.3p left=73.4p → MONITOR_CLOSE  (✓)
+    [2023-11-07T19:15] AUDUSD  MFE=19.3p left=73.4p → MONITOR_CLOSE  (✓)
+
+
+  ── Monthly performance summary
+──────────────────────────────────────────────────────────────────────
+  Month                   Trades    W     L    MC       Month P&L       Eq Start         Eq End      Chg%
+──────────────────────────────────────────────────────────────────────
+  Month 1: Nov 2023           53   27     0    26         +27,509         30,000         57,509    +91.7%
+  Month 2: Dec 2023           46   18     1    27         +29,338         57,509         86,847    +51.0%
+  Month 3: Jan 2024           39   17     4    18         +50,614         86,847        137,461    +58.3%
+  Month 4: Feb 2024           17   10     1     6         +26,744        137,461        164,205    +19.5%
+  Month 5: Mar 2024           16    3     3     6          +6,124        164,205        170,329     +3.7%
+  Month 6: Apr 2024           15   13     1     1         +33,627        170,329        203,956    +19.7%
+──────────────────────────────────────────────────────────────────────
+
+  ── Equity curve (grouped by month)
+──────────────────────────────────────────────────────────────────────
+     #  Symbol     Outcome             Before       After      Change
+
+  ── Month 1: Nov 2023  [trades=53 | W=27 L=0 MC=26 | P&L=+27,509 | Equity 30,000 → 57,509 (+91.7%)]
+──────────────────────────────────────────────────────────────────────
+     1  GBPUSD     WIN_PARTIAL         30,000      30,446  +       446
+     2  USDCHF     MONITOR_CLOSE       30,446      30,399         -48
+     3  GBPUSD     WIN_PARTIAL         30,399      30,851  +       452
+     4  GBPUSD     WIN_PARTIAL         30,851      31,309  +       459
+     5  GBPUSD     MONITOR_CLOSE       31,309      31,775  +       466
+     6  GBPUSD     MONITOR_CLOSE       31,775      32,248  +       473
+     7  GBPUSD     MONITOR_CLOSE       32,248      32,728  +       480
+     8  AUDUSD     MONITOR_CLOSE       32,728      33,215  +       487
+     9  AUDUSD     MONITOR_CLOSE       33,215      33,709  +       494
+    10  AUDUSD     MONITOR_CLOSE       33,709      34,211  +       502
+    11  USDJPY     WIN_PARTIAL         34,211      34,720  +       509
+    12  AUDUSD     WIN_PARTIAL         34,720      35,237  +       517
+    13  AUDUSD     MONITOR_CLOSE       35,237      35,200         -37
+    14  USDJPY     MONITOR_CLOSE       35,200      35,724  +       524
+    15  USDJPY     WIN_PARTIAL         35,724      36,256  +       532
+    16  USDJPY     WIN_PARTIAL         36,256      36,796  +       540
+    17  USDJPY     WIN_PARTIAL         36,796      37,344  +       548
+    18  USDJPY     WIN_PARTIAL         37,344      37,900  +       556
+    19  USDJPY     WIN_PARTIAL         37,900      38,465  +       565
+    20  USDJPY     WIN_PARTIAL         38,465      39,038  +       573
+    21  USDJPY     MONITOR_CLOSE       39,038      38,823        -215
+    22  USDJPY     MONITOR_CLOSE       38,823      38,614        -209
+    23  USDJPY     MONITOR_CLOSE       38,614      38,516         -98
+    24  USDJPY     WIN_PARTIAL         38,516      39,090  +       574
+    25  USDJPY     WIN_PARTIAL         39,090      39,672  +       582
+    26  GBPUSD     WIN_PARTIAL         39,672      40,263  +       591
+    27  GBPUSD     WIN_PARTIAL         40,263      40,863  +       600
+    28  GBPUSD     WIN_PARTIAL         40,863      41,472  +       609
+    29  GBPUSD     WIN_PARTIAL         41,472      42,091  +       618
+    30  GBPUSD     MONITOR_CLOSE       42,091      42,718  +       627
+    31  GBPUSD     MONITOR_CLOSE       42,718      43,156  +       438
+    32  AUDUSD     WIN_PARTIAL         43,156      43,800  +       643
+    33  USDJPY     MONITOR_CLOSE       43,800      43,953  +       153
+    34  USDJPY     WIN_PARTIAL         43,953      44,608  +       655
+    35  GBPUSD     MONITOR_CLOSE       44,608      45,274  +       665
+    36  USDJPY     MONITOR_CLOSE       45,274      45,468  +       194
+    37  GBPUSD     MONITOR_CLOSE       45,468      46,146  +       678
+    38  USDJPY     MONITOR_CLOSE       46,146      46,834  +       688
+    39  USDJPY     MONITOR_CLOSE       46,834      47,533  +       699
+    40  USDCHF     WIN_PARTIAL         47,533      48,242  +       709
+    41  USDJPY     MONITOR_CLOSE       48,242      48,142        -100
+    42  USDCHF     WIN_PARTIAL         48,142      48,860  +       718
+    43  USDJPY     WIN_PARTIAL         48,860      49,589  +       729
+    44  GBPUSD     WIN_PARTIAL         49,589      50,329  +       740
+    45  GBPUSD     WIN_PARTIAL         50,329      51,080  +       751
+    46  USDJPY     WIN_PARTIAL         51,080      51,842  +       762
+    47  USDJPY     MONITOR_CLOSE       51,842      52,616  +       774
+    48  USDJPY     MONITOR_CLOSE       52,616      53,402  +       785
+    49  USDJPY     WIN_PARTIAL         53,402      54,199  +       797
+    50  USDJPY     MONITOR_CLOSE       54,199      55,008  +       809
+    51  USDJPY     MONITOR_CLOSE       55,008      55,829  +       821
+    52  GBPUSD     WIN_PARTIAL         55,829      56,662  +       834
+    53  USDJPY     MONITOR_CLOSE       56,662      57,509  +       846
+
+  ── Month 2: Dec 2023  [trades=46 | W=18 L=1 MC=27 | P&L=+29,338 | Equity 57,509 → 86,847 (+51.0%)]
+──────────────────────────────────────────────────────────────────────
+    54  GBPUSD     MONITOR_CLOSE       57,509      58,367  +       859
+    55  AUDUSD     MONITOR_CLOSE       58,367      58,380  +        13
+    56  AUDUSD     MONITOR_CLOSE       58,380      58,395  +        14
+    57  USDCHF     MONITOR_CLOSE       58,395      59,267  +       872
+    58  AUDUSD     MONITOR_CLOSE       59,267      59,305  +        38
+    59  AUDUSD     MONITOR_CLOSE       59,305      59,343  +        38
+    60  AUDUSD     MONITOR_CLOSE       59,343      59,379  +        36
+    61  AUDUSD     MONITOR_CLOSE       59,379      59,361         -18
+    62  GBPUSD     MONITOR_CLOSE       59,361      60,248  +       887
+    63  GBPUSD     WIN_PARTIAL         60,248      61,147  +       900
+    64  USDJPY     MONITOR_CLOSE       61,147      61,946  +       798
+    65  USDJPY     MONITOR_CLOSE       61,946      62,755  +       810
+    66  USDJPY     MONITOR_CLOSE       62,755      63,572  +       817
+    67  USDCHF     WIN_PARTIAL         63,572      64,204  +       632
+    68  GBPUSD     WIN_PARTIAL         64,204      65,163  +       959
+    69  GBPUSD     WIN_PARTIAL         65,163      66,137  +       974
+    70  GBPUSD     WIN_PARTIAL         66,137      67,125  +       988
+    71  GBPUSD     WIN_PARTIAL         67,125      68,128  +     1,003
+    72  GBPUSD     WIN_PARTIAL         68,128      69,146  +     1,018
+    73  AUDUSD     WIN_PARTIAL         69,146      70,179  +     1,033
+    74  USDJPY     WIN_PARTIAL         70,179      71,228  +     1,049
+    75  USDJPY     WIN_PARTIAL         71,228      72,293  +     1,065
+    76  USDJPY     MONITOR_CLOSE       72,293      72,184        -109
+    77  USDJPY     MONITOR_CLOSE       72,184      72,072        -112
+    78  GBPUSD     MONITOR_CLOSE       72,072      73,150  +     1,077
+    79  GBPUSD     MONITOR_CLOSE       73,150      74,243  +     1,093
+    80  USDJPY     MONITOR_CLOSE       74,243      74,714  +       471
+    81  USDJPY     MONITOR_CLOSE       74,714      75,179  +       465
+    82  USDJPY     MONITOR_CLOSE       75,179      75,625  +       446
+    83  USDJPY     MONITOR_CLOSE       75,625      76,069  +       443
+    84  USDJPY     MONITOR_CLOSE       76,069      76,491  +       423
+    85  AUDUSD     MONITOR_CLOSE       76,491      76,126        -365
+    86  USDJPY     LOSS                76,126      75,361        -765
+    87  USDJPY     MONITOR_CLOSE       75,361      74,897        -463
+    88  USDJPY     WIN_PARTIAL         74,897      76,017  +     1,120
+    89  AUDUSD     WIN_PARTIAL         76,017      77,153  +     1,136
+    90  USDJPY     MONITOR_CLOSE       77,153      78,307  +     1,153
+    91  GBPUSD     WIN_PARTIAL         78,307      79,477  +     1,171
+    92  GBPUSD     WIN_PARTIAL         79,477      80,666  +     1,188
+    93  GBPUSD     WIN_PARTIAL         80,666      81,872  +     1,206
+    94  USDCHF     MONITOR_CLOSE       81,872      83,096  +     1,224
+    95  USDCHF     WIN_PARTIAL         83,096      84,338  +     1,243
+    96  USDCHF     WIN_PARTIAL         84,338      85,600  +     1,261
+    97  USDCHF     WIN_PARTIAL         85,600      86,880  +     1,280
+    98  USDCHF     MONITOR_CLOSE       86,880      86,501        -378
+    99  USDCHF     MONITOR_CLOSE       86,501      86,847  +       345
+
+  ── Month 3: Jan 2024  [trades=39 | W=17 L=4 MC=18 | P&L=+50,614 | Equity 86,847 → 137,461 (+58.3%)]
+──────────────────────────────────────────────────────────────────────
+   100  USDCHF     WIN_PARTIAL         86,847      88,145  +     1,299
+   101  USDCHF     WIN_PARTIAL         88,145      89,464  +     1,318
+   102  USDJPY     MONITOR_CLOSE       89,464      90,802  +     1,338
+   103  USDJPY     LOSS                90,802      89,890        -912
+   104  USDJPY     WIN_PARTIAL         89,890      91,234  +     1,344
+   105  USDCHF     WIN_PARTIAL         91,234      92,599  +     1,365
+   106  GBPUSD     WIN_PARTIAL         92,599      93,984  +     1,385
+   107  GBPUSD     WIN_PARTIAL         93,984      95,390  +     1,406
+   108  USDJPY     MONITOR_CLOSE       95,390      96,817  +     1,427
+   109  GBPUSD     MONITOR_CLOSE       96,817      98,265  +     1,448
+   110  GBPUSD     MONITOR_CLOSE       98,265      99,735  +     1,470
+   111  GBPUSD     MONITOR_CLOSE       99,735     101,227  +     1,492
+   112  USDJPY     WIN_PARTIAL        101,227     102,742  +     1,515
+   113  GBPUSD     MONITOR_CLOSE      102,742     104,279  +     1,537
+   114  GBPUSD     WIN_PARTIAL        104,279     105,839  +     1,560
+   115  USDJPY     WIN_PARTIAL        105,839     107,423  +     1,584
+   116  USDJPY     MONITOR_CLOSE      107,423     109,031  +     1,607
+   117  USDJPY     MONITOR_CLOSE      109,031     110,662  +     1,632
+   118  USDJPY     MONITOR_CLOSE      110,662     112,318  +     1,656
+   119  USDJPY     WIN_PARTIAL        112,318     113,999  +     1,681
+   120  AUDUSD     MONITOR_CLOSE      113,999     115,705  +     1,706
+   121  AUDUSD     MONITOR_CLOSE      115,705     117,437  +     1,732
+   122  GBPUSD     WIN_PARTIAL        117,437     119,194  +     1,758
+   123  USDJPY     WIN_PARTIAL        119,194     120,978  +     1,784
+   124  USDJPY     WIN_PARTIAL        120,978     122,789  +     1,811
+   125  USDJPY     WIN_PARTIAL        122,789     124,627  +     1,838
+   126  USDJPY     MONITOR_CLOSE      124,627     126,493  +     1,866
+   127  USDJPY     MONITOR_CLOSE      126,493     128,386  +     1,893
+   128  USDJPY     MONITOR_CLOSE      128,386     130,308  +     1,922
+   129  USDJPY     MONITOR_CLOSE      130,308     132,259  +     1,951
+   130  USDJPY     MONITOR_CLOSE      132,259     134,239  +     1,980
+   131  USDCHF     WIN_PARTIAL        134,239     136,248  +     2,010
+   132  USDCHF     WIN_PARTIAL        136,248     138,288  +     2,040
+   133  USDJPY     WIN_PARTIAL        138,288     140,359  +     2,070
+   134  USDCHF     MONITOR_CLOSE      140,359     140,718  +       359
+   135  USDJPY     LOSS               140,718     139,307      -1,411
+   136  USDJPY     LOSS               139,307     137,910      -1,397
+   137  USDJPY     LOSS               137,910     136,527      -1,383
+   138  USDJPY     MONITOR_CLOSE      136,527     137,461  +       934
+
+  ── Month 4: Feb 2024  [trades=17 | W=10 L=1 MC=6 | P&L=+26,744 | Equity 137,461 → 164,205 (+19.5%)]
+──────────────────────────────────────────────────────────────────────
+   139  USDJPY     WIN_PARTIAL        137,461     139,519  +     2,058
+   140  USDJPY     WIN_PARTIAL        139,519     141,608  +     2,089
+   141  USDJPY     WIN_PARTIAL        141,608     143,728  +     2,120
+   142  GBPUSD     MONITOR_CLOSE      143,728     143,724          -4
+   143  USDJPY     WIN_PARTIAL        143,724     145,876  +     2,152
+   144  USDJPY     WIN_PARTIAL        145,876     148,060  +     2,184
+   145  USDJPY     WIN_PARTIAL        148,060     150,277  +     2,217
+   146  USDJPY     WIN_PARTIAL        150,277     152,528  +     2,250
+   147  USDCHF     WIN_PARTIAL        152,528     154,812  +     2,284
+   148  GBPUSD     WIN_PARTIAL        154,812     157,130  +     2,318
+   149  USDJPY     MONITOR_CLOSE      157,130     159,483  +     2,353
+   150  AUDUSD     MONITOR_CLOSE      159,483     159,992  +       509
+   151  AUDUSD     MONITOR_CLOSE      159,992     160,502  +       509
+   152  AUDUSD     MONITOR_CLOSE      160,502     161,009  +       507
+   153  GBPUSD     MONITOR_CLOSE      161,009     163,421  +     2,411
+   154  USDCHF     WIN_PARTIAL        163,421     165,868  +     2,447
+   155  USDJPY     LOSS               165,868     164,205      -1,663
+
+  ── Month 5: Mar 2024  [trades=16 | W=3 L=3 MC=6 | P&L=+6,124 | Equity 164,205 → 170,329 (+3.7%)]
+──────────────────────────────────────────────────────────────────────
+   156  USDJPY     NOT_FILLED         164,205     164,205  +         0
+   157  USDJPY     NOT_FILLED         164,205     164,205  +         0
+   158  USDJPY     NOT_FILLED         164,205     164,205  +         0
+   159  USDJPY     NOT_FILLED         164,205     164,205  +         0
+   160  USDCHF     WIN_PARTIAL        164,205     166,665  +     2,459
+   161  GBPUSD     MONITOR_CLOSE      166,665     166,754  +        89
+   162  USDJPY     LOSS               166,754     165,082      -1,671
+   163  USDJPY     LOSS               165,082     163,428      -1,655
+   164  GBPUSD     WIN_PARTIAL        163,428     165,875  +     2,448
+   165  USDJPY     MONITOR_CLOSE      165,875     166,812  +       937
+   166  GBPUSD     LOSS               166,812     165,140      -1,672
+   167  AUDUSD     WIN_PARTIAL        165,140     167,613  +     2,473
+   168  USDJPY     MONITOR_CLOSE      167,613     166,326      -1,288
+   169  GBPUSD     MONITOR_CLOSE      166,326     168,816  +     2,491
+   170  USDCHF     MONITOR_CLOSE      168,816     167,816      -1,000
+   171  GBPUSD     MONITOR_CLOSE      167,816     170,329  +     2,513
+
+  ── Month 6: Apr 2024  [trades=15 | W=13 L=1 MC=1 | P&L=+33,627 | Equity 170,329 → 203,956 (+19.7%)]
+──────────────────────────────────────────────────────────────────────
+   172  GBPUSD     MONITOR_CLOSE      170,329     169,813        -516
+   173  GBPUSD     WIN_PARTIAL        169,813     172,357  +     2,543
+   174  USDCHF     LOSS               172,357     170,629      -1,727
+   175  GBPUSD     WIN_PARTIAL        170,629     173,185  +     2,556
+   176  GBPUSD     WIN_PARTIAL        173,185     175,779  +     2,594
+   177  USDJPY     WIN_PARTIAL        175,779     178,411  +     2,633
+   178  GBPUSD     WIN_PARTIAL        178,411     181,084  +     2,672
+   179  GBPUSD     WIN_PARTIAL        181,084     183,796  +     2,712
+   180  GBPUSD     WIN_PARTIAL        183,796     186,549  +     2,753
+   181  USDJPY     WIN_PARTIAL        186,549     189,343  +     2,794
+   182  GBPUSD     WIN_PARTIAL        189,343     192,180  +     2,836
+   183  GBPUSD     WIN_PARTIAL        192,180     195,058  +     2,879
+   184  USDJPY     WIN_PARTIAL        195,058     197,980  +     2,922
+   185  USDJPY     WIN_PARTIAL        197,980     200,946  +     2,966
+   186  USDJPY     WIN_PARTIAL        200,946     203,956  +     3,010
+
+══════════════════════════════════════════════════════════════════════
+  WARNINGS & FLAGS
+══════════════════════════════════════════════════════════════════════
+  No warnings.
+
+══════════════════════════════════════════════════════════════════════
+  END OF REPORT
+══════════════════════════════════════════════════════════════════════

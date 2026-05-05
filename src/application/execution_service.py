@@ -40,6 +40,10 @@ from src.application.analysis import (
     find_htf_zone_confluence,
     find_m30_zone_confluence,
     find_m5_zone_confluence,
+    read_m5_zone_story,
+    read_m30_zone_story,
+    find_m5_precision_entry,
+    get_current_m5_bar_open,
 )
 from src.application.news_manager import NewsManager
 from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl, find_runner_protection_sl
@@ -278,13 +282,31 @@ class ExecutionService:
                 break  # same for every zone on this symbol; no need to loop
 
             # Block setups that go against the D1 macro trend.
-            # Commission is only worth paying when all timeframes agree.
-            if (getattr(config, "BLOCK_COUNTER_D1", True)
-                    and d1_bias is not None
-                    and d1_bias != zone.direction):
-                logger.debug("COUNTER-D1 | %s | zone=%s d1=%s — skipped",
-                             symbol, zone.direction.value, d1_bias.value)
-                continue
+            # Full hard-block if BLOCK_COUNTER_D1=True.
+            # When False, counter-D1 trades still require a minimum score
+            # of COUNTER_D1_MIN_SCORE (default 7) — they must have H4+H4-zone
+            # confluence to compensate for trading against the daily trend.
+            if d1_bias is not None and d1_bias != zone.direction:
+                if getattr(config, "BLOCK_COUNTER_D1", False):
+                    logger.debug("COUNTER-D1 HARD BLOCK | %s | zone=%s d1=%s",
+                                 symbol, zone.direction.value, d1_bias.value)
+                    continue
+                # Soft gate: pre-score the setup to check if it clears the bar
+                _pre_h4c  = find_htf_zone_confluence(zone, h4_zones)
+                _pre_m30c = find_m30_zone_confluence(zone, self._m30_zones.get(symbol, []))
+                _pre_m5c  = find_m5_zone_confluence(zone,  self._m5_zones.get(symbol,  []))
+                _pre_score = score_setup(
+                    zone.direction, h4_bias, ask, h4_eq, d1_bias,
+                    _pre_h4c, _pre_m30c, _pre_m5c,
+                )
+                _counter_d1_min = getattr(config, "COUNTER_D1_MIN_SCORE", 7)
+                if _pre_score < _counter_d1_min:
+                    logger.debug(
+                        "COUNTER-D1 SOFT BLOCK | %s | zone=%s d1=%s score=%d < %d",
+                        symbol, zone.direction.value, d1_bias.value,
+                        _pre_score, _counter_d1_min,
+                    )
+                    continue
 
             h4_confluent  = find_htf_zone_confluence(zone, h4_zones)
             m30_confluent = find_m30_zone_confluence(zone, self._m30_zones.get(symbol, []))
@@ -311,12 +333,17 @@ class ExecutionService:
             if not m5:
                 continue
 
+            # Initialise story/precision state so references are always valid
+            # even when the healthy-branch is skipped (zone flip path).
+            precision_zone = None
+            m5_story       = "neutral"
+
             # Re-evaluate zone at the moment price arrives.
             healthy, reject_reason = evaluate_zone_health(
                 zone, h1_short, m5, h1_atr)
 
             if not healthy:
-                if reject_reason == "m5_momentum_against_zone":
+                if reject_reason in ("m5_momentum_against_zone", "m5_zone_distributing"):
                     # Institutional pressure is moving AGAINST our zone.
                     # Try to trade WITH that institution instead of fighting it.
                     opp = find_opposing_opportunity(
@@ -330,8 +357,8 @@ class ExecutionService:
                         min_rr=min_rr,
                     )
                     if opp is None:
-                        logger.info("ZONE FLIP | %s %s | no opposing setup — skipping",
-                                    symbol, zone.id[:8])
+                        logger.info("ZONE FLIP | %s %s | %s — no opposing setup",
+                                    symbol, zone.id[:8], reject_reason)
                         continue
                     signal, zone = opp   # trade the reversal instead
                 else:
@@ -339,11 +366,50 @@ class ExecutionService:
                                 symbol, zone.id[:8], reject_reason)
                     continue
             else:
+                # ── M30 story gate ────────────────────────────────
+                # Read what the M30 bars are saying about this H1 zone
+                # BEFORE looking for entries.  A M30 bar closing against
+                # the zone direction is a 30-minute institutional statement
+                # that outweighs any M5 or M1 signal we might find.
+                m30_bars = self._md.get_candles(symbol, Timeframe.M30,
+                                                getattr(config, "M30_STORY_LOOKBACK", 8))
+                if m30_bars:
+                    m30_story = read_m30_zone_story(zone, m30_bars, h1_atr)
+                    if m30_story == "against":
+                        logger.info(
+                            "M30 STORY AGAINST | %s %s | M30 bar closed against zone — skip",
+                            symbol, zone.id[:8],
+                        )
+                        continue
+
+                # ── M5 zone story gate ────────────────────────────
+                # Check the sub-bar story INSIDE the zone using M5 bars.
+                # If M5 bars are distributing (closing lower and lower with
+                # volume) the zone is being used as supply, not demand.
+                # This is a finer check than evaluate_zone_health check 5
+                # because it uses all M5 bars inside the zone, not just the
+                # last 4 recent ones.
+                m5_story = read_m5_zone_story(zone, m5, h1_atr)
+                if m5_story == "distributing":
+                    logger.info(
+                        "M5 STORY DISTRIBUTING | %s %s | M5 bars showing distribution — skip",
+                        symbol, zone.id[:8],
+                    )
+                    continue
+
+                # ── M5 precision entry zone ───────────────────────
+                # Find the M5 OB / FVG INSIDE the H1 zone — this is the
+                # real institutional cluster, not the H1 zone boundary.
+                # When found, it is passed to both signal finders so the
+                # SL is anchored at the M5 OB low rather than the H1 OB low.
+                precision_zone = find_m5_precision_entry(zone, m5, pip_calc, h1_atr)
+                if precision_zone:
+                    logger.debug(
+                        "M5 PRECISION ZONE | %s | %.5f–%.5f inside H1 zone %.5f–%.5f",
+                        symbol, precision_zone[0], precision_zone[1], zone.low, zone.high,
+                    )
+
                 # ── M1 Predictive Signal (primary) ────────────────
-                # Read M1 candles and attempt a tighter ICT CRT entry.
-                # The current M5 candle (m5[-1]) is passed so the function
-                # can gate on M5 colour — if M5 is still bearish, the M1
-                # ChoCh is likely noise and we fall through to the M5 ChoCh.
                 m1 = self._md.get_candles(symbol, Timeframe.M1, config.M1_CANDLE_COUNT)
                 current_m5_candle = m5[-1] if m5 else None
                 signal = None
@@ -360,19 +426,22 @@ class ExecutionService:
                         zone_buffer=    zone_buf,
                         min_rr_override=min_rr,
                         m30_zones=      self._m30_zones.get(symbol, []),
+                        m5_candles=     m5,
                     )
                     if signal:
                         logger.info(
                             "M1 PREDICTIVE ENTRY | %s %s | RR=%.2f | "
-                            "entry=%.5f SL=%.5f (zone.mid=%.5f)",
+                            "entry=%.5f SL=%.5f (zone.mid=%.5f) | "
+                            "m5_story=%s precision=%s",
                             symbol, zone.direction.value,
                             signal.risk_reward, signal.entry_price,
                             signal.stop_loss, zone.mid,
+                            m5_story,
+                            f"{precision_zone[0]:.5f}-{precision_zone[1]:.5f}"
+                            if precision_zone else "none",
                         )
 
                 # ── M5 ChoCh Signal (fallback) ────────────────────
-                # Fires when M1 signal is unavailable (no M1 data, zone too
-                # narrow, M5 colour mismatch, thresholds not met).
                 if signal is None:
                     signal = find_m5_choch_signal(
                         m5_candles=m5, zone=zone, pip_calc=pip_calc,
@@ -380,6 +449,7 @@ class ExecutionService:
                         atr_price=h1_atr, zone_buffer=zone_buf,
                         min_rr_override=min_rr,
                         m30_zones=self._m30_zones.get(symbol, []),
+                        precision_zone=precision_zone,
                     )
 
                 if signal is None:

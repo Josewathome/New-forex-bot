@@ -409,16 +409,27 @@ def run_live() -> None:
     logger.info("Bot stopped cleanly.")
 
 
-def run_backtest() -> None:
+def run_backtest(
+    start_date:  str = "",
+    end_date:    str = "",
+    report_name: str = "",
+) -> None:
     from src.application.backtester  import Backtester
     from src.application.diagnostics import DiagnosticsCollector
     from src.domain.entities         import Timeframe
     from datetime                    import timedelta
 
-    end_dt   = datetime.now(tz=timezone.utc)
-    start_dt = end_dt - timedelta(days=30 * config.BACKTEST_MONTHS_BACK)
-    start_str = config.BACKTEST_START_DATE or start_dt.strftime("%Y-%m-%d")
-    end_str   = config.BACKTEST_END_DATE   or end_dt.strftime("%Y-%m-%d")
+    _now      = datetime.now(tz=timezone.utc)
+    _fallback_start = _now - timedelta(days=30 * config.BACKTEST_MONTHS_BACK)
+
+    # Priority: CLI arg → config override → auto-computed from BACKTEST_MONTHS_BACK
+    start_str = start_date or config.BACKTEST_START_DATE or _fallback_start.strftime("%Y-%m-%d")
+    end_str   = end_date   or config.BACKTEST_END_DATE   or _now.strftime("%Y-%m-%d")
+
+    # Align the MT5 fetch window to the resolved date range so that
+    # explicit --start/--end CLI dates are actually fetched from MT5.
+    start_dt = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end_dt   = datetime.strptime(end_str,   "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
     logger.info("Backtest: %s to %s", start_str, end_str)
     gw = connect_mt5()
@@ -473,9 +484,12 @@ def run_backtest() -> None:
                      end_date=end_str, diag=diag)
     bt.analyze_trade_features(results)
 
-    report_dir = Path("src/backtest_results")
+    report_dir  = Path("src/backtest_results")
     report_dir.mkdir(parents=True, exist_ok=True)
-    report_path = report_dir / f"backtest_{start_str}_{end_str}_report.txt"
+    run_ts      = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    # Priority: CLI --name arg → config BACKTEST_REPORT_NAME → default "backtest"
+    rname       = report_name or getattr(config, "BACKTEST_REPORT_NAME", "backtest")
+    report_path = report_dir / f"{rname}_{start_str}_{end_str}_{run_ts}.txt"
     diag.write_report(str(report_path))
     logger.info("Report -> %s", report_path)
     gw.disconnect()
@@ -490,13 +504,26 @@ if __name__ == "__main__":
     logger.info("  Risk    : %.1f%%  |  MinRR: %.1f", config.RISK_PERCENT, config.MIN_RR)
     logger.info("-" * 50)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--backtest", action="store_true")
+    parser = argparse.ArgumentParser(description="Zone-Reactive Forex Bot")
+    parser.add_argument("--backtest", action="store_true",
+                        help="Run backtest instead of live trading")
+    parser.add_argument("--start", default="",
+                        help="Backtest start date YYYY-MM-DD (overrides config)")
+    parser.add_argument("--end", default="",
+                        help="Backtest end date YYYY-MM-DD (overrides config)")
+    parser.add_argument("--name", default="",
+                        help="Report filename label, e.g. 'story_fixes_v1' "
+                             "(overrides config BACKTEST_REPORT_NAME)")
     args = parser.parse_args()
 
     if args.backtest:
-        logger.info("Mode: BACKTEST")
-        run_backtest()
+        logger.info("Mode: BACKTEST | start=%s end=%s name=%s",
+                    args.start or "auto", args.end or "auto", args.name or "auto")
+        run_backtest(
+            start_date=  args.start,
+            end_date=    args.end,
+            report_name= args.name,
+        )
     else:
         logger.info("Mode: LIVE")
         run_live()

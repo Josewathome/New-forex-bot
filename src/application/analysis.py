@@ -740,6 +740,7 @@ def find_m5_choch_signal(
     min_rr_override: Optional[float] = None,
     m30_zones:       Optional[List["Zone"]] = None,
     symbol:          str = "",
+    precision_zone:  Optional[Tuple[float, float]] = None,
 ) -> Optional[TradeSignal]:
     """
     M5 Change of Character (ChoCh) entry — replaces the old M1 engulfing scan.
@@ -835,7 +836,12 @@ def find_m5_choch_signal(
             pre_disp = m5_candles[i - 2]
             entry    = pre_disp.high if pre_disp.high < disp.low else disp.open
 
-            sl = disp.low - sl_buffer
+            # Use M5 precision OB as SL anchor when available — tighter stop,
+            # better RR, and structurally grounded inside the H1 zone.
+            if precision_zone is not None:
+                sl = precision_zone[0] - sl_buffer   # precision_zone[0] = OB low
+            else:
+                sl = disp.low - sl_buffer
             tp = find_m30_structural_tp(
                 direction=Direction.BULLISH, entry=entry,
                 m30_zones=m30_zones or [], pip_calc=pip_calc,
@@ -867,7 +873,10 @@ def find_m5_choch_signal(
             pre_disp = m5_candles[i - 2]
             entry    = pre_disp.low if pre_disp.low > disp.high else disp.open
 
-            sl = disp.high + sl_buffer
+            if precision_zone is not None:
+                sl = precision_zone[1] + sl_buffer   # precision_zone[1] = OB high
+            else:
+                sl = disp.high + sl_buffer
             tp = find_m30_structural_tp(
                 direction=Direction.BEARISH, entry=entry,
                 m30_zones=m30_zones or [], pip_calc=pip_calc,
@@ -931,6 +940,7 @@ def find_m1_predictive_signal(
     zone_buffer:     float               = 0.0,
     min_rr_override: Optional[float]     = None,
     m30_zones:       Optional[List["Zone"]] = None,
+    m5_candles:      Optional[List[Candle]] = None,
 ) -> Optional[TradeSignal]:
     """
     M1 Predictive Entry — ICT Candle Range Theory (CRT) implementation.
@@ -1011,6 +1021,18 @@ def find_m1_predictive_signal(
                 diag.record_rejection(symbol, "m1_m5_colour_mismatch")
             return None
 
+    # ── Bar-position gate ─────────────────────────────────────────
+    # The M1 signal must fire in the EARLY portion of the M5 bar (first 3 min).
+    # A ChoCh at minute 4 of the M5 bar is not predictive — it describes what
+    # already happened.  We check this against the current M5 bar open time.
+    if current_m5 is not None and m1_candles:
+        m5_open = current_m5.time
+        m1_latest_time = m1_candles[-1].time
+        if not m1_is_early_in_m5_bar(m1_latest_time, m5_open):
+            if diag:
+                diag.record_rejection(symbol, "m1_late_in_m5_bar")
+            return None
+
     # ── Precompute thresholds ──────────────────────────────────────
     avg_volume   = sum(c.volume for c in m1_candles[-11:-1]) / 10.0
     sl_buffer    = _compute_sl_buffer(symbol, atr_price, pip_calc, spread_pips)
@@ -1068,6 +1090,17 @@ def find_m1_predictive_signal(
                     diag.record_rejection(symbol, "m1_no_sweep_before_choch")
                 continue
 
+            # ── M5-swing significance gate ────────────────────────
+            # The wave_high being broken must be near an M5 swing high,
+            # not just a random M1 oscillation peak.  An M1 ChoCh that
+            # breaks a level M5 also recognises is a genuine structure shift.
+            if m5_candles and getattr(config, "M1_REQUIRE_M5_SWING_BREAK", True):
+                if not m1_choch_breaks_m5_swing(wave_high, m5_candles,
+                                                 Direction.BULLISH, pip_calc):
+                    if diag:
+                        diag.record_rejection(symbol, "m1_choch_not_m5_swing")
+                    continue
+
             disp = c
 
             # Volume gate
@@ -1119,6 +1152,14 @@ def find_m1_predictive_signal(
                 if diag:
                     diag.record_rejection(symbol, "m1_no_sweep_before_choch")
                 continue
+
+            # ── M5-swing significance gate ────────────────────────
+            if m5_candles and getattr(config, "M1_REQUIRE_M5_SWING_BREAK", True):
+                if not m1_choch_breaks_m5_swing(wave_low, m5_candles,
+                                                 Direction.BEARISH, pip_calc):
+                    if diag:
+                        diag.record_rejection(symbol, "m1_choch_not_m5_swing")
+                    continue
 
             disp = c
 
@@ -1395,6 +1436,327 @@ def is_kill_zone(dt: datetime) -> bool:
 
 
 # ─────────────────────────────────────────────
+#  M5 Zone Story Reader
+# ─────────────────────────────────────────────
+
+def read_m5_zone_story(
+    zone:       "Zone",
+    m5_candles: List["Candle"],
+    h1_atr:     float,
+) -> str:
+    """
+    Read the story that M5 bars inside the H1 zone are telling.
+
+    The H1 zone is a mapped address (e.g. "demand at 1.2700–1.2730").
+    But who is actually inside that building right now?  The M5 bars
+    that have printed INSIDE the zone since price arrived reveal the
+    intent of the institutions operating at that level:
+
+    "absorbing"   — price is being held up / turned around inside the zone.
+                    Signs: rejection wicks pointing away from zone edge,
+                    closes moving toward the expected TP direction,
+                    at least one bullish close (for demand) after first touch.
+
+    "distributing"— institutions are using the zone as a supply/distribution
+                    point instead of demand.  Signs: consecutive closes drifting
+                    AWAY from TP (deeper into or through the zone), bodies
+                    pointing against zone direction with no wick rejection.
+
+    "neutral"     — not enough M5 bars inside the zone yet to tell a story
+                    (< MIN_ZONE_STORY_BARS bars), or mixed signals.
+
+    Returns one of: "absorbing" | "distributing" | "neutral"
+    """
+    min_bars = getattr(config, "MIN_ZONE_STORY_BARS", 3)
+
+    # Collect M5 candles whose BODY overlaps the zone (price was inside)
+    inside = [
+        c for c in m5_candles
+        if c.body_low <= zone.high and c.body_high >= zone.low
+    ]
+
+    if len(inside) < min_bars:
+        return "neutral"
+
+    # Use the last N bars inside the zone so we read the CURRENT story,
+    # not what happened 20 bars ago when price first grazed the zone.
+    window = inside[-getattr(config, "ZONE_STORY_WINDOW", 6):]
+
+    vol_sample = [c.volume for c in m5_candles[-11:-1]]
+    avg_vol    = sum(vol_sample) / len(vol_sample) if vol_sample else 0.0
+    vol_thresh = getattr(config, "ZONE_STORY_VOL_THRESH", 1.2)
+
+    if zone.direction == Direction.BULLISH:
+        # Absorption signs (demand zone holding):
+        #   • candles closing in the upper half of their range (wick below = rejection)
+        #   • at least one bullish close with elevated volume
+        #   • closing prices trending UP from first to last bar in window
+        bullish_closes  = sum(1 for c in window if c.is_bullish)
+        strong_bullish  = sum(1 for c in window
+                              if c.is_bullish and avg_vol > 0 and c.volume >= avg_vol * vol_thresh)
+        # Lower-wick ratio > 0.4 on majority = wicks pointing down = demand rejection
+        wick_rejections = sum(1 for c in window if c.wick_ratio("lower") > 0.4)
+
+        # Distribution signs (zone being sold INTO):
+        bearish_closes  = sum(1 for c in window if c.is_bearish)
+        strong_bearish  = sum(1 for c in window
+                              if c.is_bearish and avg_vol > 0 and c.volume >= avg_vol * vol_thresh)
+        # Closes moving lower — the zone is leaking
+        closes_falling  = all(
+            window[i].close < window[i - 1].close
+            for i in range(1, len(window))
+        )
+
+        # Distributing: majority bearish + strong bearish vol + closes leaking lower
+        dist_threshold = getattr(config, "ZONE_STORY_DIST_MAJORITY", 0.6)
+        if (bearish_closes / len(window) >= dist_threshold
+                and strong_bearish >= 1
+                and closes_falling):
+            return "distributing"
+
+        # Absorbing: majority bullish, at least one strong bullish, wick rejections
+        abs_threshold = getattr(config, "ZONE_STORY_ABS_MAJORITY", 0.5)
+        if (bullish_closes / len(window) >= abs_threshold
+                and (strong_bullish >= 1 or wick_rejections >= 2)):
+            return "absorbing"
+
+    else:  # BEARISH zone
+        bearish_closes  = sum(1 for c in window if c.is_bearish)
+        strong_bearish  = sum(1 for c in window
+                              if c.is_bearish and avg_vol > 0 and c.volume >= avg_vol * vol_thresh)
+        wick_rejections = sum(1 for c in window if c.wick_ratio("upper") > 0.4)
+
+        bullish_closes  = sum(1 for c in window if c.is_bullish)
+        strong_bullish  = sum(1 for c in window
+                              if c.is_bullish and avg_vol > 0 and c.volume >= avg_vol * vol_thresh)
+        closes_rising   = all(
+            window[i].close > window[i - 1].close
+            for i in range(1, len(window))
+        )
+
+        dist_threshold = getattr(config, "ZONE_STORY_DIST_MAJORITY", 0.6)
+        if (bullish_closes / len(window) >= dist_threshold
+                and strong_bullish >= 1
+                and closes_rising):
+            return "distributing"
+
+        abs_threshold = getattr(config, "ZONE_STORY_ABS_MAJORITY", 0.5)
+        if (bearish_closes / len(window) >= abs_threshold
+                and (strong_bearish >= 1 or wick_rejections >= 2)):
+            return "absorbing"
+
+    return "neutral"
+
+
+# ─────────────────────────────────────────────
+#  M30 Story Reader
+# ─────────────────────────────────────────────
+
+def read_m30_zone_story(
+    zone:        "Zone",
+    m30_candles: List["Candle"],
+    h1_atr:      float,
+) -> str:
+    """
+    Read the M30 bar story relative to the H1 zone — one timeframe above M5.
+
+    M30 bars are 30 minutes wide and contain six M5 bars each.  When the
+    last M30 bar CLOSED inside or through the H1 zone in the wrong direction,
+    it is telling a much louder story than a single M5 bar.
+
+    Returns:
+        "against"  — last M30 bar closed against the zone direction
+                     (e.g. bearish close inside a demand zone).  This is the
+                     strongest early warning that institutions are distributing
+                     from the zone, not absorbing.
+        "with"     — last M30 bar supports the zone direction (bullish close
+                     inside demand zone = absorption at the level).
+        "neutral"  — M30 bar did not interact with the zone, or mixed.
+    """
+    if not m30_candles:
+        return "neutral"
+
+    # Find M30 candles that overlap the zone
+    zone_m30 = [
+        c for c in m30_candles
+        if c.low <= zone.high and c.high >= zone.low
+    ]
+    if not zone_m30:
+        return "neutral"
+
+    last = zone_m30[-1]
+
+    if zone.direction == Direction.BULLISH:
+        if last.is_bearish and last.close < zone.high:
+            # Bearish M30 candle closed INSIDE or below demand zone — distribution
+            return "against"
+        if last.is_bullish and last.close > last.open:
+            return "with"
+    else:
+        if last.is_bullish and last.close > zone.low:
+            return "against"
+        if last.is_bearish and last.close < last.open:
+            return "with"
+
+    return "neutral"
+
+
+# ─────────────────────────────────────────────
+#  M5 Sub-Zone Precision Finder
+# ─────────────────────────────────────────────
+
+def find_m5_precision_entry(
+    zone:       "Zone",
+    m5_candles: List["Candle"],
+    pip_calc:   "PipCalculator",
+    h1_atr:     float,
+) -> Optional[Tuple[float, float]]:
+    """
+    Find the tightest valid entry inside an H1 zone using the M5 sub-structure.
+
+    The H1 OB is the address.  Inside that address the M5 bars have printed
+    their own micro OBs and FVGs — these are the ACTUAL institutional order
+    clusters.  Entering at the M5 OB inside the H1 OB gives:
+        • Tighter SL (M5 OB edge, not H1 OB edge)
+        • Better RR (same TP, smaller risk)
+        • Price is already showing the institutional level is respected
+
+    Algorithm (bullish example):
+        1. Find all M5 candles whose body is inside the H1 zone.
+        2. Among those, find the most recent M5 bearish candle followed by
+           a strong bullish move (= M5 OB inside the H1 zone).
+        3. Return (ob_low, ob_high) as the precision entry zone.
+           Caller uses ob_high as entry, ob_low - buffer as SL.
+
+    Returns (precision_low, precision_high) or None if no M5 OB found inside.
+    """
+    min_pips = getattr(config, "M5_PRECISION_MIN_PIPS", 2.0)
+    min_price = pip_calc.pips_to_price(min_pips)
+
+    inside = [
+        (i, c) for i, c in enumerate(m5_candles)
+        if c.body_low >= zone.low and c.body_high <= zone.high
+    ]
+    if len(inside) < 3:
+        return None
+
+    if zone.direction == Direction.BULLISH:
+        # Look for the last M5 bearish candle inside the zone whose next
+        # candle is a strong bullish move — that's the M5 OB (demand).
+        for k in range(len(inside) - 2, 0, -1):
+            idx, ob_candle = inside[k]
+            if not ob_candle.is_bearish:
+                continue
+            # Next candle after OB must be bullish and have a large body
+            if idx + 1 >= len(m5_candles):
+                continue
+            nxt = m5_candles[idx + 1]
+            if not nxt.is_bullish:
+                continue
+            if nxt.body_size < ob_candle.body_size * 1.5:
+                continue
+            # OB must be meaningful size
+            if ob_candle.body_size < min_price:
+                continue
+            return (ob_candle.body_low, ob_candle.body_high)
+
+    else:  # BEARISH
+        for k in range(len(inside) - 2, 0, -1):
+            idx, ob_candle = inside[k]
+            if not ob_candle.is_bullish:
+                continue
+            if idx + 1 >= len(m5_candles):
+                continue
+            nxt = m5_candles[idx + 1]
+            if not nxt.is_bearish:
+                continue
+            if nxt.body_size < ob_candle.body_size * 1.5:
+                continue
+            if ob_candle.body_size < min_price:
+                continue
+            return (ob_candle.body_low, ob_candle.body_high)
+
+    return None
+
+
+# ─────────────────────────────────────────────
+#  M1 Bar-Position-in-M5 Gate
+# ─────────────────────────────────────────────
+
+def m1_is_early_in_m5_bar(
+    m1_signal_time: datetime,
+    m5_bar_open_time: datetime,
+) -> bool:
+    """
+    Return True when the M1 signal fired in the EARLY portion of the M5 bar.
+
+    ICT Candle Range Theory requires that the M1 sweep + MSS happens early
+    inside the M5 bar so that the prediction 'this M5 bar will close bullish'
+    still has time to play out.  If the M1 ChoCh fires at minute 3-4 of the
+    M5 bar there is no predictive value — the M5 bar is nearly done and the
+    signal is describing what already happened, not what is about to happen.
+
+    Threshold: M1_EARLY_BAR_MINUTES (default 3).  The M1 signal must fire
+    within the first 3 minutes of the M5 bar (minutes 0, 1, 2 are valid;
+    minutes 3, 4 are rejected).
+    """
+    if m5_bar_open_time is None:
+        return True   # can't determine — allow through
+    elapsed_seconds = (m1_signal_time - m5_bar_open_time).total_seconds()
+    max_seconds = getattr(config, "M1_EARLY_BAR_MINUTES", 3) * 60
+    return 0 <= elapsed_seconds < max_seconds
+
+
+def get_current_m5_bar_open(m5_candles: List["Candle"]) -> Optional[datetime]:
+    """Return the open time of the most recent (possibly still-forming) M5 bar."""
+    if not m5_candles:
+        return None
+    return m5_candles[-1].time
+
+
+# ─────────────────────────────────────────────
+#  M1 ChoCh vs M5 Swing Validator
+# ─────────────────────────────────────────────
+
+def m1_choch_breaks_m5_swing(
+    m1_wave_extreme: float,
+    m5_candles:      List["Candle"],
+    direction:       "Direction",
+    pip_calc:        "PipCalculator",
+) -> bool:
+    """
+    Return True when the M1 ChoCh wave-extreme (wave_high for bulls,
+    wave_low for bears) coincides with a SIGNIFICANT M5 swing level.
+
+    Why this matters:
+        Inside an H1 zone the M1 is oscillating.  An M1 ChoCh that merely
+        breaks a random M1 high that sits in the middle of a bearish M5 candle
+        body is noise — it is describing M1 internal volatility, not a real
+        change of character.  A genuine institutional shift MUST break a level
+        that the M5 timeframe also recognises as a swing point.
+
+    Method:
+        Check whether m1_wave_extreme is within M1_M5_SWING_PROXIMITY_PIPS
+        of any M5 candle high (bull) or low (bear) in the recent lookback.
+        If yes, breaking it carries M5-level significance.
+
+    Returns True (valid) or False (M1 noise — reject).
+    """
+    lookback = getattr(config, "M1_M5_SWING_LOOKBACK", 12)
+    prox     = pip_calc.pips_to_price(
+        getattr(config, "M1_M5_SWING_PROXIMITY_PIPS", 3.0)
+    )
+    window = m5_candles[-lookback:] if len(m5_candles) >= lookback else m5_candles
+
+    if direction == Direction.BULLISH:
+        m5_highs = [c.high for c in window]
+        return any(abs(m1_wave_extreme - h) <= prox for h in m5_highs)
+    else:
+        m5_lows = [c.low for c in window]
+        return any(abs(m1_wave_extreme - l) <= prox for l in m5_lows)
+
+
+# ─────────────────────────────────────────────
 #  Zone Health Re-Evaluator
 # ─────────────────────────────────────────────
 
@@ -1458,22 +1820,34 @@ def evaluate_zone_health(
         return False, "ob_over_tapped"
 
     # ── Check 4: M5 momentum displacement against zone ───────────────
-    # 4/4 recent M5 candles oppose the zone AND at least 2 carry volume
-    # spike (>1.3× avg) → a real institutional move is forming against us.
+    # 3/4 recent M5 candles oppose the zone AND at least 1 carries a volume
+    # spike (>1.5× avg) → catching distribution/accumulation EARLIER than
+    # the old 4/4 + 2-strong gate which fired only after 20+ pip adverse move.
     if len(m5_candles) >= 5:
         last4 = m5_candles[-4:]
         vol_sample = [c.volume for c in m5_candles[-11:-1]]
         avg_vol = sum(vol_sample) / len(vol_sample) if vol_sample else 0.0
+        vol_spike_threshold = getattr(config, "ZONE_HEALTH_VOL_SPIKE", 1.5)
+        against_min         = getattr(config, "ZONE_HEALTH_AGAINST_MIN", 3)
+        strong_min          = getattr(config, "ZONE_HEALTH_STRONG_MIN",  1)
         if zone.direction == Direction.BULLISH:
             against = [c for c in last4 if c.is_bearish]
             strong  = sum(1 for c in against
-                          if avg_vol > 0 and c.volume >= avg_vol * 1.3)
+                          if avg_vol > 0 and c.volume >= avg_vol * vol_spike_threshold)
         else:
             against = [c for c in last4 if c.is_bullish]
             strong  = sum(1 for c in against
-                          if avg_vol > 0 and c.volume >= avg_vol * 1.3)
-        if len(against) == 4 and strong >= 2:
+                          if avg_vol > 0 and c.volume >= avg_vol * vol_spike_threshold)
+        if len(against) >= against_min and strong >= strong_min:
             return False, "m5_momentum_against_zone"
+
+    # ── Check 5: M5 internal distribution / absorption story ────────────
+    # Reads the sub-bar story INSIDE the zone — are M5 bars being absorbed
+    # (wicks rejecting from zone edge, closes moving toward TP) or distributed
+    # (closes drifting away from TP, bodies pointing against zone direction)?
+    zone_story = read_m5_zone_story(zone, m5_candles, h1_atr)
+    if zone_story == "distributing":
+        return False, "m5_zone_distributing"
 
     return True, "ok"
 
