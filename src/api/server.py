@@ -457,7 +457,7 @@ class DashboardServer:
         @require_auth
         def logs():
             n    = int(request.args.get("n", 100))
-            logf = Path("trading_bot.log")
+            logf = Path("logs/trading_bot.log")
             if not logf.exists():
                 return jsonify({"lines": []})
             try:

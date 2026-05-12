@@ -8,7 +8,7 @@
 # We do use this root context to fix volume ownership so the abc user
 # can write to the Docker named volumes (news_cache, zones_data) that
 # Docker creates owned by root by default.
-mkdir -p /bot/.cache /bot/logs /bot/zones
-chown -R abc:abc /bot/.cache /bot/logs /bot/zones 2>/dev/null || true
+mkdir -p /bot/.cache /bot/logs /bot/zones /bot/.checkpoints /bot/src/backtest_results
+chown -R abc:abc /bot/.cache /bot/logs /bot/zones /bot/.checkpoints /bot/src/backtest_results 2>/dev/null || true
 chmod +x /Metatrader/start.sh 2>/dev/null || true
 exit 0
