@@ -10,4 +10,5 @@
 # Docker creates owned by root by default.
 mkdir -p /bot/.cache /bot/logs /bot/zones
 chown -R abc:abc /bot/.cache /bot/logs /bot/zones 2>/dev/null || true
+chmod +x /Metatrader/start.sh 2>/dev/null || true
 exit 0
