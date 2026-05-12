@@ -13,11 +13,13 @@ Common 403 causes fixed here:
 """
 from __future__ import annotations
 import logging
+from logging import config
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
+import config
 
 from src.domain.entities import NewsEvent
 from src.domain.repositories import INewsRepository
@@ -25,8 +27,8 @@ from .cache_store import JsonCacheStore
 
 logger = logging.getLogger(__name__)
 
-BASE_FF     = "https://forexnews.gre8i.com/forexfactory/events"
-BASE_MFX    = "https://forexnews.gre8i.com/myfxbook/events"
+BASE_FF     = f"{config.NEWS_API_URL}/forexfactory/events"
+BASE_MFX    = f"{config.NEWS_API_URL}/myfxbook/events"
 
 FF_CACHE_TTL  = 30 * 60
 MFX_CACHE_TTL = 1220 * 60

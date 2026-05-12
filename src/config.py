@@ -37,7 +37,7 @@ MT5_PATH = ""
 
 # ── News API ───────────────────────────────────────────────────────
 NEWS_API_KEY = os.environ.get("NEWS_API_KEY", "")
-
+NEWS_API_URL = os.environ.get("NEWS_API_URL", "http://192.168.1.100:8087")
 # ── Dashboard Auth ─────────────────────────────────────────────────
 # Password for the web dashboard. If empty, a random one is printed to
 # the log at startup (check logs/trading_bot.log for the one-time password).
