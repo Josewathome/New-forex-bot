@@ -56,7 +56,6 @@ def _setup_logging() -> None:
         handlers=[
             logging.StreamHandler(sys.stdout),
             logging.FileHandler("logs/trading_bot.log", encoding="utf-8"),
-            logging.FileHandler("trading_bot.log",      encoding="utf-8"),
         ],
     )
 
