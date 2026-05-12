@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
-import config
+import src.config as config
 
 from src.domain.entities import NewsEvent
 from src.domain.repositories import INewsRepository
