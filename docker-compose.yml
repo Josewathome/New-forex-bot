@@ -25,6 +25,8 @@ services:
       - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD}
       - JWT_ACCESS_EXPIRES_MINUTES=${JWT_ACCESS_EXPIRES_MINUTES:-15}
       - JWT_REFRESH_EXPIRES_DAYS=${JWT_REFRESH_EXPIRES_DAYS:-7}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets Wine reach host-bound ports (e.g. forex-api:8087)
     volumes:
       - mt5_config:/config
       - ./fix_rpyc.sh:/custom-cont-init.d/fix_rpyc.sh   # no-op, kept to avoid init error
