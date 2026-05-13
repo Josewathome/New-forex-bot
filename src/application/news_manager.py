@@ -55,8 +55,8 @@ class NewsManager:
         threshold = atr_pips * config.ATR_COST_THRESHOLD
         cost_pips = broker_cost.total_cost_pips
         if cost_pips > threshold:
-            logger.warning("COST BLOCK | %s | cost=%.2f pips > ATR×10%%=%.2f pips",
-                           symbol, cost_pips, threshold)
+            logger.warning("COST BLOCK | %s | cost=%.2f pips > ATR×%.0f%%=%.2f pips",
+                           symbol, cost_pips, config.ATR_COST_THRESHOLD * 100, threshold)
             return True
         return False
 

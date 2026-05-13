@@ -4,6 +4,7 @@
 .env.*
 
 # ── Generated at runtime ──────────────────────
+ready_to_trade
 .cache/
 *.log
 __pycache__/

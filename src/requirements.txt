@@ -12,3 +12,4 @@ certifi
 charset-normalizer
 idna
 tzdata
+requests 
