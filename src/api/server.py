@@ -343,7 +343,6 @@ class DashboardServer:
         # ── Static ──────────────────────────────────────────────────
 
         @app.route("/")
-        @require_auth
         def index():
             p = Path("src/dashboard/index.html")
             if p.exists():
