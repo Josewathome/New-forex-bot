@@ -511,7 +511,7 @@ DASHBOARD_ENABLED = True
 DASHBOARD_PORT    = 8080
 
 # ── Email / Weekly Backtest ───────────────────────────────────────
-EMAIL_ENABLED   = False            # set True + fill fields below to activate
+EMAIL_ENABLED   = True            # set True + fill fields below to activate
 EMAIL_SMTP_HOST = os.environ.get("EMAIL_SMTP_HOST", "smtp.gmail.com")
 EMAIL_SMTP_PORT = int(os.environ.get("EMAIL_SMTP_PORT", 587))
 EMAIL_USER      = os.environ.get("EMAIL_USER",      "")
@@ -536,7 +536,7 @@ MAX_FORWARD_M1_BARS  = 4_320
 #
 # After doing that, set this to 4 for a full and accurate simulation.
 # Leave at 2 if you have not yet scrolled back (safe default).
-BACKTEST_MONTHS_BACK = 6
+BACKTEST_MONTHS_BACK = 2
 BACKTEST_START_DATE  = ""
 BACKTEST_END_DATE    = ""
 BACKTEST_REPORT_NAME ="Last_6_months"
