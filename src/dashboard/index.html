@@ -253,6 +253,8 @@
 let accessToken  = sessionStorage.getItem('zb_access');
 let refreshToken = localStorage.getItem('zb_refresh');
 
+const API_BASE = window.location.pathname.startsWith('/bot') ? '/bot' : '';
+
 // ── Login / logout UI ────────────────────────────────────────────────
 function showLogin(msg) {
   document.getElementById('app').style.display = 'none';
@@ -278,7 +280,7 @@ async function doLogin() {
   btn.disabled = true;
   btn.textContent = 'Signing in…';
   try {
-    const r = await fetch('/api/auth/login', {
+    const r = await fetch(API_BASE + '/api/auth/login', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({password: pw}),
@@ -306,7 +308,7 @@ async function doLogin() {
 async function doLogout() {
   try {
     if (refreshToken) {
-      await fetch('/api/auth/logout', {
+      await fetch(API_BASE + '/api/auth/logout', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({refresh_token: refreshToken}),
@@ -322,7 +324,8 @@ async function doLogout() {
 
 // ── Authenticated fetch wrapper ───────────────────────────────────────
 // Transparently refreshes the access token on 401, then retries once.
-async function apiFetch(url, opts = {}) {
+async function apiFetch(path, opts = {}) {
+  const url = API_BASE + path;
   opts.headers = {...(opts.headers || {}), 'Authorization': `Bearer ${accessToken}`};
   let r = await fetch(url, opts);
 
@@ -340,7 +343,7 @@ async function apiFetch(url, opts = {}) {
 async function tryRefresh() {
   if (!refreshToken) return false;
   try {
-    const r = await fetch('/api/auth/refresh', {
+    const r = await fetch(API_BASE + '/api/auth/refresh', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({refresh_token: refreshToken}),
@@ -535,7 +538,7 @@ async function rotateSecret() {
   const pw = prompt('Confirm your dashboard password to rotate the JWT secret:');
   if (pw === null) return;
   try {
-    const r = await fetch('/api/auth/rotate-secret', {
+    const r = await fetch(API_BASE + '/api/auth/rotate-secret', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({password: pw}),
