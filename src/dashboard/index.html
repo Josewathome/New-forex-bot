@@ -143,12 +143,42 @@
 
 <!-- ANALYTICS -->
 <div class="page active" id="page-analytics">
+
+  <!-- Account health row (always all-time) -->
+  <div style="display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap">
+    <div class="card" style="flex:1;min-width:200px">
+      <div class="card-label">Current Balance</div>
+      <div class="card-value" id="sc-balance">-</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px" id="sc-balance-change"></div>
+    </div>
+    <div class="card" style="flex:1;min-width:200px">
+      <div class="card-label">Max Drawdown <span id="dd-period-label" style="color:var(--muted);font-weight:400">(5 months)</span></div>
+      <div class="card-value" id="sc-dd">-</div>
+    </div>
+  </div>
+
+  <!-- Period filter + period stats -->
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <div style="font-size:13px;font-weight:600;color:var(--muted)">PERIOD STATS</div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <label style="font-size:12px;color:var(--muted)">Period:</label>
+      <select id="periodSelect" onchange="onPeriodChange()"
+        style="background:#13151f;border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:6px;font-size:13px;cursor:pointer">
+        <option value="30">Last month</option>
+        <option value="90">Last 3 months</option>
+        <option value="150" selected>Last 5 months</option>
+        <option value="365">Last year</option>
+        <option value="">All time</option>
+      </select>
+    </div>
+  </div>
+
   <div class="cards" id="statCards">
     <div class="card"><div class="card-label">Total Trades</div><div class="card-value" id="sc-total">-</div></div>
     <div class="card"><div class="card-label">Wins</div><div class="card-value green" id="sc-wins">-</div></div>
     <div class="card"><div class="card-label">Losses</div><div class="card-value red" id="sc-losses">-</div></div>
     <div class="card"><div class="card-label">Win Rate</div><div class="card-value yellow" id="sc-wr">-</div></div>
-    <div class="card"><div class="card-label">Total PnL</div><div class="card-value" id="sc-pnl">-</div></div>
+    <div class="card"><div class="card-label">Period PnL</div><div class="card-value" id="sc-pnl">-</div></div>
     <div class="card"><div class="card-label">Avg PnL / Trade</div><div class="card-value" id="sc-avg">-</div></div>
   </div>
 
@@ -189,6 +219,52 @@
 
 <!-- CONFIG -->
 <div class="page" id="page-config">
+
+  <!-- Account Balance -->
+  <div class="section">
+    <div class="section-header">Account Balance</div>
+    <div style="padding:18px 18px 0">
+      <div style="display:flex;gap:24px;margin-bottom:18px;flex-wrap:wrap">
+        <div>
+          <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">Current Initial Balance</div>
+          <div style="font-size:24px;font-weight:700;margin-top:4px" id="bal-display">—</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:2px" id="bal-since">—</div>
+        </div>
+      </div>
+
+      <div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:12px 14px;margin-bottom:18px">
+        <div style="font-weight:600;color:var(--yellow);margin-bottom:5px">Warning — read before updating</div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.6">
+          Only change this when you <strong style="color:var(--text)">deposit or withdraw funds</strong> in your MT5 account.
+          Setting the wrong value will make your PnL%, drawdown, and year-end stats incorrect.
+          Every change is recorded with a timestamp so you have a full audit trail.
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+        <div class="form-group">
+          <label>New Balance ({{ ccy }})</label>
+          <input type="number" id="bal-new-amount" step="500" min="1" placeholder="e.g. 50000"/>
+        </div>
+        <div class="form-group">
+          <label>Note</label>
+          <input type="text" id="bal-new-note" placeholder="e.g. Deposited 20,000 KES" maxlength="80"/>
+        </div>
+      </div>
+      <button class="btn btn-danger" onclick="updateBalance()" type="button">Update Initial Balance</button>
+    </div>
+
+    <div style="border-top:1px solid var(--border);margin-top:18px">
+      <div style="padding:14px 18px 8px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">
+        Funding History
+      </div>
+      <table>
+        <thead><tr><th>Date / Time</th><th>Balance</th><th>Note</th></tr></thead>
+        <tbody id="balHistoryTable"><tr><td colspan="3" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
   <div class="section">
     <div class="section-header">Risk & Execution</div>
     <div class="form-grid">
@@ -369,7 +445,8 @@ function showTab(name) {
   document.querySelectorAll('.page').forEach(p=>{
     p.classList.toggle('active', p.id===`page-${name}`);
   });
-  if(name==='logs') loadLogs();
+  if(name==='logs')   loadLogs();
+  if(name==='config') loadBalanceHistory();
 }
 
 // ── Status ───────────────────────────────────────────────────────────
@@ -392,7 +469,18 @@ async function loadStatus() {
 }
 
 // ── Analytics ────────────────────────────────────────────────────────
+let periodDays = 150; // default: last 5 months
+
+function onPeriodChange() {
+  const val = document.getElementById('periodSelect').value;
+  periodDays = val ? parseInt(val) : null;
+  const labels = {'30':'1 month','90':'3 months','150':'5 months','365':'1 year','':'all time'};
+  document.getElementById('dd-period-label').textContent = '(' + (labels[val] || val+' days') + ')';
+  loadStats();
+}
+
 function pnlClass(v){ return v>0?'pnl-pos':v<0?'pnl-neg':''; }
+function fmt(v){ return v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
 function outcomeBadge(o){
   const m = {WIN_FULL:'badge-green',WIN_PARTIAL:'badge-green',LOSS:'badge-red',OPEN:'badge-blue',MONITOR_CLOSE:'badge-yellow'};
   return `<span class="badge ${m[o]||'badge-blue'}">${o}</span>`;
@@ -400,22 +488,48 @@ function outcomeBadge(o){
 
 async function loadStats() {
   try {
-    const r = await apiFetch('/api/stats');
+    const url = '/api/stats' + (periodDays ? `?days=${periodDays}` : '');
+    const r = await apiFetch(url);
     const d = await r.json();
     const g = d.global;
-    document.getElementById('sc-total').textContent   = g.total;
-    document.getElementById('sc-wins').textContent    = g.wins;
-    document.getElementById('sc-losses').textContent  = g.losses;
-    document.getElementById('sc-wr').textContent      = g.total ? `${g.win_rate}%` : '-';
-    const pnlEl = document.getElementById('sc-pnl');
-    pnlEl.textContent = g.total ? (g.total_pnl>=0?'+':'')+g.total_pnl : '-';
-    pnlEl.className = 'card-value '+pnlClass(g.total_pnl);
-    const avgEl = document.getElementById('sc-avg');
-    avgEl.textContent = g.total ? (g.avg_pnl>=0?'+':'')+g.avg_pnl : '-';
-    avgEl.className = 'card-value '+pnlClass(g.avg_pnl);
+    const ccy = g.currency || '';
 
+    // ── Current balance card (always all-time) ──
+    const balEl = document.getElementById('sc-balance');
+    if (g.current_balance != null) {
+      balEl.textContent = fmt(g.current_balance) + (ccy ? ' ' + ccy : '');
+      balEl.className   = 'card-value ' + (g.balance_change_pct >= 0 ? 'green' : 'red');
+      const chg  = document.getElementById('sc-balance-change');
+      const sign = g.balance_change_pct >= 0 ? '+' : '';
+      const since = g.balance_set_at ? ' · since ' + new Date(g.balance_set_at).toLocaleDateString() : '';
+      chg.textContent = `${sign}${g.balance_change_pct.toFixed(2)}% vs ${fmt(g.initial_balance)}${since}`;
+      chg.style.color = g.balance_change_pct >= 0 ? 'var(--green)' : 'var(--red)';
+    }
+
+    // ── Max drawdown card ──
+    const ddEl = document.getElementById('sc-dd');
+    if (g.drawdown_pct != null) {
+      ddEl.textContent = g.drawdown_pct.toFixed(2) + '%';
+      ddEl.className   = 'card-value ' + (g.drawdown_pct > 15 ? 'red' : g.drawdown_pct > 7 ? 'yellow' : 'green');
+    }
+
+    // ── Period stats cards ──
+    document.getElementById('sc-total').textContent  = g.total;
+    document.getElementById('sc-wins').textContent   = g.wins;
+    document.getElementById('sc-losses').textContent = g.losses;
+    document.getElementById('sc-wr').textContent     = g.total ? `${g.win_rate}%` : '-';
+
+    const pnlEl = document.getElementById('sc-pnl');
+    pnlEl.textContent = g.total ? (g.total_pnl>=0?'+':'')+fmt(g.total_pnl)+(ccy?' '+ccy:'') : '-';
+    pnlEl.className   = 'card-value '+pnlClass(g.total_pnl);
+
+    const avgEl = document.getElementById('sc-avg');
+    avgEl.textContent = g.total ? (g.avg_pnl>=0?'+':'')+fmt(g.avg_pnl) : '-';
+    avgEl.className   = 'card-value '+pnlClass(g.avg_pnl);
+
+    // ── Per-symbol table ──
     const tbody = document.getElementById('symTable');
-    const syms = Object.entries(d.by_symbol);
+    const syms  = Object.entries(d.by_symbol);
     if(!syms.length){ tbody.innerHTML='<tr><td colspan="7" class="empty">No closed trades yet.</td></tr>'; return; }
     tbody.innerHTML = syms.sort((a,b)=>b[1].total-a[1].total).map(([sym,s])=>`
       <tr>
@@ -424,8 +538,8 @@ async function loadStats() {
         <td class="pnl-pos">${s.wins}</td>
         <td class="pnl-neg">${s.losses}</td>
         <td>${s.win_rate}%</td>
-        <td class="${pnlClass(s.total_pnl)}">${s.total_pnl>=0?'+':''}${s.total_pnl}</td>
-        <td class="${pnlClass(s.avg_pnl)}">${s.avg_pnl>=0?'+':''}${s.avg_pnl}</td>
+        <td class="${pnlClass(s.total_pnl)}">${s.total_pnl>=0?'+':''}${fmt(s.total_pnl)}</td>
+        <td class="${pnlClass(s.avg_pnl)}">${s.avg_pnl>=0?'+':''}${fmt(s.avg_pnl)}</td>
       </tr>`).join('');
   } catch(e) { if(e.message!=='unauthenticated') console.error('stats error', e); }
 }
@@ -554,6 +668,80 @@ async function rotateSecret() {
   } catch(e) { alert('Error: ' + e); }
 }
 
+// ── Balance history ───────────────────────────────────────────────────
+async function loadBalanceHistory() {
+  try {
+    const r = await apiFetch('/api/balance-history');
+    const d = await r.json();
+    const history = d.history || [];
+
+    if (history.length) {
+      const latest = history[history.length - 1];
+      const ccy    = latest.currency || '';
+      document.getElementById('bal-display').textContent =
+        fmt(latest.balance) + (ccy ? ' ' + ccy : '');
+      document.getElementById('bal-since').textContent =
+        'Set on ' + new Date(latest.set_at).toLocaleString();
+    }
+
+    const tbody = document.getElementById('balHistoryTable');
+    if (!history.length) {
+      tbody.innerHTML = '<tr><td colspan="3" class="empty">No history yet.</td></tr>';
+      return;
+    }
+    // Show newest first
+    tbody.innerHTML = [...history].reverse().map((e, i, arr) => {
+      const isLatest = i === 0;
+      const prev     = arr[i + 1];
+      let delta = '';
+      if (prev) {
+        const diff = e.balance - prev.balance;
+        const sign = diff >= 0 ? '+' : '';
+        delta = `<span style="font-size:11px;color:${diff>=0?'var(--green)':'var(--red)'}">${sign}${fmt(diff)}</span>`;
+      }
+      return `<tr${isLatest ? ' style="background:rgba(108,99,255,.06)"' : ''}>
+        <td>${new Date(e.set_at).toLocaleString()}${isLatest ? ' <span class="badge badge-blue" style="font-size:10px">current</span>' : ''}</td>
+        <td><strong>${fmt(e.balance)} ${e.currency||''}</strong> ${delta}</td>
+        <td>${escHtml(e.note || '')}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { if(e.message !== 'unauthenticated') console.error('balance history error', e); }
+}
+
+async function updateBalance() {
+  const amountEl = document.getElementById('bal-new-amount');
+  const noteEl   = document.getElementById('bal-new-note');
+  const amount   = parseFloat(amountEl.value);
+  const note     = noteEl.value.trim();
+
+  if (!amount || amount <= 0) { alert('Enter a valid balance amount.'); return; }
+
+  const ccy = document.getElementById('bal-display').textContent.split(' ').slice(-1)[0] || '';
+  const confirmed = confirm(
+    `Update initial balance to ${fmt(amount)} ${ccy}?\n\n` +
+    `This affects all PnL %, drawdown, and year-end statistics.\n` +
+    `Only confirm if you have deposited or withdrawn funds from your MT5 account.`
+  );
+  if (!confirmed) return;
+
+  try {
+    const r = await apiFetch('/api/balance-history', {
+      method:  'POST',
+      headers: {'Content-Type': 'application/json'},
+      body:    JSON.stringify({balance: amount, note: note || `Balance set to ${fmt(amount)}`}),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      amountEl.value = '';
+      noteEl.value   = '';
+      loadBalanceHistory();
+      loadStats();   // refresh analytics cards with new initial balance
+    } else {
+      alert(d.error || 'Error updating balance.');
+    }
+  } catch(e) { alert('Error: ' + e); }
+}
+
 // ── Logs ──────────────────────────────────────────────────────────────
 async function loadLogs() {
   try {
@@ -586,11 +774,12 @@ function refresh() {
 if (accessToken) {
   showApp();
   loadConfig();
+  loadBalanceHistory();
   refresh();
 } else if (refreshToken) {
   // Try silent refresh before showing login
   tryRefresh().then(ok => {
-    if (ok) { showApp(); loadConfig(); refresh(); }
+    if (ok) { showApp(); loadConfig(); loadBalanceHistory(); refresh(); }
     else showLogin();
   });
 } else {

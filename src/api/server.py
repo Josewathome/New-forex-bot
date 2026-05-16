@@ -50,6 +50,55 @@ _BOT_START_TIME = datetime.now(tz=timezone.utc)
 # File where dashboard config overrides are written so they survive restarts.
 _CONFIG_OVERRIDE_FILE = Path(".checkpoints/config_overrides.json")
 
+# Full history of balance events — each deposit/withdrawal appends a new entry.
+# The most recent entry is the "current initial balance" for PnL calculations.
+_BALANCE_HISTORY_FILE = Path(".checkpoints/balance_history.json")
+_INITIAL_BALANCE_FILE = Path(".checkpoints/initial_balance.json")  # legacy — migrated on first load
+
+
+def _load_balance_history() -> list:
+    """Load balance history, auto-migrating from the old single-snapshot file."""
+    if _BALANCE_HISTORY_FILE.exists():
+        try:
+            data = json.loads(_BALANCE_HISTORY_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            pass
+
+    # Migrate from the old single-snapshot file if it exists
+    seed: dict = {}
+    if _INITIAL_BALANCE_FILE.exists():
+        try:
+            seed = json.loads(_INITIAL_BALANCE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    entry = {
+        "balance":  float(seed.get("balance", config.ACCOUNT_BALANCE)),
+        "currency": seed.get("currency", config.ACCOUNT_CURRENCY),
+        "set_at":   seed.get("set_at", datetime.now(tz=timezone.utc).isoformat()),
+        "note":     "Initial funding",
+    }
+    history = [entry]
+    _save_balance_history(history)
+    logger.info("Balance history initialised: %.2f %s", entry["balance"], entry["currency"])
+    return history
+
+
+def _save_balance_history(history: list) -> None:
+    _BALANCE_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _BALANCE_HISTORY_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    tmp.replace(_BALANCE_HISTORY_FILE)
+
+
+def _get_initial_balance() -> tuple:
+    """Return (balance, set_at) from the most recent balance event."""
+    history = _load_balance_history()
+    latest  = history[-1]
+    return float(latest["balance"]), latest["set_at"]
+
 _CONFIG_MAP = {
     "risk_pct":           ("RISK_PERCENT",          float),
     "min_rr":             ("MIN_RR",                float),
@@ -373,9 +422,28 @@ class DashboardServer:
         @app.route("/api/stats")
         @require_auth
         def stats():
+            days = request.args.get("days", type=int)  # None = all time
+
+            g = self.journal.get_stats(days=days)
+
+            # Current balance is always all-time (cumulative)
+            all_closed              = [t for t in self.journal.get_all() if t["outcome"] != "OPEN"]
+            all_pnl                 = sum(t["pnl"] or 0 for t in all_closed)
+            initial_bal, bal_set_at = _get_initial_balance()
+            current_bal             = initial_bal + all_pnl
+            change_pct              = round((current_bal - initial_bal) / initial_bal * 100, 2) if initial_bal else 0.0
+
+            g["initial_balance"]    = round(initial_bal, 2)
+            g["current_balance"]    = round(current_bal, 2)
+            g["balance_change_pct"] = change_pct
+            g["balance_set_at"]     = bal_set_at
+            g["currency"]           = config.ACCOUNT_CURRENCY
+            g["drawdown_pct"]       = self.journal.get_drawdown(initial_bal, days=days)
+            g["period_days"]        = days
+
             return jsonify({
-                "global":    self.journal.get_stats(),
-                "by_symbol": self.journal.get_stats_by_symbol(),
+                "global":    g,
+                "by_symbol": self.journal.get_stats_by_symbol(days=days),
             })
 
         @app.route("/api/trades")
@@ -449,6 +517,38 @@ class DashboardServer:
             config.SYMBOLS.remove(sym)
             logger.info("Symbol removed via dashboard: %s", sym)
             return jsonify({"ok": True, "symbols": config.SYMBOLS})
+
+        # ── Balance history ──────────────────────────────────────────
+
+        @app.route("/api/balance-history", methods=["GET"])
+        @require_auth
+        def get_balance_history():
+            return jsonify({"history": _load_balance_history()})
+
+        @app.route("/api/balance-history", methods=["POST"])
+        @require_auth
+        def add_balance_event():
+            data = request.get_json(silent=True) or {}
+            try:
+                balance = float(data["balance"])
+                if balance <= 0:
+                    raise ValueError("must be positive")
+            except (KeyError, ValueError, TypeError) as exc:
+                return jsonify({"ok": False, "error": f"Invalid balance: {exc}"}), 400
+
+            note    = str(data.get("note", "")).strip() or "Balance updated"
+            history = _load_balance_history()
+            event   = {
+                "balance":  round(balance, 2),
+                "currency": config.ACCOUNT_CURRENCY,
+                "set_at":   datetime.now(tz=timezone.utc).isoformat(),
+                "note":     note,
+            }
+            history.append(event)
+            _save_balance_history(history)
+            logger.info("Balance history updated: %.2f %s — %s",
+                        balance, config.ACCOUNT_CURRENCY, note)
+            return jsonify({"ok": True, "history": history})
 
         # ── Log tail ────────────────────────────────────────────────
 

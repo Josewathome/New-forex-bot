@@ -29,8 +29,8 @@ MT5_SERVER = os.environ.get("MT5_SERVER")
 if not MT5_SERVER:
     raise RuntimeError("MT5_SERVER environment variable is not set.")
 ACCOUNT_NICKNAME = "Demojose"
-ACCOUNT_CURRENCY = "KES"
-ACCOUNT_BALANCE  = 30_000
+ACCOUNT_CURRENCY = os.environ.get("ACCOUNT_CURRENCY", "KES")
+ACCOUNT_BALANCE  = float(os.environ.get("ACCOUNT_BALANCE", "30000"))
 LEVERAGE         = "1:400"
 
 MT5_PATH = ""

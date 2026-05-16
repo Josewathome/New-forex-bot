@@ -93,15 +93,63 @@ class WeeklyBacktestRunner:
 
         logger.info("WeeklyBacktest: reports written → %s", report_path)
 
+        # ── Compute summary stats for email body ──────────────────────
+        closed    = [r for r in results if r.outcome != "OPEN"]
+        wins      = [r for r in closed if r.outcome in ("WIN_FULL", "WIN_PARTIAL")]
+        losses    = [r for r in closed if r.outcome == "LOSS"]
+        mc        = [r for r in closed if r.outcome == "MONITOR_CLOSE"]
+        total     = len(closed)
+        wr        = (len(wins) / total * 100) if total else 0.0
+        total_pnl = sum(r.pnl_usd for r in closed)
+        init_bal  = config.ACCOUNT_BALANCE
+        final_bal = init_bal + total_pnl
+
+        equity = init_bal
+        peak   = equity
+        max_dd = 0.0
+        for r in closed:
+            equity += r.pnl_usd
+            if equity > peak:
+                peak = equity
+            dd = (peak - equity) / peak * 100 if peak > 0 else 0
+            if dd > max_dd:
+                max_dd = dd
+
+        # Top 3 symbols by PnL
+        sym_pnl: Dict[str, float] = {}
+        for r in closed:
+            sym_pnl[r.trade.symbol] = sym_pnl.get(r.trade.symbol, 0.0) + r.pnl_usd
+        top_syms = sorted(sym_pnl.items(), key=lambda x: x[1], reverse=True)[:3]
+        top_lines = "  " + ",  ".join(
+            f"{s}: {p:+,.0f}" for s, p in top_syms
+        ) if top_syms else "  —"
+
+        ccy = config.ACCOUNT_CURRENCY
         subject = (
             f"Zone Bot Weekly Backtest — W{week_num:02d} "
             f"({start_str} to {end_str})"
         )
         body = (
-            f"Weekly backtest complete.\n\n"
-            f"Period  : {start_str} to {end_str}\n"
-            f"Symbols : {', '.join(config.SYMBOLS)}\n\n"
-            f"Report attached."
+            f"Zone Bot — Weekly Backtest Report  |  W{week_num:02d}\n"
+            f"{'=' * 52}\n\n"
+            f"Period          : {start_str}  to  {end_str}\n"
+            f"Symbols         : {', '.join(config.SYMBOLS)}\n\n"
+            f"PERFORMANCE SUMMARY\n"
+            f"  Initial Balance : {init_bal:>12,.2f} {ccy}\n"
+            f"  Final Balance   : {final_bal:>12,.2f} {ccy}\n"
+            f"  Total PnL       : {total_pnl:>+12,.2f} {ccy}\n"
+            f"  Max Drawdown    : {max_dd:>11.1f}%\n\n"
+            f"TRADES\n"
+            f"  Total   : {total}\n"
+            f"  Wins    : {len(wins)}  "
+            f"(Full={sum(1 for r in wins if r.outcome=='WIN_FULL')}  "
+            f"Partial={sum(1 for r in wins if r.outcome=='WIN_PARTIAL')})\n"
+            f"  Losses  : {len(losses)}\n"
+            f"  Monitor Close : {len(mc)}\n"
+            f"  Win Rate      : {wr:.1f}%\n\n"
+            f"TOP SYMBOLS BY PnL\n"
+            f"{top_lines}\n\n"
+            f"Full trade history attached.\n"
         )
         self.email.send_report(subject, body, str(report_path))
 
@@ -151,14 +199,17 @@ class WeeklyBacktestRunner:
         mc      = [r for r in closed if r.outcome == "MONITOR_CLOSE"]
         total   = len(closed)
         wr      = (len(wins) / total * 100) if total else 0.0
-        total_pnl = sum(getattr(r, "pnl", 0) or 0 for r in closed)
+        total_pnl = sum(r.pnl_usd for r in closed)
+
+        initial_balance = config.ACCOUNT_BALANCE
+        final_balance   = initial_balance + total_pnl
 
         # Max drawdown (equity curve)
-        equity  = config.ACCOUNT_BALANCE
+        equity  = initial_balance
         peak    = equity
         max_dd  = 0.0
         for r in closed:
-            equity += getattr(r, "pnl", 0) or 0
+            equity += r.pnl_usd
             if equity > peak:
                 peak = equity
             dd = (peak - equity) / peak * 100 if peak > 0 else 0
@@ -175,26 +226,28 @@ class WeeklyBacktestRunner:
             sep,
             "",
             "  PERFORMANCE SUMMARY",
+            f"  Initial Balance : {initial_balance:,.2f} {config.ACCOUNT_CURRENCY}",
+            f"  Final Balance   : {final_balance:,.2f} {config.ACCOUNT_CURRENCY}",
             f"  Total Trades   : {total}",
             f"  Wins           : {len(wins)}  (Full={sum(1 for r in wins if r.outcome=='WIN_FULL')}  Partial={sum(1 for r in wins if r.outcome=='WIN_PARTIAL')})",
             f"  Losses         : {len(losses)}",
             f"  Monitor Close  : {len(mc)}",
             f"  Win Rate       : {wr:.1f}%",
-            f"  Total PnL      : {total_pnl:+.2f} {config.ACCOUNT_CURRENCY}",
+            f"  Total PnL      : {total_pnl:+,.2f} {config.ACCOUNT_CURRENCY}",
             f"  Max Drawdown   : {max_dd:.1f}%",
             "",
             "  PER-SYMBOL BREAKDOWN",
         ]
 
-        symbols = sorted({getattr(r, "symbol", "?") for r in closed})
+        symbols = sorted({r.trade.symbol for r in closed})
         for sym in symbols:
-            sym_t   = [r for r in closed if getattr(r, "symbol", "") == sym]
+            sym_t   = [r for r in closed if r.trade.symbol == sym]
             sym_w   = [r for r in sym_t  if r.outcome in ("WIN_FULL", "WIN_PARTIAL")]
-            sym_pnl = sum(getattr(r, "pnl", 0) or 0 for r in sym_t)
+            sym_pnl = sum(r.pnl_usd for r in sym_t)
             sym_wr  = (len(sym_w) / len(sym_t) * 100) if sym_t else 0
             lines.append(
                 f"  {sym:8s}  trades={len(sym_t):3d}  wins={len(sym_w):3d}"
-                f"  wr={sym_wr:5.1f}%  pnl={sym_pnl:+.2f}"
+                f"  wr={sym_wr:5.1f}%  pnl={sym_pnl:+,.2f}"
             )
 
         lines += [
@@ -202,10 +255,11 @@ class WeeklyBacktestRunner:
             "  TRADE HISTORY (last 30)",
         ]
         for r in closed[-30:]:
-            pnl_str = f"{getattr(r, 'pnl', 0):+.2f}" if getattr(r, "pnl", None) is not None else "?"
+            sym       = r.trade.symbol
+            direction = r.trade.direction.value if hasattr(r.trade.direction, "value") else str(r.trade.direction)
+            pnl_str   = f"{r.pnl_usd:+,.2f}"
             lines.append(
-                f"  {getattr(r,'symbol','?'):8s}  {getattr(r,'direction','?').value if hasattr(getattr(r,'direction','?'),'value') else '?':5s}"
-                f"  {r.outcome:14s}  pnl={pnl_str}"
+                f"  {sym:8s}  {direction:5s}  {r.outcome:14s}  pnl={pnl_str}"
             )
 
         lines += ["", sep]

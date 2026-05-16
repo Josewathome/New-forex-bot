@@ -9,7 +9,7 @@ Storage: .cache/trade_journal.json
 from __future__ import annotations
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -83,31 +83,70 @@ class TradeJournal:
     def get_by_symbol(self, symbol: str) -> List[Dict[str, Any]]:
         return [t for t in self._trades if t.get("symbol") == symbol]
 
-    def get_stats(self, trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    def get_stats(
+        self,
+        trades: Optional[List[Dict[str, Any]]] = None,
+        days:   Optional[int] = None,
+    ) -> Dict[str, Any]:
         if trades is None:
-            trades = [t for t in self._trades if t["outcome"] != "OPEN"]
-        if not trades:
-            return {
-                "total": 0, "wins": 0, "losses": 0,
-                "win_rate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0,
-            }
-        wins    = [t for t in trades if t["outcome"] in ("WIN_FULL", "WIN_PARTIAL")]
-        losses  = [t for t in trades if t["outcome"] == "LOSS"]
-        total_pnl = sum(t["pnl"] or 0 for t in trades)
+            closed = [t for t in self._trades if t["outcome"] != "OPEN"]
+            if days is not None:
+                cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
+                closed = [t for t in closed if (t.get("closed_at") or "") >= cutoff]
+        else:
+            closed = [t for t in trades if t["outcome"] != "OPEN"]
+
+        if not closed:
+            return {"total": 0, "wins": 0, "losses": 0,
+                    "win_rate": 0.0, "total_pnl": 0.0, "avg_pnl": 0.0}
+        wins      = [t for t in closed if t["outcome"] in ("WIN_FULL", "WIN_PARTIAL")]
+        losses    = [t for t in closed if t["outcome"] == "LOSS"]
+        total_pnl = sum(t["pnl"] or 0 for t in closed)
         return {
-            "total":     len(trades),
+            "total":     len(closed),
             "wins":      len(wins),
             "losses":    len(losses),
-            "win_rate":  round(len(wins) / len(trades) * 100, 1),
+            "win_rate":  round(len(wins) / len(closed) * 100, 1),
             "total_pnl": round(total_pnl, 2),
-            "avg_pnl":   round(total_pnl / len(trades), 2),
+            "avg_pnl":   round(total_pnl / len(closed), 2),
         }
 
-    def get_stats_by_symbol(self) -> Dict[str, Dict[str, Any]]:
-        closed  = [t for t in self._trades if t["outcome"] != "OPEN"]
-        symbols = sorted({t["symbol"] for t in closed})
+    def get_drawdown(self, initial_balance: float, days: Optional[int] = None) -> float:
+        """Return max drawdown % for the given period (all-time if days is None)."""
+        all_closed = sorted(
+            [t for t in self._trades if t["outcome"] != "OPEN"],
+            key=lambda t: t.get("closed_at") or "",
+        )
+        if days is not None:
+            cutoff     = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
+            pre_trades = [t for t in all_closed if (t.get("closed_at") or "") < cutoff]
+            period     = [t for t in all_closed if (t.get("closed_at") or "") >= cutoff]
+            equity     = initial_balance + sum(t["pnl"] or 0 for t in pre_trades)
+        else:
+            period = all_closed
+            equity = initial_balance
+
+        peak   = equity
+        max_dd = 0.0
+        for t in period:
+            equity += t["pnl"] or 0
+            if equity > peak:
+                peak = equity
+            if peak > 0:
+                dd = (peak - equity) / peak * 100
+                if dd > max_dd:
+                    max_dd = dd
+        return round(max_dd, 2)
+
+    def get_stats_by_symbol(self, days: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
+        all_closed = [t for t in self._trades if t["outcome"] != "OPEN"]
+        if days is not None:
+            cutoff     = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
+            all_closed = [t for t in all_closed if (t.get("closed_at") or "") >= cutoff]
+        symbols = sorted({t["symbol"] for t in all_closed})
         return {
-            sym: self.get_stats(self.get_by_symbol(sym)) for sym in symbols
+            sym: self.get_stats([t for t in all_closed if t["symbol"] == sym])
+            for sym in symbols
         }
 
     # ── Persistence ──────────────────────────────────────────────────
