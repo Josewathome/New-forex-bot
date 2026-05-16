@@ -18,7 +18,7 @@ import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Union
 
 import src.config as config
 
@@ -51,17 +51,26 @@ class EmailService:
 
     def send_report(
         self,
-        subject:         str,
-        body:            str,
-        attachment_path: Optional[str] = None,
+        subject:          str,
+        body:             str,
+        attachment_path:  Union[str, List[str], None] = None,
     ) -> bool:
         """
-        Send an email, optionally with a text file attachment.
+        Send an email with one or more text file attachments.
+        attachment_path can be a single path string or a list of path strings.
         Returns True on success, False on failure or when disabled.
         """
         if not self.enabled:
             logger.info("EmailService: disabled — skipping send of '%s'.", subject)
             return False
+
+        # Normalise to a list
+        if attachment_path is None:
+            paths: List[str] = []
+        elif isinstance(attachment_path, str):
+            paths = [attachment_path]
+        else:
+            paths = list(attachment_path)
 
         try:
             msg = MIMEMultipart()
@@ -71,10 +80,10 @@ class EmailService:
 
             msg.attach(MIMEText(body, "plain", "utf-8"))
 
-            if attachment_path:
-                p = Path(attachment_path)
+            for ap in paths:
+                p = Path(ap)
                 if p.exists():
-                    content = p.read_text(encoding="utf-8")
+                    content    = p.read_text(encoding="utf-8")
                     attachment = MIMEText(content, "plain", "utf-8")
                     attachment.add_header(
                         "Content-Disposition",
@@ -82,7 +91,7 @@ class EmailService:
                     )
                     msg.attach(attachment)
                 else:
-                    logger.warning("EmailService: attachment not found: %s", attachment_path)
+                    logger.warning("EmailService: attachment not found: %s", ap)
 
             with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
                 server.ehlo()

@@ -33,6 +33,11 @@ ACCOUNT_CURRENCY = os.environ.get("ACCOUNT_CURRENCY", "KES")
 ACCOUNT_BALANCE  = float(os.environ.get("ACCOUNT_BALANCE", "30000"))
 LEVERAGE         = "1:400"
 
+# Starting balance used for every backtest simulation.
+# Defaults to ACCOUNT_BALANCE but can be set independently so you can test
+# at a different account size without touching your live balance figure.
+BACKTEST_INITIAL_BALANCE = float(os.environ.get("BACKTEST_INITIAL_BALANCE", str(ACCOUNT_BALANCE)))
+
 MT5_PATH = ""
 
 # ── News API ───────────────────────────────────────────────────────
@@ -348,6 +353,11 @@ TRADING_SESSIONS = {
     "LONDON":   {"start": 8,  "end": 16},
     "NEW_YORK":  {"start": 13, "end": 21},
 }
+
+# Minutes to wait after a session opens before placing trades, and
+# minutes before a session closes to stop placing trades.
+# Analysis and zone mapping continue unaffected during this buffer.
+SESSION_BUFFER_MIN: int = 60
 
 LOOP_INTERVAL_SECONDS = 60
 

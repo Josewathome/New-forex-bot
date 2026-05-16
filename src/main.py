@@ -232,7 +232,7 @@ def run_live() -> None:
     if getattr(config, "DASHBOARD_ENABLED", True):
         try:
             from src.api.server import DashboardServer
-            DashboardServer(journal, checkpoint).start()
+            DashboardServer(journal, checkpoint, weekly_bt).start()
         except Exception as e:
             logger.warning("Dashboard failed to start: %s", e)
 
@@ -475,7 +475,8 @@ def run_backtest(
     else:
         bt_news = bt_mt5
     comm  = _commission_in_account_ccy(config.COMMISSION_PER_LOT)
-    bt    = Backtester(news_client=bt_news, account=config.ACCOUNT_BALANCE,
+    bt_bal = getattr(config, "BACKTEST_INITIAL_BALANCE", config.ACCOUNT_BALANCE)
+    bt    = Backtester(news_client=bt_news, account=bt_bal,
                        risk_pct=config.RISK_PERCENT, commission=comm,
                        currency=config.ACCOUNT_CURRENCY)
     diag    = DiagnosticsCollector()

@@ -157,6 +157,14 @@
     </div>
   </div>
 
+  <!-- Manual backtest trigger -->
+  <div style="display:flex;justify-content:flex-end;margin-bottom:16px">
+    <button class="btn btn-ghost btn-sm" onclick="runWeeklyBacktest()" type="button"
+      title="Fetch candle data from MT5, generate report files and email them now">
+      ▶ Run Weekly Backtest Now
+    </button>
+  </div>
+
   <!-- Period filter + period stats -->
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
     <div style="font-size:13px;font-weight:600;color:var(--muted)">PERIOD STATS</div>
@@ -274,6 +282,12 @@
       <div class="form-group"><label>ATR Cost Threshold</label><input type="number" id="cfg-atr_cost_threshold" step="0.01" min="0.01" max="1"/></div>
       <div class="form-group"><label>Loop Interval (seconds)</label><input type="number" id="cfg-loop_interval" step="5" min="10"/></div>
       <div class="form-group"><label>Breakeven RR Trigger</label><input type="number" id="cfg-breakeven_rr" step="0.1" min="0.5"/></div>
+      <div class="form-group">
+        <label>Backtest Initial Balance</label>
+        <input type="number" id="cfg-backtest_balance" step="1000" min="1"
+               title="Starting balance used for every backtest simulation. Set this to the amount you want to test with — it does not affect your live account."/>
+        <span style="font-size:11px;color:var(--muted);margin-top:3px">Used by weekly &amp; manual backtests only — not your live balance.</span>
+      </div>
     </div>
     <div class="form-actions">
       <button class="btn btn-primary" onclick="saveConfig()">Save & Apply</button>
@@ -613,7 +627,7 @@ async function loadConfig() {
       risk_pct:'cfg-risk_pct', min_rr:'cfg-min_rr', max_open_trades:'cfg-max_open_trades',
       atr_cost_threshold:'cfg-atr_cost_threshold', loop_interval:'cfg-loop_interval',
       tiered_tp1_ratio:'cfg-tiered_tp1_ratio', tiered_tp2_ratio:'cfg-tiered_tp2_ratio',
-      breakeven_rr:'cfg-breakeven_rr',
+      breakeven_rr:'cfg-breakeven_rr', backtest_balance:'cfg-backtest_balance',
     };
     for(const[k,id] of Object.entries(map)){
       const el = document.getElementById(id);
@@ -635,6 +649,7 @@ async function saveConfig() {
     tiered_tp1_ratio:    parseFloat(document.getElementById('cfg-tiered_tp1_ratio')?.value),
     tiered_tp2_ratio:    parseFloat(document.getElementById('cfg-tiered_tp2_ratio')?.value),
     breakeven_rr:        parseFloat(document.getElementById('cfg-breakeven_rr')?.value),
+    backtest_balance:    parseFloat(document.getElementById('cfg-backtest_balance')?.value),
   };
   try {
     const r = await apiFetch('/api/config',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(fields)});
@@ -666,6 +681,32 @@ async function rotateSecret() {
     localStorage.removeItem('zb_refresh');
     showLogin();
   } catch(e) { alert('Error: ' + e); }
+}
+
+// ── Weekly backtest manual trigger ────────────────────────────────────
+async function runWeeklyBacktest() {
+  const ok = confirm(
+    'Run the weekly backtest now?\n\n' +
+    'This will:\n' +
+    '  • Fetch the last 2 months of candle data from MT5\n' +
+    '  • Generate the report + diagnostics files\n' +
+    '  • Send both files to your email\n\n' +
+    'It runs in the background and takes a few minutes.\n' +
+    'Watch the Logs tab for progress.'
+  );
+  if (!ok) return;
+
+  try {
+    const r = await apiFetch('/api/run-weekly-backtest', {method: 'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      alert('Backtest started!\n\n' + d.message);
+    } else {
+      alert('Error: ' + (d.error || 'Unknown error'));
+    }
+  } catch(e) {
+    if (e.message !== 'unauthenticated') alert('Error: ' + e);
+  }
 }
 
 // ── Balance history ───────────────────────────────────────────────────

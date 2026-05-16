@@ -108,7 +108,8 @@ _CONFIG_MAP = {
     "tiered_tp_enabled":  ("TIERED_TP_ENABLED",     bool),
     "tiered_tp1_ratio":   ("TIERED_TP1_RATIO",      float),
     "tiered_tp2_ratio":   ("TIERED_TP2_RATIO",      float),
-    "breakeven_rr":       ("BREAKEVEN_RR_TRIGGER",  float),
+    "breakeven_rr":          ("BREAKEVEN_RR_TRIGGER",       float),
+    "backtest_balance":      ("BACKTEST_INITIAL_BALANCE",   float),
 }
 
 
@@ -270,9 +271,10 @@ class JWTManager:
 
 class DashboardServer:
 
-    def __init__(self, trade_journal, checkpoint_service) -> None:
+    def __init__(self, trade_journal, checkpoint_service, weekly_runner=None) -> None:
         self.journal    = trade_journal
         self.checkpoint = checkpoint_service
+        self._weekly    = weekly_runner
         self._thread: Optional[threading.Thread] = None
         self._jwt       = JWTManager()
         self._password  = self._resolve_password()
@@ -469,6 +471,7 @@ class DashboardServer:
                 "tiered_tp2_ratio":    config.TIERED_TP2_RATIO,
                 "monitor_enabled":     config.MONITOR_ENABLED,
                 "breakeven_rr":        config.BREAKEVEN_RR_TRIGGER,
+                "backtest_balance":    config.BACKTEST_INITIAL_BALANCE,
             })
 
         @app.route("/api/config", methods=["PATCH"])
@@ -549,6 +552,25 @@ class DashboardServer:
             logger.info("Balance history updated: %.2f %s — %s",
                         balance, config.ACCOUNT_CURRENCY, note)
             return jsonify({"ok": True, "history": history})
+
+        # ── Manual weekly backtest trigger ──────────────────────────
+
+        @app.route("/api/run-weekly-backtest", methods=["POST"])
+        @require_auth
+        def run_weekly_backtest():
+            if not self._weekly:
+                return jsonify({"ok": False, "error": "Weekly runner not wired up"}), 503
+            import threading
+            threading.Thread(
+                target=self._weekly.run,
+                daemon=True,
+                name="ManualWeeklyBT",
+            ).start()
+            logger.info("Dashboard: manual weekly backtest triggered.")
+            return jsonify({
+                "ok": True,
+                "message": "Backtest running in background. Watch the Logs tab — email arrives when done.",
+            })
 
         # ── Log tail ────────────────────────────────────────────────
 

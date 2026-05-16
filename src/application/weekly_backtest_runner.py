@@ -62,9 +62,10 @@ class WeeklyBacktestRunner:
             news = wbr_mt5
         comm  = self._commission_in_account_ccy(config.COMMISSION_PER_LOT)
 
+        bt_balance = getattr(config, "BACKTEST_INITIAL_BALANCE", config.ACCOUNT_BALANCE)
         bt = Backtester(
             news_client=news,
-            account=    config.ACCOUNT_BALANCE,
+            account=    bt_balance,
             risk_pct=   config.RISK_PERCENT,
             commission= comm,
             currency=   config.ACCOUNT_CURRENCY,
@@ -101,7 +102,7 @@ class WeeklyBacktestRunner:
         total     = len(closed)
         wr        = (len(wins) / total * 100) if total else 0.0
         total_pnl = sum(r.pnl_usd for r in closed)
-        init_bal  = config.ACCOUNT_BALANCE
+        init_bal  = getattr(config, "BACKTEST_INITIAL_BALANCE", config.ACCOUNT_BALANCE)
         final_bal = init_bal + total_pnl
 
         equity = init_bal
@@ -151,7 +152,7 @@ class WeeklyBacktestRunner:
             f"{top_lines}\n\n"
             f"Full trade history attached.\n"
         )
-        self.email.send_report(subject, body, str(report_path))
+        self.email.send_report(subject, body, [str(report_path), str(diag_path)])
 
     # ── Data fetch ───────────────────────────────────────────────────
 
@@ -201,7 +202,7 @@ class WeeklyBacktestRunner:
         wr      = (len(wins) / total * 100) if total else 0.0
         total_pnl = sum(r.pnl_usd for r in closed)
 
-        initial_balance = config.ACCOUNT_BALANCE
+        initial_balance = getattr(config, "BACKTEST_INITIAL_BALANCE", config.ACCOUNT_BALANCE)
         final_balance   = initial_balance + total_pnl
 
         # Max drawdown (equity curve)

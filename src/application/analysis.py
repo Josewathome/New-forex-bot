@@ -76,15 +76,24 @@ def calculate_zone_buffer(atr_price: float, buffer_pct: Optional[float] = None) 
 
 def is_in_trading_session(dt: datetime) -> bool:
     """
-    Return True if *dt* (UTC) falls within any configured trading session.
+    Return True if *dt* (UTC) is within an active trading window.
 
-    Sessions are defined in config.TRADING_SESSIONS as {start_hour, end_hour}
-    pairs (inclusive start, exclusive end).  Trades outside these windows are
-    filtered out to avoid Asian-session chop and low-liquidity dead zones.
+    Rules:
+    - Weekends (Saturday=5, Sunday=6) are always blocked — no live market.
+    - Each session in config.TRADING_SESSIONS has a 1-hour entry buffer after
+      open and a 1-hour exit buffer before close (SESSION_BUFFER_MIN).
+      Analysis and zone mapping are unaffected; only trade execution is gated.
     """
-    hour = dt.hour
+    if dt.weekday() >= 5:  # Saturday or Sunday
+        return False
+
+    buffer_min = getattr(config, "SESSION_BUFFER_MIN", 60)
+    # Convert dt to fractional minutes-since-midnight for sub-hour precision.
+    now_min = dt.hour * 60 + dt.minute
     for session in config.TRADING_SESSIONS.values():
-        if session["start"] <= hour < session["end"]:
+        open_min  = session["start"] * 60 + buffer_min   # e.g. 08:00 + 60 = 09:00
+        close_min = session["end"]   * 60 - buffer_min   # e.g. 16:00 - 60 = 15:00
+        if open_min <= now_min < close_min:
             return True
     return False
 
