@@ -271,10 +271,11 @@ class JWTManager:
 
 class DashboardServer:
 
-    def __init__(self, trade_journal, checkpoint_service, weekly_runner=None) -> None:
-        self.journal    = trade_journal
-        self.checkpoint = checkpoint_service
-        self._weekly    = weekly_runner
+    def __init__(self, trade_journal, checkpoint_service, weekly_runner=None, balance_fn=None) -> None:
+        self.journal     = trade_journal
+        self.checkpoint  = checkpoint_service
+        self._weekly     = weekly_runner
+        self._balance_fn = balance_fn   # callable() -> float | None, fetches live MT5 balance
         self._thread: Optional[threading.Thread] = None
         self._jwt       = JWTManager()
         self._password  = self._resolve_password()
@@ -428,12 +429,18 @@ class DashboardServer:
 
             g = self.journal.get_stats(days=days)
 
-            # Current balance is always all-time (cumulative)
-            all_closed              = [t for t in self.journal.get_all() if t["outcome"] != "OPEN"]
-            all_pnl                 = sum(t["pnl"] or 0 for t in all_closed)
+            # Current balance: use live MT5 value if available, else fall back to journal estimate
             initial_bal, bal_set_at = _get_initial_balance()
-            current_bal             = initial_bal + all_pnl
-            change_pct              = round((current_bal - initial_bal) / initial_bal * 100, 2) if initial_bal else 0.0
+            if self._balance_fn:
+                try:
+                    current_bal = self._balance_fn() or initial_bal
+                except Exception:
+                    all_pnl     = sum(t["pnl"] or 0 for t in self.journal.get_all() if t["outcome"] != "OPEN")
+                    current_bal = initial_bal + all_pnl
+            else:
+                all_pnl     = sum(t["pnl"] or 0 for t in self.journal.get_all() if t["outcome"] != "OPEN")
+                current_bal = initial_bal + all_pnl
+            change_pct = round((current_bal - initial_bal) / initial_bal * 100, 2) if initial_bal else 0.0
 
             g["initial_balance"]    = round(initial_bal, 2)
             g["current_balance"]    = round(current_bal, 2)

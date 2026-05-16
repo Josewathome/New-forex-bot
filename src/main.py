@@ -232,7 +232,10 @@ def run_live() -> None:
     if getattr(config, "DASHBOARD_ENABLED", True):
         try:
             from src.api.server import DashboardServer
-            DashboardServer(journal, checkpoint, weekly_bt).start()
+            DashboardServer(
+                journal, checkpoint, weekly_bt,
+                balance_fn=lambda: (gw.get_account_info() or {}).get("balance"),
+            ).start()
         except Exception as e:
             logger.warning("Dashboard failed to start: %s", e)
 
