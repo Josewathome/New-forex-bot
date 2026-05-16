@@ -165,7 +165,7 @@ class ForexNewsClient(INewsRepository):
         cache_key = f"ff_{date_str}_{'_'.join(sorted(currencies))}"
         cached    = self._cache.get(cache_key)
         if cached is not None:
-            logger.debug("FF events from cache (%d events)", len(cached))
+            logger.info("ForexFactory: %d events from cache for %s", len(cached), date_str)
             return [self._dict_to_event(e) for e in cached]
 
         # Build params as list of tuples so requests sends
