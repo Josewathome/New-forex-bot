@@ -27,6 +27,8 @@ class TradeJournal:
 
     # ── Write ────────────────────────────────────────────────────────
 
+    _MAX_CLOSED = 500   # keep last N closed trades; all OPEN trades are always kept
+
     def record_open(
         self,
         ticket:     int,
@@ -151,12 +153,21 @@ class TradeJournal:
 
     # ── Persistence ──────────────────────────────────────────────────
 
+    def _trim_closed(self) -> None:
+        """Keep all OPEN trades + last _MAX_CLOSED closed trades."""
+        open_trades   = [t for t in self._trades if t["outcome"] == "OPEN"]
+        closed_trades = [t for t in self._trades if t["outcome"] != "OPEN"]
+        if len(closed_trades) > self._MAX_CLOSED:
+            closed_trades = closed_trades[-self._MAX_CLOSED:]
+            self._trades = open_trades + closed_trades
+
     def _save(self) -> None:
         try:
+            self._trim_closed()
             tmp = self.path.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(self._trades, fh, indent=2, default=str)
-            tmp.rename(self.path)
+            tmp.replace(self.path)   # atomic on Windows; rename() can fail cross-drive
         except Exception as exc:
             logger.error("TradeJournal save failed: %s", exc)
 

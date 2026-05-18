@@ -27,6 +27,7 @@ from src.domain.value_objects import BrokerCost, PipCalculator, RiskParameters
 from src.application.analysis import (
     ZoneMapper, atr,
     find_m5_choch_signal,
+    find_m1_predictive_signal,
     find_h4_bias,
     find_d1_bias,
     compute_h4_equilibrium,
@@ -46,6 +47,8 @@ from src.application.analysis import (
     evaluate_zone_health,
     find_opposing_opportunity,
     find_htf_zone_confluence,
+    find_m30_zone_confluence,
+    find_m5_zone_confluence,
 )
 from src.application.diagnostics import DiagnosticsCollector
 from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl, find_runner_protection_sl
@@ -92,20 +95,22 @@ class Backtester:
 
     def __init__(
         self,
-        news_client:  ForexNewsClient,
-        account:      float,
-        risk_pct:     float,
-        commission:   float,
-        currency:     str,
-        tick_values:  Optional[Dict[str, float]] = None,
+        news_client:     ForexNewsClient,
+        account:         float,
+        risk_pct:        float,
+        commission:      float,
+        currency:        str,
+        tick_values:     Optional[Dict[str, float]] = None,
+        commission_map:  Optional[Dict[str, float]] = None,
     ) -> None:
-        self._news        = news_client
-        self._account     = account
-        self._risk_pct    = risk_pct
-        self._commission  = commission
-        self._currency    = currency
-        self._mapper      = ZoneMapper()
-        self._tick_values = tick_values or {}
+        self._news           = news_client
+        self._account        = account
+        self._risk_pct       = risk_pct
+        self._commission     = commission
+        self._currency       = currency
+        self._mapper         = ZoneMapper()
+        self._tick_values    = tick_values or {}
+        self._commission_map = commission_map or {}
         # Streak protection: track consecutive net-negative losses per symbol.
         self._loss_streak:    Dict[str, int]      = {}
         self._streak_pause:   Dict[str, datetime] = {}
@@ -154,13 +159,14 @@ class Backtester:
 
         sym_data: Dict[str, dict] = {}
         for sym, td in candle_data.items():
-            h1 = td.get(Timeframe.H1, [])
-            m5 = td.get(Timeframe.M5, []) or td.get(Timeframe.M1, [])
-            m1 = td.get(Timeframe.M1, [])
-            h4 = td.get(Timeframe.H4, [])
-            d1 = td.get(Timeframe.D1, [])
+            h1  = td.get(Timeframe.H1, [])
+            m5  = td.get(Timeframe.M5, []) or td.get(Timeframe.M1, [])
+            m1  = td.get(Timeframe.M1, [])
+            h4  = td.get(Timeframe.H4, [])
+            d1  = td.get(Timeframe.D1, [])
+            m30 = td.get(Timeframe.M30, [])
             if h1 and m5:
-                sym_data[sym] = {"h1": h1, "m5": m5, "m1": m1, "h4": h4, "d1": d1}
+                sym_data[sym] = {"h1": h1, "m5": m5, "m1": m1, "h4": h4, "d1": d1, "m30": m30}
 
         H1W = 100
         s_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -178,6 +184,7 @@ class Backtester:
         for bar_time, sym, h1_idx in all_evts:
             d = sym_data[sym]
             r = self._process_h1_bar(sym, d["h1"], d["m5"], d["m1"], d["h4"], d["d1"],
+                                     d.get("m30", []),
                                      h1_idx, no_trade_windows, equity, diag)
             if r:
                 equity += r.pnl_usd
@@ -187,7 +194,7 @@ class Backtester:
         self.analyze_trade_features(results)
         return results
 
-    def _process_h1_bar(self, symbol, h1, m5, m1, h4, d1,
+    def _process_h1_bar(self, symbol, h1, m5, m1, h4, d1, m30,
                         h1_idx, ntw, equity, diag):
         digits = config.SYMBOL_DIGITS.get(symbol, 5)
         tv = self._get_tick_value(symbol)
@@ -243,11 +250,29 @@ class Backtester:
             if diag: diag.record_rejection(symbol, "outside_session")
             return None
 
+        # Per-symbol commission: use commission_map when available (XAUUSD ≠ forex pairs).
+        sym_commission = self._commission_map.get(symbol, self._commission)
         bc = BrokerCost(
             spread_pips=FALLBACK_SPREAD_PIPS.get(symbol, DEFAULT_FALLBACK_PIPS),
-            commission_usd=self._commission,
+            commission_usd=sym_commission,
             tick_value=tv,
         )
+
+        # ── M30 zone map (historical, for confluence scoring) ─────────────
+        # Use M30 bars in the 30-bar window before bar_time.
+        m30_lookback = 60
+        m30_zone_win = [c for c in m30 if c.time < bar_time][-m30_lookback:]
+        m30_zones_bt, _ = (self._mapper.map_zones(m30_zone_win, symbol, Timeframe.M30)
+                           if len(m30_zone_win) >= 10 else ([], None))
+
+        # ── M5 zone map (historical, for confluence scoring) ──────────────
+        # Use the most recent M5 bars before bar_time (not the future 6h window).
+        m5_zone_win = [c for c in m5 if c.time < bar_time][-60:]
+        m5_zones_bt, _ = (self._mapper.map_zones(m5_zone_win, symbol, Timeframe.M5)
+                          if len(m5_zone_win) >= 10 else ([], None))
+
+        # M1 bars in the same 6-hour window as m5_win (for M1 predictive signal).
+        m1_win = [c for c in m1 if bar_time <= c.time < bar_time + timedelta(hours=6)]
 
         sym_min_score = config.SYMBOL_MIN_SCORE.get(symbol, config.SETUP_SCORE_THRESHOLD)
 
@@ -263,8 +288,13 @@ class Backtester:
                 if diag: diag.record_rejection(symbol, "counter_d1")
                 continue
 
-            h4_confluent = find_htf_zone_confluence(zone, h4_zones)
-            setup_score = score_setup(zone.direction, h4_bias, bar_px, h4_eq, d1_bias, h4_confluent)
+            h4_confluent  = find_htf_zone_confluence(zone, h4_zones)
+            m30_confluent = find_m30_zone_confluence(zone, m30_zones_bt)
+            m5_confluent  = find_m5_zone_confluence(zone, m5_zones_bt)
+            setup_score = score_setup(
+                zone.direction, h4_bias, bar_px, h4_eq, d1_bias,
+                h4_confluent, m30_confluent, m5_confluent,
+            )
             if setup_score < sym_min_score:
                 if diag: diag.record_rejection(symbol, "below_score_threshold")
                 continue
@@ -297,12 +327,30 @@ class Backtester:
                     if diag: diag.record_rejection(symbol, reject_reason)
                     continue
             else:
-                signal = find_m5_choch_signal(
-                    m5_candles=m5_win, zone=zone, pip_calc=pip_calc,
-                    spread_pips=bc.spread_pips, liquidity_pool=pool,
-                    atr_price=h1_atr, diag=diag,
-                    zone_buffer=zbuf, min_rr_override=min_rr,
-                )
+                # ── M1 predictive signal (primary) ────────────────
+                signal = None
+                if m1_win:
+                    signal = find_m1_predictive_signal(
+                        m1_candles=m1_win,
+                        zone=zone,
+                        pip_calc=pip_calc,
+                        spread_pips=bc.spread_pips,
+                        liquidity_pool=pool,
+                        current_m5=m5_win[0] if m5_win else None,
+                        atr_price=h1_atr,
+                        zone_buffer=zbuf,
+                        min_rr_override=min_rr,
+                        m30_zones=m30_zones_bt,
+                        m5_candles=m5_win,
+                    )
+                # ── M5 ChoCh (fallback) ───────────────────────────
+                if signal is None:
+                    signal = find_m5_choch_signal(
+                        m5_candles=m5_win, zone=zone, pip_calc=pip_calc,
+                        spread_pips=bc.spread_pips, liquidity_pool=pool,
+                        atr_price=h1_atr, diag=diag,
+                        zone_buffer=zbuf, min_rr_override=min_rr,
+                    )
                 if signal is None:
                     continue
 
@@ -345,12 +393,13 @@ class Backtester:
             tp2_price = (signal.entry_price + tp2_ratio * abs(signal.entry_price - signal.stop_loss)
                          if signal.direction == Direction.BULLISH
                          else signal.entry_price - tp2_ratio * abs(signal.entry_price - signal.stop_loss))
-            # Clamp TP2 to the liquidity pool.  When TP2 ratio pushes beyond
+            # Clamp TP2 to the liquidity pool.  When TP2 ratio pushes BEYOND
             # the pool, MT5's full take_profit fires first — the partial close
             # never triggers.  Skip TP2 so the runner runs straight to the pool.
-            if signal.direction == Direction.BULLISH and tp2_price >= signal.take_profit:
+            # Use strict > / < so that TP2 == pool is still allowed to fire.
+            if signal.direction == Direction.BULLISH and tp2_price > signal.take_profit:
                 tp2_price = None
-            elif signal.direction == Direction.BEARISH and tp2_price <= signal.take_profit:
+            elif signal.direction == Direction.BEARISH and tp2_price < signal.take_profit:
                 tp2_price = None
 
             # Position size.
@@ -400,7 +449,7 @@ class Backtester:
                 pip_calc=pip_calc, zones=zones, monitor=monitor,
                 tp1_price=tp1_price, tp2_price=tp2_price,
                 trade_score=trade_score, tp1_ratio=tp1_ratio, tp2_ratio=tp2_ratio,
-                grade=grade,
+                grade=grade, commission=sym_commission,
             )
 
             if diag:
@@ -432,7 +481,7 @@ class Backtester:
                 take_profit=signal.take_profit, lot_size=lot,
                 status=TradeStatus.CLOSED, created_at=signal.created_at,
                 closed_at=meta.get("closed_at"), pnl=pnl,
-                commission=self._commission * lot,
+                commission=sym_commission * lot,
                 news_affected=news_affected, slippage_pips=slippage_pips,
                 mfe_price=meta.get("mfe_price"),
                 mfe_pips=meta.get("mfe_pips"),
@@ -518,6 +567,7 @@ class Backtester:
         tp1_ratio: float = 1.8,
         tp2_ratio: float = 3.5,
         grade: str = "C",
+        commission: Optional[float] = None,
     ):
         # When BACKTEST_USE_M5_ONLY=True, always simulate on M5 regardless of M1
         # availability.  MT5 retains M1 for ~60 days, giving 31.5% coverage on a
@@ -547,9 +597,10 @@ class Backtester:
 
         sl_dist = abs(entry - original_sl)
         sl_pips = pip_calc.price_to_pips(sl_dist)
-        # self._commission is already in account currency (KES for this account).
-        # _commission_in_account_ccy() was applied in run_backtest() before passing here.
-        comm = self._commission * lot_size
+        # commission is already in account currency (KES for this account).
+        # Use per-symbol commission when provided; fall back to instance default.
+        eff_commission = commission if commission is not None else self._commission
+        comm = eff_commission * lot_size
 
         # ── Limit-order fill check ─────────────────────────────────────
         # The signal entry is a FVG limit price (below current price for

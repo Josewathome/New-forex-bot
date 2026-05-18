@@ -46,6 +46,22 @@ class EmailService:
                     "EmailService: EMAIL_ENABLED=True but missing config: %s", missing
                 )
                 self.enabled = False
+            else:
+                self._test_smtp_connectivity()
+
+    def _test_smtp_connectivity(self) -> None:
+        """Connect, EHLO, and STARTTLS — no login, no message — to validate reachability."""
+        try:
+            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=10) as server:
+                server.ehlo()
+                server.starttls()
+            logger.info("EmailService: SMTP connectivity OK (%s:%s)", self.smtp_host, self.smtp_port)
+        except Exception as exc:
+            logger.warning(
+                "EmailService: SMTP connectivity test failed (%s:%s) — %s. "
+                "Email delivery may fail; check SMTP host/port settings.",
+                self.smtp_host, self.smtp_port, exc,
+            )
 
     # ── Public ──────────────────────────────────────────────────────
 

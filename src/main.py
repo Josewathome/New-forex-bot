@@ -196,10 +196,13 @@ M5ClockWatcher  = lambda: _BarClockWatcher(5  * 60)   # fires every 5 min
 def run_live() -> None:
     gw  = connect_mt5()
 
-    # Auto-detect broker server UTC offset so position.time corrections are exact.
-    # Overwrites the config default; falls back to that default if market is closed.
-    config.BROKER_UTC_OFFSET_HOURS = gw.detect_utc_offset()
-    logger.info("Broker UTC offset: UTC%+d", config.BROKER_UTC_OFFSET_HOURS)
+    # Auto-detect broker server UTC offset. Only overwrite the config default when
+    # the detection returns a non-zero value — a 0 result means the market is closed
+    # and the EURUSD tick is stale (not that the broker is genuinely on UTC+0).
+    _detected_offset = gw.detect_utc_offset()
+    if _detected_offset != 0:
+        config.BROKER_UTC_OFFSET_HOURS = _detected_offset
+    logger.info("Broker UTC offset: UTC%+d (detected=%+d)", config.BROKER_UTC_OFFSET_HOURS, _detected_offset)
 
     acc = gw.get_account_info()
     if acc:
@@ -220,6 +223,12 @@ def run_live() -> None:
     cp = checkpoint.load()
     if cp:
         logger.info("Resumed from checkpoint (saved_at=%s).", cp.get("saved_at"))
+        rt_state = cp.get("runtime_state")
+        if rt_state:
+            try:
+                execution.load_runtime_state(rt_state)
+            except Exception as _rt_exc:
+                logger.warning("Runtime state restore failed — starting fresh: %s", _rt_exc)
 
     # Re-apply any config values changed via the dashboard before last shutdown.
     # Must run AFTER checkpoint load and BEFORE building services that read config.
@@ -391,11 +400,17 @@ def run_live() -> None:
 
             loop_n += 1
             if (loop_start - last_checkpoint).total_seconds() >= cp_interval:
+                try:
+                    rt_state = execution.save_runtime_state()
+                except Exception as _cp_exc:
+                    logger.warning("Runtime state serialisation failed: %s", _cp_exc)
+                    rt_state = {}
                 checkpoint.save({
-                    "loop_n":   loop_n,
-                    "symbols":  config.SYMBOLS,
-                    "risk_pct": config.RISK_PERCENT,
-                    "min_rr":   config.MIN_RR,
+                    "loop_n":        loop_n,
+                    "symbols":       config.SYMBOLS,
+                    "risk_pct":      config.RISK_PERCENT,
+                    "min_rr":        config.MIN_RR,
+                    "runtime_state": rt_state,
                 })
                 last_checkpoint = loop_start
 
@@ -447,21 +462,26 @@ def run_backtest(
     # the history the terminal has cached locally (up to ~5 months on HFM).
     d1_buf = timedelta(days=config.D1_CANDLE_COUNT + 10)
     candle_data = {}
+    m30_buf = timedelta(hours=60)  # 60 bars of M30 context before start for zone mapping
     for sym in config.SYMBOLS:
-        h1 = md.get_candles_range(sym, Timeframe.H1, start_dt-h1_buf, end_dt)
-        m5 = md.get_candles_range(sym, Timeframe.M5, start_dt, end_dt)
-        m1 = md.get_candles_range(sym, Timeframe.M1, start_dt, end_dt)
-        h4 = md.get_candles_range(sym, Timeframe.H4, start_dt-h4_buf, end_dt)
-        d1 = md.get_candles_range(sym, Timeframe.D1, start_dt-d1_buf, end_dt)
+        h1  = md.get_candles_range(sym, Timeframe.H1,  start_dt-h1_buf,  end_dt)
+        m5  = md.get_candles_range(sym, Timeframe.M5,  start_dt,         end_dt)
+        m1  = md.get_candles_range(sym, Timeframe.M1,  start_dt,         end_dt)
+        h4  = md.get_candles_range(sym, Timeframe.H4,  start_dt-h4_buf,  end_dt)
+        d1  = md.get_candles_range(sym, Timeframe.D1,  start_dt-d1_buf,  end_dt)
+        m30 = md.get_candles_range(sym, Timeframe.M30, start_dt-m30_buf, end_dt)
         if h1 and m5:
-            candle_data[sym] = {Timeframe.H1:h1,Timeframe.M5:m5,Timeframe.M1:m1,
-                                Timeframe.H4:h4,Timeframe.D1:d1}
-            m1_count = len(m1) if m1 else 0
-            m5_count = len(m5) if m5 else 0
+            candle_data[sym] = {
+                Timeframe.H1: h1, Timeframe.M5: m5, Timeframe.M1: m1,
+                Timeframe.H4: h4, Timeframe.D1: d1, Timeframe.M30: m30 or [],
+            }
+            m1_count  = len(m1)  if m1  else 0
+            m5_count  = len(m5)  if m5  else 0
+            m30_count = len(m30) if m30 else 0
             m1_coverage = round(m1_count / max(m5_count * 5, 1) * 100, 1)
-            logger.info("  %s: H1=%d  M5=%d  M1=%d (%.1f%% coverage)  H4=%d  D1=%d",
+            logger.info("  %s: H1=%d  M5=%d  M1=%d (%.1f%% coverage)  H4=%d  D1=%d  M30=%d",
                         sym, len(h1), m5_count, m1_count, m1_coverage,
-                        len(h4) if h4 else 0, len(d1) if d1 else 0)
+                        len(h4) if h4 else 0, len(d1) if d1 else 0, m30_count)
         else:
             logger.warning("  %s: insufficient data (H1=%s M5=%s).",
                            sym, "ok" if h1 else "MISSING", "ok" if m5 else "MISSING")
@@ -481,7 +501,8 @@ def run_backtest(
     bt_bal = getattr(config, "BACKTEST_INITIAL_BALANCE", config.ACCOUNT_BALANCE)
     bt    = Backtester(news_client=bt_news, account=bt_bal,
                        risk_pct=config.RISK_PERCENT, commission=comm,
-                       currency=config.ACCOUNT_CURRENCY)
+                       currency=config.ACCOUNT_CURRENCY,
+                       commission_map=_build_commission_map())
     diag    = DiagnosticsCollector()
     results = bt.run(candle_data=candle_data, start_date=start_str,
                      end_date=end_str, diag=diag)

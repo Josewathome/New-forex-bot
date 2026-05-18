@@ -22,6 +22,8 @@ _CHECKPOINT_PROTECTED = {
     "balance_history.json",
     "config_overrides.json",
     "jwt_secret.txt",
+    "jwt_blocklist.json",
+    "symbols_override.json",
 }
 
 

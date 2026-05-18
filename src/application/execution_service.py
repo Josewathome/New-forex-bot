@@ -493,12 +493,13 @@ class ExecutionService:
                 if signal.direction == Direction.BULLISH
                 else signal.entry_price - tp2_ratio * abs(signal.entry_price - signal.stop_loss)
             )
-            # Clamp TP2 to the liquidity pool.  If TP2 ratio pushes beyond
+            # Clamp TP2 to the liquidity pool.  If TP2 ratio pushes BEYOND
             # the pool, MT5's full take_profit fires first — the partial close
             # never triggers.  Skip TP2 so the runner goes straight to the pool.
-            if signal.direction == Direction.BULLISH and tp2_price >= signal.take_profit:
+            # Use strict > / < so TP2 == pool is still allowed to fire.
+            if signal.direction == Direction.BULLISH and tp2_price > signal.take_profit:
                 tp2_price = None
-            elif signal.direction == Direction.BEARISH and tp2_price <= signal.take_profit:
+            elif signal.direction == Direction.BEARISH and tp2_price < signal.take_profit:
                 tp2_price = None
 
             return EntryCandidate(
@@ -626,10 +627,11 @@ class ExecutionService:
                 tp1 = compute_tp1_price(pos.direction, pos.entry_price, pos.stop_loss)
                 tp2 = compute_tp2_price(pos.direction, pos.entry_price, pos.stop_loss)
                 # Clamp TP2 to not exceed MT5's take_profit (the liquidity pool).
+                # Strict > / < so TP2 == pool is still allowed to fire.
                 if tp2 is not None and pos.take_profit:
-                    if pos.direction == Direction.BULLISH and tp2 >= pos.take_profit:
+                    if pos.direction == Direction.BULLISH and tp2 > pos.take_profit:
                         tp2 = None
-                    elif pos.direction == Direction.BEARISH and tp2 <= pos.take_profit:
+                    elif pos.direction == Direction.BEARISH and tp2 < pos.take_profit:
                         tp2 = None
                 self._trade_states[ticket] = _OpenTradeState(
                     ticket=ticket, symbol=symbol, direction=pos.direction,
@@ -866,21 +868,27 @@ class ExecutionService:
                             symbol, ticket, ev.signal_type, ev.timeframe_source,
                             ev.mfe_pips_at_signal, ev.pips_to_tp, ev.detail)
 
-            # ── Stall exit condition (only after TP1, not strong trend) ──
-            # Stall exit condition (only after TP1, not strong trend, and profit > min ratio)
+            # ── Stall exit ────────────────────────────────────────────────
+            # STALL_EXIT_REQUIRES_TP1=True  → only exit on stall after TP1 hit
+            # STALL_EXIT_REQUIRES_TP1=False → exit on stall as soon as min profit reached
             stall_event = next((e for e in events if e.signal_type == "mfe_stall"), None)
-            if stall_event and getattr(config, "STALL_EXIT_REQUIRES_TP1", True):
-                current_price = self._md.get_current_price(symbol)
-                sl_dist = abs(state.entry - state.original_sl)
-                if sl_dist > 0:
-                    current_profit_ratio = abs(current_price - state.entry) / sl_dist
-                else:
-                    current_profit_ratio = 0
-                min_profit_ratio = getattr(config, "MIN_PROFIT_RATIO_TO_CLOSE", 1.5)
-                if state.tp1_hit and not self._is_strong_trend(state.m5_window, state.direction) and current_profit_ratio >= min_profit_ratio:
+            if stall_event:
+                requires_tp1      = getattr(config, "STALL_EXIT_REQUIRES_TP1", False)
+                current_price     = self._md.get_current_price(symbol)
+                sl_dist           = abs(state.entry - state.original_sl)
+                current_profit_ratio = (abs(current_price - state.entry) / sl_dist
+                                        if sl_dist > 0 else 0)
+                min_profit_ratio  = getattr(config, "MIN_PROFIT_RATIO_TO_CLOSE", 0.1)
+                tp1_gate_ok       = (not requires_tp1) or state.tp1_hit
+                if (tp1_gate_ok
+                        and not self._is_strong_trend(state.m5_window, state.direction)
+                        and current_profit_ratio >= min_profit_ratio):
                     should_close = True
-                    action = "close_now"
-                    logger.info("Stall exit after TP1, profit=%.1fR", current_profit_ratio)
+                    action       = "close_now"
+                    logger.info(
+                        "Stall exit | %s ticket=%s | tp1_hit=%s requires_tp1=%s profit=%.2fR",
+                        symbol, ticket, state.tp1_hit, requires_tp1, current_profit_ratio,
+                    )
 
             # ── Time‑based exit ───────────────────────────────────
             if state.created_at:
@@ -996,6 +1004,88 @@ class ExecutionService:
         else:
             self._loss_streak[symbol] = 0
 
+    # ── Runtime state persistence (called by main.py checkpoint cycle) ──
+
+    def save_runtime_state(self) -> dict:
+        """
+        Serialise all in-memory trade state into a JSON-safe dict so the
+        checkpoint can survive bot restarts without losing TP1 status,
+        streak counts, or open trade metadata.
+        """
+        states = {}
+        for ticket, s in self._trade_states.items():
+            states[str(ticket)] = {
+                "ticket":           s.ticket,
+                "symbol":           s.symbol,
+                "direction":        s.direction.value,
+                "entry":            s.entry,
+                "original_sl":      s.original_sl,
+                "current_sl":       s.current_sl,
+                "take_profit":      s.take_profit,
+                "tp1_price":        s.tp1_price,
+                "tp2_price":        s.tp2_price,
+                "tp1_hit":          s.tp1_hit,
+                "tp2_hit":          s.tp2_hit,
+                "lot_size":         s.lot_size,
+                "initial_risk":     s.initial_risk,
+                "mfe_price":        s.mfe_price,
+                "accumulated_pips": s.accumulated_pips,
+                "digits":           s.digits,
+                "grade":            s.grade,
+                "created_at":       s.created_at.isoformat() if s.created_at else None,
+                "sl_trailed":       s.sl_trailed,
+            }
+        streaks = {sym: count for sym, count in self._loss_streak.items()}
+        pauses  = {sym: dt.isoformat() for sym, dt in self._streak_pause.items()}
+        return {"trade_states": states, "loss_streak": streaks, "streak_pause": pauses}
+
+    def load_runtime_state(self, data: dict) -> None:
+        """
+        Restore trade state from a previously saved checkpoint dict.
+        Missing or malformed entries are silently skipped so a corrupt
+        checkpoint never prevents the bot from starting.
+        """
+        for ticket_str, s in data.get("trade_states", {}).items():
+            try:
+                ticket = int(ticket_str)
+                created = (datetime.fromisoformat(s["created_at"])
+                           if s.get("created_at") else None)
+                self._trade_states[ticket] = _OpenTradeState(
+                    ticket=ticket,
+                    symbol=s["symbol"],
+                    direction=Direction[s["direction"].upper()],
+                    entry=float(s["entry"]),
+                    original_sl=float(s["original_sl"]),
+                    current_sl=float(s["current_sl"]),
+                    take_profit=float(s["take_profit"]),
+                    tp1_price=s.get("tp1_price"),
+                    tp2_price=s.get("tp2_price"),
+                    tp1_hit=bool(s.get("tp1_hit", False)),
+                    tp2_hit=bool(s.get("tp2_hit", False)),
+                    lot_size=float(s.get("lot_size", 0.0)),
+                    initial_risk=float(s.get("initial_risk", 0.0)),
+                    mfe_price=float(s.get("mfe_price", s["entry"])),
+                    accumulated_pips=float(s.get("accumulated_pips", 0.0)),
+                    digits=int(s.get("digits", 5)),
+                    grade=s.get("grade", "?"),
+                    created_at=created,
+                    sl_trailed=bool(s.get("sl_trailed", False)),
+                )
+                logger.info("Restored trade state: ticket=%s %s %s tp1_hit=%s",
+                            ticket, s["symbol"], s["direction"], s.get("tp1_hit"))
+            except Exception as exc:
+                logger.warning("load_runtime_state: skip ticket=%s — %s", ticket_str, exc)
+
+        for sym, count in data.get("loss_streak", {}).items():
+            self._loss_streak[sym] = int(count)
+        for sym, iso in data.get("streak_pause", {}).items():
+            try:
+                self._streak_pause[sym] = datetime.fromisoformat(iso)
+            except Exception:
+                pass
+        if self._trade_states:
+            logger.info("Loaded %d open trade state(s) from checkpoint.", len(self._trade_states))
+
     def _journal_close(self, ticket: int, pips: float, outcome: str) -> None:
         if self._journal:
             try:
@@ -1018,7 +1108,9 @@ class ExecutionService:
         )
         sl_pips = pip_calc.price_to_pips(abs(signal.entry_price - signal.stop_loss))
         # Floor (not round) to 2 decimal places so we never exceed the calculated risk.
-        lot_size = max(0.01, math.floor(risk_params.lot_size(sl_pips, tick_value, pip_calc) * 100) / 100)
+        raw_lot  = risk_params.lot_size(sl_pips, tick_value, pip_calc)
+        max_lot  = getattr(config, "MAX_LOT_SIZE", 10.0)
+        lot_size = max(0.01, min(math.floor(raw_lot * 100) / 100, max_lot))
 
         final_tp = signal.take_profit
 

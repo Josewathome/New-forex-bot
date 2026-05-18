@@ -37,9 +37,10 @@ import logging
 import secrets
 import threading
 import time
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Set
+from typing import Dict, Optional, Set, Tuple
 
 import src.config as config
 
@@ -112,6 +113,33 @@ _CONFIG_MAP = {
     "backtest_balance":      ("BACKTEST_INITIAL_BALANCE",   float),
 }
 
+# Symbols are persisted separately because they are a list, not a scalar.
+_SYMBOLS_FILE = Path(".checkpoints/symbols_override.json")
+
+
+def _persist_symbols() -> None:
+    try:
+        _SYMBOLS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SYMBOLS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(config.SYMBOLS), encoding="utf-8")
+        tmp.replace(_SYMBOLS_FILE)
+        logger.info("Symbols persisted to %s: %s", _SYMBOLS_FILE, config.SYMBOLS)
+    except Exception as exc:
+        logger.error("Failed to persist symbols: %s", exc)
+
+
+def load_symbols_override() -> None:
+    """Apply persisted symbol list override at startup. Call from load_config_overrides()."""
+    if not _SYMBOLS_FILE.exists():
+        return
+    try:
+        syms = json.loads(_SYMBOLS_FILE.read_text(encoding="utf-8"))
+        if isinstance(syms, list) and syms:
+            config.SYMBOLS[:] = syms
+            logger.info("Loaded symbols override from disk: %s", config.SYMBOLS)
+    except Exception as exc:
+        logger.warning("Could not load symbols override: %s", exc)
+
 
 def _persist_config_overrides(changed_keys, _map) -> None:
     """Write all current mutable config values to disk."""
@@ -134,20 +162,20 @@ def load_config_overrides() -> None:
     Apply any previously-saved dashboard config overrides to the live config module.
     Call this once at bot startup (from main.py) BEFORE trading begins.
     """
-    if not _CONFIG_OVERRIDE_FILE.exists():
-        return
-    try:
-        overrides = json.loads(_CONFIG_OVERRIDE_FILE.read_text(encoding="utf-8"))
-        applied = []
-        for key, (attr, cast) in _CONFIG_MAP.items():
-            if key in overrides and overrides[key] is not None:
-                setattr(config, attr, cast(overrides[key]))
-                applied.append(f"{attr}={overrides[key]}")
-        if applied:
-            logger.info("Loaded %d config overrides from disk: %s",
-                        len(applied), ", ".join(applied))
-    except Exception as exc:
-        logger.warning("Could not load config overrides (%s) — using defaults.", exc)
+    if _CONFIG_OVERRIDE_FILE.exists():
+        try:
+            overrides = json.loads(_CONFIG_OVERRIDE_FILE.read_text(encoding="utf-8"))
+            applied = []
+            for key, (attr, cast) in _CONFIG_MAP.items():
+                if key in overrides and overrides[key] is not None:
+                    setattr(config, attr, cast(overrides[key]))
+                    applied.append(f"{attr}={overrides[key]}")
+            if applied:
+                logger.info("Loaded %d config overrides from disk: %s",
+                            len(applied), ", ".join(applied))
+        except Exception as exc:
+            logger.warning("Could not load config overrides (%s) — using defaults.", exc)
+    load_symbols_override()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -194,15 +222,16 @@ def _jwt_decode(token: str, secret: str) -> dict:
 #  JWTManager — secret persistence + token issuance + blocklist
 # ─────────────────────────────────────────────────────────────────────
 
-_SECRET_FILE = Path(".checkpoints/jwt_secret.txt")
+_SECRET_FILE    = Path(".checkpoints/jwt_secret.txt")
+_BLOCKLIST_FILE = Path(".checkpoints/jwt_blocklist.json")
 
 
 class JWTManager:
     """Manages JWT signing secret and refresh-token revocation list."""
 
     def __init__(self) -> None:
-        self._secret: str = self._load_or_create()
-        self._blocklist: Set[str] = set()  # revoked refresh-token JTIs
+        self._secret: str      = self._load_or_create()
+        self._blocklist: Set[str] = self._load_blocklist()
 
     # ── Secret lifecycle ──────────────────────────────────────────
 
@@ -220,10 +249,29 @@ class JWTManager:
         _SECRET_FILE.write_text(secret, encoding="utf-8")
         return secret
 
+    def _load_blocklist(self) -> Set[str]:
+        if not _BLOCKLIST_FILE.exists():
+            return set()
+        try:
+            data = json.loads(_BLOCKLIST_FILE.read_text(encoding="utf-8"))
+            return set(data) if isinstance(data, list) else set()
+        except Exception:
+            return set()
+
+    def _save_blocklist(self) -> None:
+        try:
+            _BLOCKLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _BLOCKLIST_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(list(self._blocklist)), encoding="utf-8")
+            tmp.replace(_BLOCKLIST_FILE)
+        except Exception as exc:
+            logger.warning("JWT blocklist save failed: %s", exc)
+
     def rotate(self) -> None:
         """Generate a new secret and save it. All existing tokens immediately invalid."""
         self._secret = self._save_new_secret()
         self._blocklist.clear()
+        self._save_blocklist()
         logger.info("JWT secret rotated — all existing sessions invalidated.")
 
     # ── Token issuance ────────────────────────────────────────────
@@ -261,8 +309,54 @@ class JWTManager:
             jti = payload.get("jti", "")
             if jti:
                 self._blocklist.add(jti)
+                self._save_blocklist()
         except Exception:
             pass  # already invalid — nothing to do
+
+    def rotate_refresh(self, old_token: str) -> str:
+        """Revoke the old refresh token and issue a new one (token rotation)."""
+        self.revoke_refresh(old_token)
+        return self.issue_refresh()
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Login rate limiter — in-memory, per-IP
+# ─────────────────────────────────────────────────────────────────────
+
+class _LoginRateLimiter:
+    """
+    Simple in-memory rate limiter for login attempts.
+    Allows MAX_ATTEMPTS per IP within WINDOW_SECONDS.
+    Locks the IP for LOCKOUT_SECONDS after too many failures.
+    """
+    MAX_ATTEMPTS    = 10
+    WINDOW_SECONDS  = 60
+    LOCKOUT_SECONDS = 300
+
+    def __init__(self) -> None:
+        self._attempts: Dict[str, list] = defaultdict(list)  # ip → [timestamp, ...]
+        self._locked:   Dict[str, float] = {}                 # ip → unlock_time
+        self._lock = threading.Lock()
+
+    def is_allowed(self, ip: str) -> bool:
+        now = time.time()
+        with self._lock:
+            if ip in self._locked:
+                if now < self._locked[ip]:
+                    return False
+                del self._locked[ip]
+                self._attempts[ip] = []
+            cutoff = now - self.WINDOW_SECONDS
+            self._attempts[ip] = [t for t in self._attempts[ip] if t > cutoff]
+            return len(self._attempts[ip]) < self.MAX_ATTEMPTS
+
+    def record_attempt(self, ip: str) -> None:
+        now = time.time()
+        with self._lock:
+            self._attempts[ip].append(now)
+            if len(self._attempts[ip]) >= self.MAX_ATTEMPTS:
+                self._locked[ip] = now + self.LOCKOUT_SECONDS
+                logger.warning("Login rate limit: IP %s locked out for %ds", ip, self.LOCKOUT_SECONDS)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -272,13 +366,14 @@ class JWTManager:
 class DashboardServer:
 
     def __init__(self, trade_journal, checkpoint_service, weekly_runner=None, balance_fn=None) -> None:
-        self.journal     = trade_journal
-        self.checkpoint  = checkpoint_service
-        self._weekly     = weekly_runner
-        self._balance_fn = balance_fn   # callable() -> float | None, fetches live MT5 balance
+        self.journal      = trade_journal
+        self.checkpoint   = checkpoint_service
+        self._weekly      = weekly_runner
+        self._balance_fn  = balance_fn   # callable() -> float | None, fetches live MT5 balance
         self._thread: Optional[threading.Thread] = None
-        self._jwt       = JWTManager()
-        self._password  = self._resolve_password()
+        self._jwt         = JWTManager()
+        self._password    = self._resolve_password()
+        self._rate_limiter = _LoginRateLimiter()
 
     def _resolve_password(self) -> str:
         pw = getattr(config, "DASHBOARD_PASSWORD", "").strip()
@@ -318,8 +413,9 @@ class DashboardServer:
         app = Flask(__name__)
         app.config["JSON_SORT_KEYS"] = False
 
-        jwt_mgr  = self._jwt
-        password = self._password
+        jwt_mgr      = self._jwt
+        password     = self._password
+        rate_limiter = self._rate_limiter
 
         # ── Auth helpers ─────────────────────────────────────────────
 
@@ -346,12 +442,15 @@ class DashboardServer:
 
         @app.route("/api/auth/login", methods=["POST"])
         def auth_login():
+            ip = request.remote_addr or "unknown"
+            if not rate_limiter.is_allowed(ip):
+                return jsonify({"error": "Too many login attempts — try again later"}), 429
             data = request.get_json(silent=True) or {}
             if not _check_password(data.get("password", "")):
-                logger.warning("Dashboard: failed login attempt from %s",
-                               request.remote_addr)
+                rate_limiter.record_attempt(ip)
+                logger.warning("Dashboard: failed login from %s", ip)
                 return jsonify({"error": "Invalid password"}), 401
-            logger.info("Dashboard: login from %s", request.remote_addr)
+            logger.info("Dashboard: login from %s", ip)
             return jsonify({
                 "access_token":  jwt_mgr.issue_access(),
                 "refresh_token": jwt_mgr.issue_refresh(),
@@ -366,9 +465,13 @@ class DashboardServer:
                 jwt_mgr.verify_refresh(rt)
             except ValueError as exc:
                 return jsonify({"error": str(exc)}), 401
+            # Rotate: revoke old token and issue a fresh one so stolen refresh
+            # tokens can only be used once.
+            new_rt = jwt_mgr.rotate_refresh(rt)
             return jsonify({
-                "access_token": jwt_mgr.issue_access(),
-                "expires_in":   config.JWT_ACCESS_EXPIRES_MINUTES * 60,
+                "access_token":  jwt_mgr.issue_access(),
+                "refresh_token": new_rt,
+                "expires_in":    config.JWT_ACCESS_EXPIRES_MINUTES * 60,
             })
 
         @app.route("/api/auth/logout", methods=["POST"])
@@ -393,6 +496,9 @@ class DashboardServer:
             })
 
         # ── Static ──────────────────────────────────────────────────
+        # Root serves the dashboard HTML shell (which contains the login form).
+        # No auth here — the JS frontend authenticates via /api/auth/login and
+        # then uses the returned JWT for all subsequent /api/* calls.
 
         @app.route("/")
         def index():
@@ -479,6 +585,7 @@ class DashboardServer:
                 "monitor_enabled":     config.MONITOR_ENABLED,
                 "breakeven_rr":        config.BREAKEVEN_RR_TRIGGER,
                 "backtest_balance":    config.BACKTEST_INITIAL_BALANCE,
+                "account_currency":   config.ACCOUNT_CURRENCY,
             })
 
         @app.route("/api/config", methods=["PATCH"])
@@ -515,6 +622,7 @@ class DashboardServer:
             if sym in config.SYMBOLS:
                 return jsonify({"ok": False, "error": f"{sym} already active"}), 400
             config.SYMBOLS.append(sym)
+            _persist_symbols()
             logger.info("Symbol added via dashboard: %s", sym)
             return jsonify({"ok": True, "symbols": config.SYMBOLS})
 
@@ -525,6 +633,7 @@ class DashboardServer:
             if sym not in config.SYMBOLS:
                 return jsonify({"ok": False, "error": f"{sym} not found"}), 404
             config.SYMBOLS.remove(sym)
+            _persist_symbols()
             logger.info("Symbol removed via dashboard: %s", sym)
             return jsonify({"ok": True, "symbols": config.SYMBOLS})
 
@@ -584,24 +693,56 @@ class DashboardServer:
         @app.route("/api/logs")
         @require_auth
         def logs():
-            n    = int(request.args.get("n", 100))
+            n    = min(int(request.args.get("n", 100)), 1000)  # cap at 1000 lines
             logf = Path("logs/trading_bot.log")
             if not logf.exists():
                 return jsonify({"lines": []})
             try:
-                chunk_size = n * 512
-                with open(logf, "rb") as f:
-                    f.seek(0, 2)
-                    file_size = f.tell()
-                    read_from = max(0, file_size - chunk_size)
-                    f.seek(read_from)
-                    raw = f.read().decode("utf-8", errors="replace")
+                # Read whole file; for a 3-day rotation the file stays manageable.
+                # Slicing the last n lines is exact unlike the old chunk-size heuristic.
+                raw   = logf.read_text(encoding="utf-8", errors="replace")
                 lines = raw.splitlines()
-                if read_from > 0 and lines:
-                    lines = lines[1:]
                 return jsonify({"lines": lines[-n:]})
             except Exception as exc:
                 return jsonify({"lines": [], "error": str(exc)})
+
+        # ── Backtest reports ─────────────────────────────────────────
+
+        @app.route("/api/backtest-reports")
+        @require_auth
+        def backtest_reports():
+            report_dir = Path("src/backtest_results")
+            if not report_dir.exists():
+                return jsonify({"reports": []})
+            reports = sorted(
+                [
+                    {
+                        "name":     p.name,
+                        "size":     p.stat().st_size,
+                        "modified": datetime.fromtimestamp(
+                            p.stat().st_mtime, tz=timezone.utc
+                        ).isoformat(),
+                    }
+                    for p in report_dir.glob("*.txt")
+                ],
+                key=lambda r: r["modified"],
+                reverse=True,
+            )
+            return jsonify({"reports": reports})
+
+        @app.route("/api/backtest-reports/<path:filename>")
+        @require_auth
+        def get_backtest_report(filename):
+            report_dir = Path("src/backtest_results")
+            p = (report_dir / filename).resolve()
+            # Guard against path traversal
+            if not str(p).startswith(str(report_dir.resolve())):
+                return jsonify({"error": "Invalid path"}), 400
+            if not p.exists():
+                return jsonify({"error": "Not found"}), 404
+            return p.read_text(encoding="utf-8", errors="replace"), 200, {
+                "Content-Type": "text/plain; charset=utf-8"
+            }
 
         # ── Start ────────────────────────────────────────────────────
 

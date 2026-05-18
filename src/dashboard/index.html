@@ -251,7 +251,7 @@
 
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
         <div class="form-group">
-          <label>New Balance ({{ ccy }})</label>
+          <label>New Balance (<span id="lbl-balance-ccy">?</span>)</label>
           <input type="number" id="bal-new-amount" step="500" min="1" placeholder="e.g. 50000"/>
         </div>
         <div class="form-group">
@@ -462,6 +462,10 @@ async function tryRefresh() {
     const d = await r.json();
     accessToken = d.access_token;
     sessionStorage.setItem('zb_access', accessToken);
+    if (d.refresh_token) {
+      refreshToken = d.refresh_token;
+      localStorage.setItem('zb_refresh', refreshToken);
+    }
     return true;
   } catch(e) { return false; }
 }
@@ -651,6 +655,8 @@ async function loadConfig() {
     }
     const tp = document.getElementById('cfg-tiered_tp_enabled');
     if(tp) tp.checked = !!d.tiered_tp_enabled;
+    const ccyEl = document.getElementById('lbl-balance-ccy');
+    if(ccyEl && d.account_currency) ccyEl.textContent = d.account_currency;
   } catch(e) { if(e.message!=='unauthenticated') console.error('config load error', e); }
 }
 

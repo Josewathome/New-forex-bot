@@ -4,9 +4,9 @@ Pure MT5 API wrapper. Returns plain dicts. Zero business logic.
 """
 from __future__ import annotations
 import logging
+import time
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -441,8 +441,14 @@ class MT5Gateway:
     def modify_position(self, ticket: int, sl: float, tp: float) -> Optional[Dict[str, Any]]:
         if not self._ensure_ready():
             return None
+        positions = mt5.positions_get(ticket=ticket)
+        if not positions:
+            logger.error("modify_position: no open position found for ticket=%s", ticket)
+            return None
+        symbol = positions[0].symbol
         result = mt5.order_send({
             "action":   mt5.TRADE_ACTION_SLTP,
+            "symbol":   symbol,
             "position": ticket,
             "sl":       float(sl),
             "tp":       float(tp),
@@ -451,6 +457,29 @@ class MT5Gateway:
             logger.error("modify_position failed ticket=%s: %s", ticket, result)
             return None
         return {"ticket": int(ticket), "retcode": int(result.retcode)}
+
+    def get_position_close_deal(self, ticket: int) -> Optional[Dict[str, Any]]:
+        """
+        Look up the deal that closed the given position in MT5 history.
+        Returns the deal's profit, price, and volume; or None if not found.
+        Use this for accurate PnL on natural SL/TP closes rather than estimating.
+        """
+        if not self._ensure_ready():
+            return None
+        deals = mt5.history_deals_get(position=ticket)
+        if deals is None or len(deals) == 0:
+            return None
+        # The closing deal has DEAL_ENTRY_OUT (1); the opening has DEAL_ENTRY_IN (0).
+        for d in reversed(deals):
+            if d.entry == mt5.DEAL_ENTRY_OUT:
+                return {
+                    "ticket":  int(d.ticket),
+                    "profit":  float(d.profit),
+                    "price":   float(d.price),
+                    "volume":  float(d.volume),
+                    "time":    int(d.time),
+                }
+        return None
 
     # ── Positions ─────────────────────────────────────────────────
 
@@ -522,7 +551,22 @@ class MT5Gateway:
         if end_dt.tzinfo is not None:
             end_dt = end_dt.replace(tzinfo=None)
 
-        rates = mt5.copy_rates_range(symbol, tf, start_dt, end_dt)
+        rates = None
+        for attempt, delay in enumerate([0, 3, 8, 15]):
+            if delay:
+                logger.info(
+                    "copy_rates_range %s/%s: retrying in %ds (attempt %d/4) ...",
+                    symbol, timeframe, delay, attempt + 1,
+                )
+                time.sleep(delay)
+            rates = mt5.copy_rates_range(symbol, tf, start_dt, end_dt)
+            if rates is not None and len(rates) > 0:
+                break
+            err = mt5.last_error()
+            if attempt < 3:
+                logger.warning(
+                    "copy_rates_range empty %s/%s: %s — will retry", symbol, timeframe, err,
+                )
         if rates is None or len(rates) == 0:
             logger.error("copy_rates_range empty %s/%s: %s", symbol, timeframe, mt5.last_error())
             return None

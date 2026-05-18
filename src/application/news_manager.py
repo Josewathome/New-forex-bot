@@ -5,7 +5,7 @@ Settings come from config.py.
 """
 from __future__ import annotations
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import List, Optional
 
 import src.config as config
@@ -70,6 +70,19 @@ class NewsManager:
         events: List[NewsEvent] = self._repo.get_today_events(
             currencies=all_currencies, date_str=date_str,
         )
+
+        # Within 60 minutes of midnight, prefetch tomorrow's events so the
+        # high-impact buffer at e.g. 00:30 is already loaded before it fires.
+        if now.hour == 23:
+            tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+            logger.info("Pre-fetching next-day news for %s …", tomorrow)
+            try:
+                next_events = self._repo.get_today_events(
+                    currencies=all_currencies, date_str=tomorrow,
+                )
+                events = events + next_events
+            except Exception as exc:
+                logger.warning("Next-day news prefetch failed: %s", exc)
 
         windows = []
         for e in events:

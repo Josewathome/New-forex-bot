@@ -60,15 +60,17 @@ class WeeklyBacktestRunner:
             news     = CompositeNewsClient([wbr_ff, wbr_mt5])
         else:
             news = wbr_mt5
-        comm  = self._commission_in_account_ccy(config.COMMISSION_PER_LOT)
+        comm           = self._commission_in_account_ccy(config.COMMISSION_PER_LOT)
+        commission_map = self._build_commission_map()
 
         bt_balance = getattr(config, "BACKTEST_INITIAL_BALANCE", config.ACCOUNT_BALANCE)
         bt = Backtester(
-            news_client=news,
-            account=    bt_balance,
-            risk_pct=   config.RISK_PERCENT,
-            commission= comm,
-            currency=   config.ACCOUNT_CURRENCY,
+            news_client=    news,
+            account=        bt_balance,
+            risk_pct=       config.RISK_PERCENT,
+            commission=     comm,
+            currency=       config.ACCOUNT_CURRENCY,
+            commission_map= commission_map,
         )
 
         candle_data = self._fetch_candles(start_dt, end_dt)
@@ -159,28 +161,33 @@ class WeeklyBacktestRunner:
     def _fetch_candles(self, start_dt, end_dt) -> Dict:
         from src.domain.entities import Timeframe
 
-        h1_buffer = timedelta(hours=150)
-        h4_buffer = timedelta(hours=config.H4_CANDLE_COUNT * 4 + 40)
-        start_h1  = start_dt - h1_buffer
-        start_h4  = start_dt - h4_buffer
+        h1_buffer  = timedelta(hours=150)
+        h4_buffer  = timedelta(hours=config.H4_CANDLE_COUNT * 4 + 40)
+        m30_buffer = timedelta(hours=60)
+        start_h1   = start_dt - h1_buffer
+        start_h4   = start_dt - h4_buffer
+        start_m30  = start_dt - m30_buffer
 
         candle_data: Dict = {}
         for sym in config.SYMBOLS:
             try:
-                h1 = self.md.get_candles_range(sym, Timeframe.H1, start_h1, end_dt)
-                m5 = self.md.get_candles_range(sym, Timeframe.M5, start_dt, end_dt)
-                m1 = self.md.get_candles_range(sym, Timeframe.M1, start_dt, end_dt)
-                h4 = self.md.get_candles_range(sym, Timeframe.H4, start_h4, end_dt)
+                h1  = self.md.get_candles_range(sym, Timeframe.H1,  start_h1,  end_dt)
+                m5  = self.md.get_candles_range(sym, Timeframe.M5,  start_dt,  end_dt)
+                m1  = self.md.get_candles_range(sym, Timeframe.M1,  start_dt,  end_dt)
+                h4  = self.md.get_candles_range(sym, Timeframe.H4,  start_h4,  end_dt)
+                m30 = self.md.get_candles_range(sym, Timeframe.M30, start_m30, end_dt)
                 if h1 and m5:
                     candle_data[sym] = {
-                        Timeframe.H1: h1,
-                        Timeframe.M5: m5,
-                        Timeframe.M1: m1,
-                        Timeframe.H4: h4,
+                        Timeframe.H1:  h1,
+                        Timeframe.M5:  m5,
+                        Timeframe.M1:  m1,
+                        Timeframe.H4:  h4,
+                        Timeframe.M30: m30 or [],
                     }
                     logger.info(
-                        "  %s: H4=%d H1=%d M5=%d M1=%d",
-                        sym, len(h4 or []), len(h1), len(m5), len(m1 or []),
+                        "  %s: H4=%d H1=%d M30=%d M5=%d M1=%d",
+                        sym, len(h4 or []), len(h1), len(m30 or []),
+                        len(m5), len(m1 or []),
                     )
                 else:
                     logger.warning("  %s: insufficient data — skipped.", sym)
@@ -270,7 +277,19 @@ class WeeklyBacktestRunner:
     def _commission_in_account_ccy(usd_commission: float) -> float:
         FX_RATES = {
             "USD": 1.0, "EUR": 0.92, "GBP": 0.79,
-            "KES": 130.0, "NGN": 1550.0,
+            "KES": getattr(config, "KES_PER_USD", 130.0), "NGN": 1550.0,
         }
         rate = FX_RATES.get(config.ACCOUNT_CURRENCY.upper(), 1.0)
         return usd_commission * rate
+
+    @classmethod
+    def _build_commission_map(cls) -> dict:
+        acct_type = getattr(config, "HFM_ACCOUNT_TYPE", "ZERO_SPREAD").upper()
+        if acct_type in ("PREMIUM", "PRO"):
+            return {sym: 0.0 for sym in config.SYMBOLS}
+        comm_usd_map = getattr(config, "HFM_COMMISSION_USD", {})
+        default_usd  = getattr(config, "HFM_COMMISSION_USD_DEFAULT", 3.0)
+        return {
+            sym: cls._commission_in_account_ccy(comm_usd_map.get(sym, default_usd))
+            for sym in config.SYMBOLS
+        }

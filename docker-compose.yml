@@ -25,6 +25,9 @@ services:
       - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD}
       - JWT_ACCESS_EXPIRES_MINUTES=${JWT_ACCESS_EXPIRES_MINUTES:-15}
       - JWT_REFRESH_EXPIRES_DAYS=${JWT_REFRESH_EXPIRES_DAYS:-7}
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
     networks:
       - default
       - forex-shared
@@ -44,4 +47,4 @@ volumes:
 networks:
   default: {}
   forex-shared:
-    external: true
+    external: true         # created by forex-api project; do not manage here

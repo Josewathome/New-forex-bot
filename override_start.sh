@@ -80,7 +80,7 @@ if ! is_wine_python_package_installed "MetaTrader5==$metatrader_version"; then
     $wine_executable python -m pip install --no-cache-dir "MetaTrader5==$metatrader_version"
 fi
 
-# MetaTrader5 5.0.45 supports NumPy 1.x; keep the pin as a safety measure.
+# MetaTrader5 5.0.37 supports NumPy 1.x only; keep the pin as a safety measure.
 # Remove this line only if a future MT5 version explicitly requires NumPy 2.x.
 show_message "[5/6] Pinning numpy<2 for stability..."
 $wine_executable python -m pip install --no-cache-dir "numpy<2" --quiet

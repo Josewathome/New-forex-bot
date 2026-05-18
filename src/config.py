@@ -91,6 +91,7 @@ COMMISSION_PER_LOT  = 3.0  # USD/lot (per side) — Zero Spread default for majo
 MIN_RR              = 2.0   # was 3.0 — backtest: rr rejections eating valid signals; 2R still profitable
 MAX_OPEN_TRADES     = 6
 MAX_TRADES_PER_SYMBOL = 2    # max concurrent trades on a single symbol (Phase 1 cap)
+MAX_LOT_SIZE: float = float(os.environ.get("MAX_LOT_SIZE", "10.0"))  # hard ceiling applied in _build_trade()
 
 # ── Phase 2 — Conviction Re-Entry ─────────────────────────────────
 # Phase 2 fires AFTER Phase 1 in the same cycle.
@@ -240,6 +241,19 @@ D1_CANDLE_COUNT  = 30   # ~6 weeks of daily data for D1 trend detection
 H4_EQUILIBRIUM_LOOKBACK = 20
 D1_EQUILIBRIUM_LOOKBACK = 15  # daily swing pivot lookback
 
+# ── Per-Symbol H4 Slope Thresholds ────────────────────────────────
+# Minimum absolute H4 slope (in pips per bar) before a direction is
+# classified as a valid trend.  Pairs with higher volatility need a
+# higher slope to distinguish trending from ranging.
+# Used by find_h4_bias() to gate the H4_BIAS contribution to score_setup().
+H4_SLOPE_THRESHOLD: dict[str, float] = {
+    "EURUSD": 1.5, "GBPUSD": 2.0, "AUDUSD": 1.5,
+    "USDJPY": 2.0, "EURJPY": 2.5, "GBPJPY": 3.0,
+    "XAUUSD": 15.0, "XAGUSD": 8.0,
+    "USDCHF": 1.5, "NZDUSD": 1.5, "USDCAD": 1.5,
+}
+H4_SLOPE_THRESHOLD_DEFAULT: float = 2.0
+
 # ── M5 Zone Story Reader ──────────────────────────────────────────
 # read_m5_zone_story() reads the sub-bar narrative inside the H1 zone.
 # MIN_ZONE_STORY_BARS: minimum M5 bars with bodies inside the zone before
@@ -357,7 +371,7 @@ TRADING_SESSIONS = {
 # Minutes to wait after a session opens before placing trades, and
 # minutes before a session closes to stop placing trades.
 # Analysis and zone mapping continue unaffected during this buffer.
-SESSION_BUFFER_MIN: int = 60
+SESSION_BUFFER_MIN: int = int(os.environ.get("SESSION_BUFFER_MIN", "15"))
 
 LOOP_INTERVAL_SECONDS = 60
 
@@ -377,7 +391,7 @@ TICK_VALUE_USD: dict[str, float] = {
     "XAUUSD": 10.0, "XAGUSD":  5.0,
 }
 
-KES_PER_USD = 130.0
+KES_PER_USD = float(os.environ.get("KES_PER_USD", "130.0"))
 
 SYMBOL_CURRENCIES: dict[str, list[str]] = {
     "EURUSD": ["EUR", "USD"],
@@ -457,7 +471,7 @@ TIERED_TP1_CLOSE_PCT_B        = 0.50   # B grade: close 50%, keep 50% running
 # TP2 hits should now occur regularly on the stronger setups.
 TIERED_TP2_RATIO         = 2.0
 TIERED_TP2_CLOSE_PCT     = 0.25
-FINAL_RUNNER_PCT         = 0.15
+FINAL_RUNNER_PCT         = 0.15   # informational only — the runner fraction is 1 - TP1_PCT - TP2_PCT at runtime
 
 # ── STALL EXIT RULE ───────────────────────────────────────────────
 # False = exit on stall whenever profit ≥ MIN_PROFIT_RATIO_TO_CLOSE (1.5R),

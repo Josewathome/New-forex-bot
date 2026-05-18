@@ -5,8 +5,9 @@ No ZMQ bridge. Runs on Windows where MetaTrader5 is installed.
 """
 from __future__ import annotations
 import logging
+import time as _time
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from src.domain.entities import Candle, Timeframe
 from src.domain.repositories import IMarketDataRepository
@@ -22,9 +23,11 @@ class MT5MarketDataRepository(IMarketDataRepository):
     All timestamps are converted to UTC on the way in.
     """
 
+    _SYMBOL_CACHE_TTL = 60  # seconds; symbol info refreshed at most once per minute
+
     def __init__(self, gateway: MT5Gateway) -> None:
         self._gw = gateway
-        self._symbol_cache: dict = {}   # symbol → symbol_info dict (rarely changes)
+        self._symbol_cache: dict[str, Tuple[dict, float]] = {}  # symbol → (info, fetched_at)
 
     # ── IMarketDataRepository ─────────────────
 
@@ -94,11 +97,16 @@ class MT5MarketDataRepository(IMarketDataRepository):
     # ── Helpers ───────────────────────────────
 
     def _get_symbol_info_cached(self, symbol: str) -> Optional[dict]:
-        if symbol not in self._symbol_cache:
-            info = self._gw.get_symbol_info(symbol)
-            if info:
-                self._symbol_cache[symbol] = info
-        return self._symbol_cache.get(symbol)
+        now = _time.monotonic()
+        cached = self._symbol_cache.get(symbol)
+        if cached is not None:
+            info, fetched_at = cached
+            if now - fetched_at < self._SYMBOL_CACHE_TTL:
+                return info
+        info = self._gw.get_symbol_info(symbol)
+        if info:
+            self._symbol_cache[symbol] = (info, now)
+        return info
     
     def get_candles_range(
         self,
