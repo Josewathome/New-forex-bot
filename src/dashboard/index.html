@@ -347,6 +347,7 @@ const API_BASE = window.location.pathname.startsWith('/bot') ? '/bot' : '';
 
 // ── Login / logout UI ────────────────────────────────────────────────
 function showLogin(msg) {
+  stopPolling();
   document.getElementById('app').style.display = 'none';
   document.getElementById('loginOverlay').style.display = 'flex';
   document.getElementById('loginPassword').value = '';
@@ -359,9 +360,24 @@ function showLogin(msg) {
   }
 }
 
+let _refreshTimer = null;
+let _configTimer  = null;
+
+function startPolling() {
+  if (_refreshTimer) return;
+  _refreshTimer = setInterval(refresh, 30000);
+  _configTimer  = setInterval(loadConfig, 60000);
+}
+
+function stopPolling() {
+  clearInterval(_refreshTimer); _refreshTimer = null;
+  clearInterval(_configTimer);  _configTimer  = null;
+}
+
 function showApp() {
   document.getElementById('loginOverlay').style.display = 'none';
   document.getElementById('app').style.display = 'block';
+  startPolling();
 }
 
 async function doLogin() {
@@ -827,8 +843,6 @@ if (accessToken) {
   showLogin();
 }
 
-setInterval(refresh, 30000);    // auto-refresh every 30 s
-setInterval(loadConfig, 60000); // config refresh every 60 s
 </script>
 </body>
 </html>
