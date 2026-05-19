@@ -66,8 +66,10 @@ if [ -e "$mt5file" ]; then
     fi
     $wine_executable start /unix "$mt5file" $MT5_LOGIN_ARGS $MT5_CMD_OPTIONS &
     show_message "[3/6] MT5 launched (PID $!)."
-    # Give MT5 time to start and authenticate before the Python bot tries to connect
-    sleep 15
+    # Give MT5 time to fully start, connect to broker, and complete the
+    # access server handshake before the Python bot attempts mt5.initialize().
+    # IC Markets takes longer than HFM due to their access server proxy layer.
+    sleep 25
 else
     show_message "[3/6] ERROR: MT5 binary not found — cannot continue."
     exit 1

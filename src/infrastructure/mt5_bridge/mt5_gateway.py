@@ -96,9 +96,33 @@ class MT5Gateway:
                     _time.sleep(delay)
                 continue
 
+            # Explicitly call mt5.login() after initialize() succeeds.
+            # IC Markets routes connections through a pool of Access Server proxy
+            # nodes. On reconnect a different node may answer, invalidating the
+            # terminal's cached session. mt5.initialize() only attaches to the
+            # terminal process — mt5.login() forces a fresh broker-level
+            # authentication handshake regardless of what the terminal has cached.
+            login_result = mt5.login(
+                login=self.login,
+                password=self.password,
+                server=self.server,
+            )
+            if not login_result:
+                code, msg = mt5.last_error()
+                logger.error(
+                    "mt5.login() failed after initialize() (attempt %d/%d): (%s, %s)",
+                    attempt, retries, code, msg,
+                )
+                mt5.shutdown()
+                if attempt < retries:
+                    logger.info("Retrying in %.0fs …", delay)
+                    _time.sleep(delay)
+                continue
+            logger.info("mt5.login() succeeded — broker session established.")
+
             acc = mt5.account_info()
             if acc is None:
-                logger.error("initialize() OK but account_info() None: %s", mt5.last_error())
+                logger.error("initialize()+login() OK but account_info() None: %s", mt5.last_error())
                 mt5.shutdown()
                 if attempt < retries:
                     _time.sleep(delay)
@@ -140,7 +164,10 @@ class MT5Gateway:
             return True
         logger.warning("MT5 not ready — attempting reconnect …")
         self._ready = False
-        return self.connect(retries=2, delay=2.0)
+        # Use 3 retries on mid-session drops — IC Markets access server pool
+        # rotation means the first reconnect node may reject; retry gives a
+        # chance to land on a working node.
+        return self.connect(retries=3, delay=5.0)
 
     # ── Account ───────────────────────────────────────────────────
 
