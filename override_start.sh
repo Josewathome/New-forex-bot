@@ -50,26 +50,70 @@ else
     rm -f /config/.wine/drive_c/mt5setup.exe
 fi
 
+# ── [3/6] Pre-write MT5 credentials into common.ini ──────────────
+# MT5 reads login/password/server from Config/common.ini at startup.
+# Writing them here before terminal64.exe launches means MT5 auto-logs in
+# silently on every container restart — no GUI login dialog, no VNC needed.
+# We also set Api=1 (Allow Algorithmic Trading) so the bot can connect
+# immediately without requiring a manual Tools→Options→Expert Advisors step.
+MT5_CONFIG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Config"
+MT5_COMMON_INI="${MT5_CONFIG_DIR}/common.ini"
+
+if [ -n "${TRADING_ID:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:-}" ]; then
+    show_message "[3/6] Writing MT5 credentials to common.ini …"
+    mkdir -p "${MT5_CONFIG_DIR}"
+
+    # Preserve any existing sections other than [Common] and [Experts].
+    # We rewrite only those two sections so we don't lose chart/object settings.
+    # Use printf to avoid locale-dependent echo behaviour.
+    EXISTING=""
+    if [ -f "${MT5_COMMON_INI}" ]; then
+        # Extract everything except [Common] and [Experts] blocks
+        EXISTING=$(awk '
+            /^\[Common\]/ { skip=1; next }
+            /^\[Experts\]/ { skip=1; next }
+            /^\[/ { skip=0 }
+            !skip { print }
+        ' "${MT5_COMMON_INI}" 2>/dev/null || true)
+    fi
+
+    printf '[Common]\r\n'                          >  "${MT5_COMMON_INI}"
+    printf 'Login=%s\r\n'   "${TRADING_ID}"        >> "${MT5_COMMON_INI}"
+    printf 'Password=%s\r\n' "${MT5_PASSWORD}"     >> "${MT5_COMMON_INI}"
+    printf 'Server=%s\r\n'  "${MT5_SERVER}"        >> "${MT5_COMMON_INI}"
+    printf 'ProxyEnable=0\r\n'                     >> "${MT5_COMMON_INI}"
+    printf 'ProxyType=0\r\n'                       >> "${MT5_COMMON_INI}"
+    printf 'ProxyAddress=\r\n'                     >> "${MT5_COMMON_INI}"
+    printf 'NewsEnable=1\r\n'                      >> "${MT5_COMMON_INI}"
+    printf '[Experts]\r\n'                         >> "${MT5_COMMON_INI}"
+    printf 'AllowDllImport=1\r\n'                  >> "${MT5_COMMON_INI}"
+    printf 'Enabled=1\r\n'                         >> "${MT5_COMMON_INI}"
+    printf 'Api=1\r\n'                             >> "${MT5_COMMON_INI}"
+    # Append any remaining sections (Charts, Objects, etc.) that were preserved
+    if [ -n "${EXISTING}" ]; then
+        printf '%s\r\n' "${EXISTING}"              >> "${MT5_COMMON_INI}"
+    fi
+    show_message "[3/6] common.ini written — auto-login + algo trading enabled."
+else
+    show_message "[3/6] WARNING: TRADING_ID/MT5_PASSWORD/MT5_SERVER not set — manual VNC login required."
+fi
+
 # ── [3/6] Launch MT5 terminal ─────────────────────────────────────
 if [ -e "$mt5file" ]; then
     show_message "[3/6] Launching MT5 terminal..."
-    # Pass broker credentials directly to terminal64.exe so MT5 auto-logs in
-    # on every container restart without requiring manual VNC login.
-    # /login /password /server are standard MT5 command-line arguments.
-    # Fall back to no credentials if env vars are not set (manual VNC login).
-    MT5_LOGIN_ARGS=""
-    if [ -n "${TRADING_ID:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:-}" ]; then
-        MT5_LOGIN_ARGS="/login:${TRADING_ID} /password:${MT5_PASSWORD} /server:${MT5_SERVER}"
-        show_message "[3/6] MT5 credentials provided — auto-login enabled."
-    else
-        show_message "[3/6] WARNING: TRADING_ID/MT5_PASSWORD/MT5_SERVER not set — manual VNC login required."
-    fi
-    $wine_executable start /unix "$mt5file" $MT5_LOGIN_ARGS $MT5_CMD_OPTIONS &
+    $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS &
     show_message "[3/6] MT5 launched (PID $!)."
     # Give MT5 time to fully start, connect to broker, and complete the
     # access server handshake before the Python bot attempts mt5.initialize().
     # IC Markets takes longer than HFM due to their access server proxy layer.
-    sleep 25
+    sleep 45
+    # MT5 rewrites common.ini on startup and resets Api=0.
+    # Patch it back to Api=1 now that MT5 has finished its init write.
+    if [ -f "${MT5_COMMON_INI:-}" ]; then
+        show_message "[3/6] Patching Api=1 in common.ini after MT5 init..."
+        sed -i 's/^Api=.*/Api=1/' "${MT5_COMMON_INI}"
+        show_message "[3/6] Api=1 patched."
+    fi
 else
     show_message "[3/6] ERROR: MT5 binary not found — cannot continue."
     exit 1
