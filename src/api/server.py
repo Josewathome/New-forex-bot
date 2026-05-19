@@ -25,6 +25,9 @@ Protected endpoints:
     POST /api/symbols             → add a symbol
     DELETE /api/symbols/<sym>     → remove a symbol
     GET  /api/logs                → last N lines of trading_bot.log
+    GET  /api/balance-history    → full balance event log
+    POST /api/balance-history    → append a new balance event (deposit/withdrawal)
+    POST /api/reset-balance      → reset performance baseline to current equity (Option A)
 """
 from __future__ import annotations
 
@@ -95,10 +98,17 @@ def _save_balance_history(history: list) -> None:
 
 
 def _get_initial_balance() -> tuple:
-    """Return (balance, set_at) from the most recent balance event."""
+    """Return (balance, set_at, reset_at) from the most recent balance event.
+    reset_at is the ISO timestamp of the most recent reset event, or None."""
     history = _load_balance_history()
     latest  = history[-1]
-    return float(latest["balance"]), latest["set_at"]
+    # Find the most recent reset event to use as the stats baseline timestamp
+    reset_at = None
+    for event in reversed(history):
+        if event.get("type") == "reset":
+            reset_at = event["set_at"]
+            break
+    return float(latest["balance"]), latest["set_at"], reset_at
 
 _CONFIG_MAP = {
     "risk_pct":           ("RISK_PERCENT",          float),
@@ -533,10 +543,13 @@ class DashboardServer:
         def stats():
             days = request.args.get("days", type=int)  # None = all time
 
-            g = self.journal.get_stats(days=days)
+            # reset_at: ISO timestamp of last reset — stats only count trades after this
+            initial_bal, bal_set_at, reset_at = _get_initial_balance()
+            since = reset_at  # Option A: time-gated stats post-reset
+
+            g = self.journal.get_stats(days=days, since=since)
 
             # Current balance: use live MT5 value if available, else fall back to journal estimate
-            initial_bal, bal_set_at = _get_initial_balance()
             if self._balance_fn:
                 try:
                     current_bal = self._balance_fn() or initial_bal
@@ -552,13 +565,14 @@ class DashboardServer:
             g["current_balance"]    = round(current_bal, 2)
             g["balance_change_pct"] = change_pct
             g["balance_set_at"]     = bal_set_at
+            g["reset_at"]           = reset_at
             g["currency"]           = config.ACCOUNT_CURRENCY
-            g["drawdown_pct"]       = self.journal.get_drawdown(initial_bal, days=days)
+            g["drawdown_pct"]       = self.journal.get_drawdown(initial_bal, days=days, since=since)
             g["period_days"]        = days
 
             return jsonify({
                 "global":    g,
-                "by_symbol": self.journal.get_stats_by_symbol(days=days),
+                "by_symbol": self.journal.get_stats_by_symbol(days=days, since=since),
             })
 
         @app.route("/api/trades")
@@ -668,6 +682,62 @@ class DashboardServer:
             logger.info("Balance history updated: %.2f %s — %s",
                         balance, config.ACCOUNT_CURRENCY, note)
             return jsonify({"ok": True, "history": history})
+
+        # ── Reset balance ────────────────────────────────────────────
+
+        @app.route("/api/reset-balance", methods=["POST"])
+        @require_auth
+        def reset_balance():
+            """
+            Reset performance tracking to the current account equity.
+
+            Appends a 'reset' event to balance_history.json with the live
+            MT5 equity (or journal-estimated equity if MT5 is unavailable).
+            After reset, /api/stats only counts trades closed after this
+            timestamp — historical trades remain visible in /api/trades
+            but do not affect performance metrics (Option A).
+
+            Body (JSON):
+              { "note": "optional reason" }   — note is optional
+            """
+            data = request.get_json(silent=True) or {}
+            note = str(data.get("note", "")).strip() or "Performance reset"
+
+            # Resolve current equity: prefer live MT5, fall back to journal estimate
+            initial_bal, _, _ = _get_initial_balance()
+            if self._balance_fn:
+                try:
+                    current_equity = self._balance_fn() or initial_bal
+                except Exception:
+                    all_pnl        = sum(t["pnl"] or 0 for t in self.journal.get_all()
+                                        if t["outcome"] != "OPEN")
+                    current_equity = initial_bal + all_pnl
+            else:
+                all_pnl        = sum(t["pnl"] or 0 for t in self.journal.get_all()
+                                    if t["outcome"] != "OPEN")
+                current_equity = initial_bal + all_pnl
+
+            reset_time = datetime.now(tz=timezone.utc).isoformat()
+            history    = _load_balance_history()
+            history.append({
+                "balance":  round(current_equity, 2),
+                "currency": config.ACCOUNT_CURRENCY,
+                "set_at":   reset_time,
+                "type":     "reset",   # marker so _get_initial_balance() can find it
+                "note":     note,
+            })
+            _save_balance_history(history)
+            logger.info(
+                "Balance reset by dashboard: new baseline %.2f %s at %s",
+                current_equity, config.ACCOUNT_CURRENCY, reset_time,
+            )
+            return jsonify({
+                "ok":           True,
+                "new_balance":  round(current_equity, 2),
+                "currency":     config.ACCOUNT_CURRENCY,
+                "reset_at":     reset_time,
+                "note":         note,
+            })
 
         # ── Manual weekly backtest trigger ──────────────────────────
 

@@ -25,7 +25,7 @@ from src.domain.value_objects import BrokerCost, PipCalculator
 
 logger = logging.getLogger(__name__)
 
-# ── Zero Spread account fallbacks (near-zero pips, commission-based) ─
+# ── HFM Zero Spread fallbacks (near-zero pips, commission-based) ─────
 ZERO_SPREAD_FALLBACK_PIPS: dict[str, float] = {
     "EURUSD": 0.1, "GBPUSD": 0.4, "USDJPY": 0.2,
     "AUDUSD": 0.4, "USDCAD": 0.5, "USDCHF": 0.3,
@@ -34,13 +34,26 @@ ZERO_SPREAD_FALLBACK_PIPS: dict[str, float] = {
     "US30":   3.0, "NAS100": 1.5,
 }
 
-# ── Premium / Pro account fallbacks (spread-based, no commission) ────
+# ── HFM Premium / Pro fallbacks (spread-based, no commission) ────────
+# Values include a ~30% safety margin above HFM minimums to cover Monday-open
+# and news-spike conditions where live spread data may be unavailable.
 PREMIUM_FALLBACK_PIPS: dict[str, float] = {
-    "EURUSD": 1.4, "GBPUSD": 1.8, "USDJPY": 1.6,
-    "AUDUSD": 1.8, "USDCAD": 2.0, "USDCHF": 2.0,
-    "NZDUSD": 2.0, "EURGBP": 1.6, "EURJPY": 2.0, "GBPJPY": 2.5,
-    "XAUUSD": 3.5, "XAGUSD": 6.0,
-    "US30":   4.0, "NAS100": 2.0,
+    "EURUSD": 1.8, "GBPUSD": 2.4, "USDJPY": 2.1,
+    "AUDUSD": 2.4, "USDCAD": 2.6, "USDCHF": 2.6,
+    "NZDUSD": 2.6, "EURGBP": 2.1, "EURJPY": 2.6, "GBPJPY": 3.3,
+    "XAUUSD": 4.6, "XAGUSD": 7.8,
+    "US30":   5.2, "NAS100": 2.6,
+}
+
+# ── IC Markets Raw Spread fallbacks (ECN spread + $3.50/lot commission) ─
+# Raw ECN spreads with ~30% safety margin for Monday-open / news spikes.
+# These are used only when MT5 tick data is unavailable at startup.
+IC_MARKETS_RAW_FALLBACK_PIPS: dict[str, float] = {
+    "EURUSD": 0.2, "GBPUSD": 0.5, "USDJPY": 0.3,
+    "AUDUSD": 0.5, "USDCAD": 0.6, "USDCHF": 0.4,
+    "NZDUSD": 0.5, "EURGBP": 0.4, "EURJPY": 0.4, "GBPJPY": 0.6,
+    "XAUUSD": 0.2, "XAGUSD": 1.2,
+    "US30":   3.5, "NAS100": 1.8,
 }
 
 # Legacy alias — kept so backtester import still resolves.
@@ -110,9 +123,11 @@ class SpreadCalculator:
             logger.warning("symbol_info spread unavailable for %s: %s", symbol, exc)
 
         # ── Method 3: account-type-specific static fallback ───────
-        acct_type = getattr(config, "HFM_ACCOUNT_TYPE", "ZERO_SPREAD").upper()
+        acct_type = getattr(config, "BROKER_ACCOUNT_TYPE", "ZERO_SPREAD").upper()
         if acct_type in ("PREMIUM", "PRO"):
             table = PREMIUM_FALLBACK_PIPS
+        elif acct_type == "IC_MARKETS_RAW":
+            table = IC_MARKETS_RAW_FALLBACK_PIPS
         else:
             table = ZERO_SPREAD_FALLBACK_PIPS
         fallback = table.get(symbol, DEFAULT_FALLBACK_PIPS)

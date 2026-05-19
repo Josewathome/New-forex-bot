@@ -65,12 +65,26 @@ SYMBOLS = ["GBPUSD", "XAUUSD", "USDJPY", "AUDUSD", "USDCHF"]
 # permanently on a different offset and you start the bot off-hours.
 BROKER_UTC_OFFSET_HOURS: int = 2
 
-# ── HFM Account Type ──────────────────────────────────────────────
-# "ZERO_SPREAD" : raw spread ≈ 0.0 pips + fixed commission per lot (best for bots)
-# "PREMIUM"     : spread-based pricing, no commission (~1.2+ pips on EURUSD)
-# "PRO"         : spread-based pricing, no commission (~0.5+ pips on EURUSD)
-# Set via .env:  HFM_ACCOUNT_TYPE=ZERO_SPREAD
-HFM_ACCOUNT_TYPE: str = os.environ.get("HFM_ACCOUNT_TYPE", "ZERO_SPREAD")
+# ── Broker / Account Type ─────────────────────────────────────────
+# Controls commission and spread cost model used across the entire bot.
+#
+# HFM accounts (set BROKER_ACCOUNT_TYPE in .env):
+#   "ZERO_SPREAD"      : HFM Zero Spread — raw spread ≈ 0 pips + $3–5/lot commission
+#   "PREMIUM"          : HFM Premium     — spread-based (~1.4+ pips), no commission
+#   "PRO"              : HFM Pro         — spread-based (~0.5+ pips), no commission
+#
+# IC Markets accounts:
+#   "IC_MARKETS_RAW"   : IC Markets Raw Spread — raw ECN spread + $3.50/lot/side commission
+#
+# Set via .env:  BROKER_ACCOUNT_TYPE=ZERO_SPREAD  (or IC_MARKETS_RAW, PREMIUM, etc.)
+# Legacy env var HFM_ACCOUNT_TYPE is still accepted for backwards compatibility.
+BROKER_ACCOUNT_TYPE: str = (
+    os.environ.get("BROKER_ACCOUNT_TYPE")
+    or os.environ.get("HFM_ACCOUNT_TYPE")
+    or "ZERO_SPREAD"
+).upper()
+# Keep HFM_ACCOUNT_TYPE as an alias so existing code referencing it still works.
+HFM_ACCOUNT_TYPE: str = BROKER_ACCOUNT_TYPE
 
 # Per-symbol opening commission in USD per standard lot — Zero Spread account only.
 # $3.00 / side  ($6.00 round-trip) for major forex pairs.
@@ -83,6 +97,21 @@ HFM_COMMISSION_USD: dict[str, float] = {
     "XAUUSD": 5.0, "XAGUSD": 5.0,
 }
 HFM_COMMISSION_USD_DEFAULT: float = 3.0  # fallback for symbols not in the map above
+
+# ── IC Markets Raw Spread Account ─────────────────────────────────
+# Broker: IC Markets (KE)
+# Account Type: Raw Spread
+# Commission: $3.50 / side ($7.00 round-trip) for all instruments.
+# Spreads: raw ECN, ~0.1 pips on EURUSD during liquid sessions.
+# Used when BROKER_ACCOUNT_TYPE=IC_MARKETS_RAW in .env
+IC_COMMISSION_PER_LOT_USD: float = float(os.environ.get("IC_COMMISSION_PER_LOT_USD", "3.50"))
+IC_COMMISSION_USD: dict[str, float] = {
+    "EURUSD": 3.50, "GBPUSD": 3.50, "USDJPY": 3.50,
+    "AUDUSD": 3.50, "USDCHF": 3.50, "NZDUSD": 3.50,
+    "EURGBP": 3.50, "USDCAD": 3.50, "EURJPY": 3.50, "GBPJPY": 3.50,
+    "XAUUSD": 3.50, "XAGUSD": 3.50,  # IC Markets charges same rate for metals
+}
+IC_COMMISSION_USD_DEFAULT: float = 3.50
 
 
 # ── Risk Management ────────────────────────────────────────────────

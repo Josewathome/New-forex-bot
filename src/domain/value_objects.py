@@ -125,4 +125,8 @@ class RiskParameters:
         """
         if sl_pips <= 0 or tick_value <= 0:
             return 0.0
-        return self.risk_amount / (sl_pips * tick_value)
+        # Include round-trip commission in the effective SL so position size
+        # reflects the true cost of the trade, not just the pip-stop distance.
+        commission_pips = self.commission_per_lot / tick_value if tick_value > 0 else 0.0
+        effective_sl_pips = sl_pips + commission_pips
+        return self.risk_amount / (effective_sl_pips * tick_value)

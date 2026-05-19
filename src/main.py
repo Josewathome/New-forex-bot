@@ -130,23 +130,36 @@ def _build_commission_map() -> dict:
     """
     Build a per-symbol commission dict in account currency.
 
-    Zero Spread: each symbol has its own USD rate (XAUUSD = $5/lot, majors = $3/lot).
-    Premium/Pro: commission is zero — spread covers broker cost.
+    HFM Zero Spread : $3/lot majors, $5/lot gold — commission only.
+    HFM Premium/Pro : $0 commission — spread is the cost.
+    IC Markets Raw  : $3.50/lot all instruments — spread + commission.
     """
-    acct_type = getattr(config, "HFM_ACCOUNT_TYPE", "ZERO_SPREAD").upper()
-    logger.info("HFM account type: %s", acct_type)
+    acct_type = getattr(config, "BROKER_ACCOUNT_TYPE", "ZERO_SPREAD").upper()
+    logger.info("Broker/account type: %s", acct_type)
 
     if acct_type in ("PREMIUM", "PRO"):
-        logger.info("Commission model: $0 (spread-based account)")
+        logger.info("Commission model: $0 (spread-based account — HFM Premium/Pro)")
         return {sym: 0.0 for sym in config.SYMBOLS}
 
+    if acct_type == "IC_MARKETS_RAW":
+        comm_usd_map = getattr(config, "IC_COMMISSION_USD", {})
+        default_usd  = getattr(config, "IC_COMMISSION_USD_DEFAULT", 3.50)
+        result = {}
+        for sym in config.SYMBOLS:
+            usd_rate = comm_usd_map.get(sym, default_usd)
+            result[sym] = _commission_in_account_ccy(usd_rate)
+            logger.info("  IC Markets commission %s: $%.2f USD → %.2f %s/lot",
+                        sym, usd_rate, result[sym], config.ACCOUNT_CURRENCY)
+        return result
+
+    # Default: HFM Zero Spread
     comm_usd_map = getattr(config, "HFM_COMMISSION_USD", {})
     default_usd  = getattr(config, "HFM_COMMISSION_USD_DEFAULT", 3.0)
     result = {}
     for sym in config.SYMBOLS:
         usd_rate = comm_usd_map.get(sym, default_usd)
         result[sym] = _commission_in_account_ccy(usd_rate)
-        logger.info("  Commission %s: $%.2f USD → %.2f %s/lot",
+        logger.info("  HFM commission %s: $%.2f USD → %.2f %s/lot",
                     sym, usd_rate, result[sym], config.ACCOUNT_CURRENCY)
     return result
 

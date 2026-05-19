@@ -89,10 +89,13 @@ class TradeJournal:
         self,
         trades: Optional[List[Dict[str, Any]]] = None,
         days:   Optional[int] = None,
+        since:  Optional[str] = None,   # ISO timestamp — only count trades closed after this
     ) -> Dict[str, Any]:
         if trades is None:
             closed = [t for t in self._trades if t["outcome"] != "OPEN"]
-            if days is not None:
+            if since is not None:
+                closed = [t for t in closed if (t.get("closed_at") or "") >= since]
+            elif days is not None:
                 cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
                 closed = [t for t in closed if (t.get("closed_at") or "") >= cutoff]
         else:
@@ -113,13 +116,22 @@ class TradeJournal:
             "avg_pnl":   round(total_pnl / len(closed), 2),
         }
 
-    def get_drawdown(self, initial_balance: float, days: Optional[int] = None) -> float:
-        """Return max drawdown % for the given period (all-time if days is None)."""
+    def get_drawdown(
+        self,
+        initial_balance: float,
+        days:  Optional[int] = None,
+        since: Optional[str] = None,   # ISO timestamp — only measure drawdown after this
+    ) -> float:
+        """Return max drawdown % for the given period (all-time if days/since are None)."""
         all_closed = sorted(
             [t for t in self._trades if t["outcome"] != "OPEN"],
             key=lambda t: t.get("closed_at") or "",
         )
-        if days is not None:
+        if since is not None:
+            # since takes priority over days when both are supplied
+            period = [t for t in all_closed if (t.get("closed_at") or "") >= since]
+            equity = initial_balance
+        elif days is not None:
             cutoff     = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
             pre_trades = [t for t in all_closed if (t.get("closed_at") or "") < cutoff]
             period     = [t for t in all_closed if (t.get("closed_at") or "") >= cutoff]
@@ -140,9 +152,15 @@ class TradeJournal:
                     max_dd = dd
         return round(max_dd, 2)
 
-    def get_stats_by_symbol(self, days: Optional[int] = None) -> Dict[str, Dict[str, Any]]:
+    def get_stats_by_symbol(
+        self,
+        days:  Optional[int] = None,
+        since: Optional[str] = None,   # ISO timestamp — only count trades closed after this
+    ) -> Dict[str, Dict[str, Any]]:
         all_closed = [t for t in self._trades if t["outcome"] != "OPEN"]
-        if days is not None:
+        if since is not None:
+            all_closed = [t for t in all_closed if (t.get("closed_at") or "") >= since]
+        elif days is not None:
             cutoff     = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
             all_closed = [t for t in all_closed if (t.get("closed_at") or "") >= cutoff]
         symbols = sorted({t["symbol"] for t in all_closed})

@@ -1,7 +1,6 @@
 # ── NEVER COMMIT THESE ────────────────────────
 .env
-*.env
-.env.*
+
 
 # ── Generated at runtime ──────────────────────
 ready_to_trade
