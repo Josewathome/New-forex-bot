@@ -53,8 +53,21 @@ fi
 # ── [3/6] Launch MT5 terminal ─────────────────────────────────────
 if [ -e "$mt5file" ]; then
     show_message "[3/6] Launching MT5 terminal..."
-    $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS &
+    # Pass broker credentials directly to terminal64.exe so MT5 auto-logs in
+    # on every container restart without requiring manual VNC login.
+    # /login /password /server are standard MT5 command-line arguments.
+    # Fall back to no credentials if env vars are not set (manual VNC login).
+    MT5_LOGIN_ARGS=""
+    if [ -n "${TRADING_ID:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:-}" ]; then
+        MT5_LOGIN_ARGS="/login:${TRADING_ID} /password:${MT5_PASSWORD} /server:${MT5_SERVER}"
+        show_message "[3/6] MT5 credentials provided — auto-login enabled."
+    else
+        show_message "[3/6] WARNING: TRADING_ID/MT5_PASSWORD/MT5_SERVER not set — manual VNC login required."
+    fi
+    $wine_executable start /unix "$mt5file" $MT5_LOGIN_ARGS $MT5_CMD_OPTIONS &
     show_message "[3/6] MT5 launched (PID $!)."
+    # Give MT5 time to start and authenticate before the Python bot tries to connect
+    sleep 15
 else
     show_message "[3/6] ERROR: MT5 binary not found — cannot continue."
     exit 1

@@ -62,6 +62,37 @@ def _setup_logging() -> None:
 logger = logging.getLogger("main")
 
 
+def _send_mt5_failure_email() -> None:
+    """Send a one-time alert email when all MT5 connection attempts fail."""
+    try:
+        from src.application.email_service import EmailService
+        svc = EmailService()
+        subject = "ZONE BOT ALERT: MT5 connection failed — action required"
+        body = (
+            f"The trading bot on server could not connect to MT5 after 5 attempts.\n\n"
+            f"Account : {config.TRADING_ID}\n"
+            f"Server  : {config.MT5_SERVER}\n\n"
+            f"This usually means MT5 needs to be logged in manually.\n\n"
+            f"ACTION REQUIRED:\n"
+            f"  1. Open the VNC interface at http://your-server-ip:3000\n"
+            f"  2. In MT5: File → Login to Trade Account\n"
+            f"     Login: {config.TRADING_ID}\n"
+            f"     Server: {config.MT5_SERVER}\n"
+            f"  3. Enable: Tools → Options → Expert Advisors → Allow Algorithmic Trading\n"
+            f"  4. Run this command to start the bot:\n"
+            f"     docker exec mt5 touch /bot/ready_to_trade\n\n"
+            f"The bot has stopped retrying to save server resources.\n"
+            f"Restart the container after completing VNC setup:\n"
+            f"  docker compose restart mt5\n"
+        )
+        if svc.send_report(subject, body):
+            logger.info("MT5 failure alert sent to %s", config.EMAIL_RECIPIENT)
+        else:
+            logger.warning("MT5 failure alert could not be sent — check EMAIL_* config in .env")
+    except Exception as exc:
+        logger.warning("Failed to send MT5 failure email: %s", exc)
+
+
 def connect_mt5() -> MT5Gateway:
     gw = MT5Gateway(
         login=    config.TRADING_ID,
@@ -76,7 +107,12 @@ def connect_mt5() -> MT5Gateway:
             "  2. Tools > Options > Expert Advisors > Allow Algorithmic Trading\n"
             "  3. Correct TRADING_ID / MT5_PASSWORD / MT5_SERVER"
         )
-        sys.exit(1)
+        _send_mt5_failure_email()
+        # Exit with 0 so Docker does NOT auto-restart the container.
+        # Restarting immediately would just repeat the same failure in a
+        # tight loop, wasting resources. The email tells the user to fix
+        # the MT5 login via VNC and then manually restart.
+        sys.exit(0)
     return gw
 
 
