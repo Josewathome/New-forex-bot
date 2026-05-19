@@ -106,7 +106,9 @@ if [ -e "$mt5file" ]; then
     # Give MT5 time to fully start, connect to broker, and complete the
     # access server handshake before the Python bot attempts mt5.initialize().
     # IC Markets takes longer than HFM due to their access server proxy layer.
-    sleep 45
+    # 60s is the safe minimum — IC Markets' access server proxy pool can take
+    # up to 45-60s to complete the initial authentication handshake.
+    sleep 60
     # MT5 rewrites common.ini on startup and resets Api=0.
     # Patch it back to Api=1 now that MT5 has finished its init write.
     if [ -f "${MT5_COMMON_INI:-}" ]; then

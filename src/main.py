@@ -100,7 +100,7 @@ def connect_mt5() -> MT5Gateway:
         server=   config.MT5_SERVER,
         mt5_path= config.MT5_PATH,
     )
-    if not gw.connect(retries=5, delay=6.0):
+    if not gw.connect(retries=10, delay=15.0):
         logger.critical(
             "MT5 connection failed.\n"
             "  1. MT5 open and charts loaded\n"
