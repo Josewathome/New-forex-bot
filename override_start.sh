@@ -115,6 +115,33 @@ echo "  4. When ready, run:"
 echo "     docker exec mt5 touch /bot/ready_to_trade"
 echo ""
 
+# ── Relaunch Xvnc with better settings for usable VNC ────────────
+# The base image starts Xvnc with -RectThreads 0 (single-threaded screen
+# encoding) and -geometry 1024x768, making the VNC completely laggy and
+# unusable for MT5 setup. We kill it and relaunch with:
+#   -RectThreads 4  : use 4 CPU threads for screen encoding (server has 12)
+#   -geometry 1280x900 : enough room for MT5 dialogs to fit without clipping
+# This runs before the ready_to_trade wait so VNC is responsive during setup.
+pkill -f "Xvnc :1" 2>/dev/null || true
+sleep 2
+/usr/local/bin/Xvnc :1 \
+    -PublicIP 127.0.0.1 \
+    -drinode /dev/dri/renderD128 \
+    -disableBasicAuth \
+    -SecurityTypes None \
+    -AlwaysShared \
+    -http-header Cross-Origin-Embedder-Policy=require-corp \
+    -http-header Cross-Origin-Opener-Policy=same-origin \
+    -geometry 1280x900 \
+    -sslOnly 0 \
+    -RectThreads 4 \
+    -websocketPort 6901 \
+    -interface 0.0.0.0 \
+    -Log "*:stdout:10" &
+sleep 2
+DISPLAY=:1 /usr/bin/openbox --startup /usr/lib/x86_64-linux-gnu/openbox-autostart OPENBOX &
+sleep 1
+
 while [ ! -f /bot/ready_to_trade ]; do
     sleep 5
 done
