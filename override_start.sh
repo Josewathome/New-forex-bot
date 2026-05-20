@@ -79,23 +79,23 @@ MT5_COMMON_INI="${MT5_CONFIG_DIR}/common.ini"
 if [ -n "${TRADING_ID:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:-}" ]; then
     show_message "[3/6] Writing MT5 credentials to common.ini …"
     mkdir -p "${MT5_CONFIG_DIR}"
-    # Unlock in case previous run locked it read-only
+    # Unlock in case a previous run locked it
     chmod 644 "${MT5_COMMON_INI}" 2>/dev/null || true
 
-    # Preserve any existing sections other than [Common] and [Experts].
-    # We rewrite only those two sections so we don't lose chart/object settings.
-    # Use printf to avoid locale-dependent echo behaviour.
+    # Preserve every existing section except [Common] so we don't disturb
+    # MT5's saved Expert Advisor settings, chart layouts, etc.
     EXISTING=""
     if [ -f "${MT5_COMMON_INI}" ]; then
-        # Extract everything except [Common] and [Experts] blocks
         EXISTING=$(awk '
             /^\[Common\]/ { skip=1; next }
-            /^\[Experts\]/ { skip=1; next }
             /^\[/ { skip=0 }
             !skip { print }
         ' "${MT5_COMMON_INI}" 2>/dev/null || true)
     fi
 
+    # Write only [Common] — credentials for auto-login.
+    # Do NOT touch [Experts]: MT5 manages those flags itself and any
+    # interference causes it to disable the Python API on account change.
     printf '[Common]\r\n'                          >  "${MT5_COMMON_INI}"
     printf 'Login=%s\r\n'   "${TRADING_ID}"        >> "${MT5_COMMON_INI}"
     printf 'Password=%s\r\n' "${MT5_PASSWORD}"     >> "${MT5_COMMON_INI}"
@@ -104,23 +104,11 @@ if [ -n "${TRADING_ID:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:
     printf 'ProxyType=0\r\n'                       >> "${MT5_COMMON_INI}"
     printf 'ProxyAddress=\r\n'                     >> "${MT5_COMMON_INI}"
     printf 'NewsEnable=1\r\n'                      >> "${MT5_COMMON_INI}"
-    printf '[Experts]\r\n'                         >> "${MT5_COMMON_INI}"
-    printf 'AllowDllImport=1\r\n'                  >> "${MT5_COMMON_INI}"
-    printf 'Enabled=1\r\n'                         >> "${MT5_COMMON_INI}"
-    # Api=1  → do NOT disable Python API access
-    # Account=0 → do NOT auto-disable trading when account changes (this is
-    #              the root cause: IC Markets login triggers "account changed"
-    #              which auto-ticks "Disable via external Python API")
-    # Profile=0, Chart=0 → do not disable on profile/chart changes either
-    printf 'Api=1\r\n'                             >> "${MT5_COMMON_INI}"
-    printf 'Account=0\r\n'                         >> "${MT5_COMMON_INI}"
-    printf 'Profile=0\r\n'                         >> "${MT5_COMMON_INI}"
-    printf 'Chart=0\r\n'                           >> "${MT5_COMMON_INI}"
-    # Append any remaining sections (Charts, Objects, etc.) that were preserved
+    # Re-append all other sections unchanged
     if [ -n "${EXISTING}" ]; then
         printf '%s\r\n' "${EXISTING}"              >> "${MT5_COMMON_INI}"
     fi
-    show_message "[3/6] common.ini written — auto-login + algo trading enabled."
+    show_message "[3/6] common.ini written — credentials set for auto-login."
 else
     show_message "[3/6] WARNING: TRADING_ID/MT5_PASSWORD/MT5_SERVER not set — manual VNC login required."
 fi
@@ -171,30 +159,8 @@ if [ -e "$mt5file" ]; then
         show_message "[3/6] WARNING: MT5 auth not confirmed after ${MT5_WAIT_SECS}s — starting bot anyway."
         show_message "[3/6] If IC Markets shows a mobile auth request, approve it in your client portal."
     fi
-    # MT5 rewrites common.ini after auth and resets Api=0, Account=1 etc.
-    # Wait an extra 10s for MT5 to finish its post-auth file writes,
-    # then patch every "disable" flag back to the correct values.
-    sleep 10
-    if [ -f "${MT5_COMMON_INI:-}" ]; then
-        show_message "[3/6] Patching Expert Advisor flags in common.ini..."
-        # Api=1     — allow Python API (key fix: MT5 resets this to 0)
-        # Account=0 — do NOT disable trading when account changes
-        # Profile=0 — do NOT disable trading when profile changes
-        # Chart=0   — do NOT disable trading when chart changes
-        # Ensure file is writable before patching (in case previous run locked it)
-        chmod 644 "${MT5_COMMON_INI}" 2>/dev/null || true
-        sed -i \
-            -e 's/^Api=.*/Api=1/' \
-            -e 's/^Account=.*/Account=0/' \
-            -e 's/^Profile=.*/Profile=0/' \
-            -e 's/^Chart=.*/Chart=0/' \
-            "${MT5_COMMON_INI}"
-        # Lock the file read-only so MT5 cannot reset these flags again.
-        # MT5 will log a write error but will still run using the in-memory
-        # values it already loaded — the flags stay correct for this session.
-        chmod 444 "${MT5_COMMON_INI}"
-        show_message "[3/6] EA flags patched and file locked read-only — Python API stays enabled."
-    fi
+    # Give MT5 a moment to finish writing its own post-auth updates to common.ini
+    sleep 5
 else
     show_message "[3/6] ERROR: MT5 binary not found — cannot continue."
     exit 1
