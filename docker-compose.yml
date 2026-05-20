@@ -25,6 +25,14 @@ services:
       - DASHBOARD_PASSWORD=${DASHBOARD_PASSWORD}
       - JWT_ACCESS_EXPIRES_MINUTES=${JWT_ACCESS_EXPIRES_MINUTES:-15}
       - JWT_REFRESH_EXPIRES_DAYS=${JWT_REFRESH_EXPIRES_DAYS:-7}
+      # KasmVNC performance — 4 rect threads eliminates the UI lag caused
+      # by the default -RectThreads 0 (single-threaded rendering).
+      # Resolution bumped from 1024x768 to 1280x900 for better MT5 usability.
+      - DRINODE=/dev/dri/renderD128
+      - DISPLAY_SIZEW=1280
+      - DISPLAY_SIZEH=900
+      - DISPLAY_REFRESH=60
+      - KASMVNC_RECT_THREADS=4
     dns:
       - 1.1.1.1
       - 1.0.0.1

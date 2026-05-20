@@ -27,6 +27,23 @@ is_wine_python_package_installed() {
 check_dependency "curl"
 check_dependency "$wine_executable"
 
+# ── [0/6] KasmVNC performance fix ─────────────────────────────────
+# The base image starts Xvnc with -RectThreads 0 (single-threaded),
+# causing severe UI lag in MT5. Patch the kasmvnc config to use 4
+# threads and a sensible resolution before the desktop starts.
+KASMVNC_CFG="${HOME}/.vnc/kasmvnc.yaml"
+if [ -f "${KASMVNC_CFG}" ]; then
+    # Patch RectThreads if present, otherwise append it
+    if grep -q "rect_threads" "${KASMVNC_CFG}" 2>/dev/null; then
+        sed -i 's/rect_threads:.*/rect_threads: 4/' "${KASMVNC_CFG}"
+    else
+        printf '\nserver:\n  rect_threads: 4\n' >> "${KASMVNC_CFG}"
+    fi
+    show_message "[0/6] KasmVNC rect_threads set to 4."
+else
+    show_message "[0/6] kasmvnc.yaml not found — VNC thread patch skipped."
+fi
+
 # ── [0/6] Pin Wine MachineGuid ────────────────────────────────────
 # IC Markets treats each unique MachineGuid as a new device and triggers
 # a mobile authorization request. Wine regenerates this GUID on every
@@ -143,14 +160,37 @@ if [ -e "$mt5file" ]; then
     # this is robust against IC Markets' variable Access Server latency.
     MT5_LOG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Logs"
     MT5_LOG_FILE="${MT5_LOG_DIR}/$(date +%Y%m%d).log"
-    MT5_WAIT_SECS=30    # maximum seconds to wait for broker auth
-    MT5_POLL_SECS=3     # polling interval
+    MT5_WAIT_SECS=120   # IC Markets Access Server pool rotation can take 60-90s
+    MT5_POLL_SECS=5     # polling interval
     waited=0
+    last_auth_time=0
     show_message "[3/6] Waiting for MT5 broker auth (up to ${MT5_WAIT_SECS}s)…"
     while [ $waited -lt $MT5_WAIT_SECS ]; do
-        if [ -f "${MT5_LOG_FILE}" ] && grep -qi "authorized" "${MT5_LOG_FILE}" 2>/dev/null; then
-            show_message "[3/6] MT5 broker auth confirmed after ${waited}s."
-            break
+        if [ -f "${MT5_LOG_FILE}" ]; then
+            # Check for a STABLE authorized state: "authorized" must appear AND
+            # "disconnected" must NOT appear after the last "authorized" line.
+            # IC Markets sometimes authorizes then immediately disconnects (log shows
+            # "authorized at 09:53:46" then "disconnected at 09:53:46" same second).
+            # We only proceed when the last relevant line is an auth confirmation.
+            last_relevant=$(grep -i -E "(authorized on|disconnected from|Invalid account)" "${MT5_LOG_FILE}" 2>/dev/null | tail -1)
+            if echo "${last_relevant}" | grep -qi "authorized on"; then
+                show_message "[3/6] MT5 broker auth stable after ${waited}s."
+                last_auth_time=$waited
+                # Wait an extra 10s to confirm it doesn't immediately disconnect again
+                sleep 10
+                last_after=$(grep -i -E "(authorized on|disconnected from|Invalid account)" "${MT5_LOG_FILE}" 2>/dev/null | tail -1)
+                if echo "${last_after}" | grep -qi "authorized on"; then
+                    show_message "[3/6] MT5 auth confirmed stable — proceeding."
+                    break
+                else
+                    show_message "[3/6] MT5 auth unstable (disconnected after auth) — waiting..."
+                    waited=$((waited + 10))
+                fi
+            elif echo "${last_relevant}" | grep -qi "Invalid account"; then
+                show_message "[3/6] WARNING: IC Markets rejected account (Invalid account). Demo may be expired."
+                show_message "[3/6] Check your IC Markets demo account status — it may need renewal."
+                break
+            fi
         fi
         sleep $MT5_POLL_SECS
         waited=$((waited + MT5_POLL_SECS))
@@ -220,8 +260,45 @@ echo "  4. When ready, run:"
 echo "     docker exec mt5 touch /config/ready_to_trade"
 echo ""
 
-# ready_to_trade lives in the persisted config volume (/config) so that
-# wiping volumes on a full reset forces the setup prompt again.
+# Remove any stale ready_to_trade flag from a previous run so the bot
+# cannot start against a terminal that hasn't finished broker auth yet.
+# The flag must be re-created by the operator (or the auto-wait below)
+# after MT5 reaches a stable connected state on THIS container start.
+rm -f /config/ready_to_trade
+
+# Auto-confirm once MT5 reaches a stable broker connection — no manual
+# touch needed on routine restarts.  The operator only needs to intervene
+# when MT5 shows a login dialog (first run or after credential change).
+MT5_LOG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Logs"
+MT5_AUTO_WAIT=180   # seconds to wait for stable connection before giving up
+MT5_AUTO_POLL=5
+auto_waited=0
+show_message "[auto] Waiting for MT5 stable broker connection before starting bot…"
+while [ $auto_waited -lt $MT5_AUTO_WAIT ]; do
+    # Find the most recent MT5 log file (handles Wine/system timezone mismatch)
+    latest_log=$(ls -t "${MT5_LOG_DIR}"/*.log 2>/dev/null | head -1)
+    if [ -n "${latest_log}" ]; then
+        last_relevant=$(grep -i -E "(authorized on|terminal synchronized|disconnected from|invalid account)" \
+            "${latest_log}" 2>/dev/null | tail -1)
+        if echo "${last_relevant}" | grep -qi "terminal synchronized"; then
+            show_message "[auto] MT5 broker connection stable — auto-confirming ready_to_trade."
+            touch /config/ready_to_trade
+            break
+        elif echo "${last_relevant}" | grep -qi "invalid account"; then
+            show_message "[auto] MT5 reports 'Invalid account' — manual VNC login required."
+            show_message "[auto] Open http://localhost:3000, log in, then run:"
+            show_message "[auto]   docker exec mt5 touch /config/ready_to_trade"
+            break
+        fi
+    fi
+    sleep $MT5_AUTO_POLL
+    auto_waited=$((auto_waited + MT5_AUTO_POLL))
+done
+if [ $auto_waited -ge $MT5_AUTO_WAIT ]; then
+    show_message "[auto] MT5 stable connection not detected in ${MT5_AUTO_WAIT}s — manual confirmation required."
+fi
+
+# ready_to_trade lives in the persisted config volume (/config).
 while [ ! -f /config/ready_to_trade ]; do
     sleep 5
 done

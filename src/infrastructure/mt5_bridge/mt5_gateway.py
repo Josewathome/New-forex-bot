@@ -69,8 +69,51 @@ class MT5Gateway:
             from mt5linux import MetaTrader5 as _MT5Bridge
             mt5 = _MT5Bridge(host=_mt5_host, port=_mt5_port)
 
-
         import time as _time
+
+        # Pre-flight: check MT5 terminal log for stable broker connection before
+        # attempting mt5.initialize(). On IC Markets, the terminal sometimes
+        # authorizes then immediately disconnects (Access Server pool rotation).
+        # mt5.initialize() returns -6 against a disconnected terminal even if
+        # credentials are correct — we must wait for a stable connected state.
+        # Use the most-recent .log file rather than a date-derived name to handle
+        # Wine/container timezone mismatches that would produce the wrong filename.
+        _log_dir = "/config/.wine/drive_c/Program Files/MetaTrader 5/Logs"
+        import os as _os, glob as _glob
+        def _latest_mt5_log():
+            logs = sorted(_glob.glob(_os.path.join(_log_dir, "*.log")),
+                          key=_os.path.getmtime, reverse=True)
+            return logs[0] if logs else None
+
+        _preflight_waited = 0
+        _preflight_max = 90  # seconds to wait for terminal to reach stable auth
+        while _preflight_waited < _preflight_max:
+            _log_path = _latest_mt5_log()
+            if _log_path:
+                try:
+                    with open(_log_path, "r", errors="replace") as _lf:
+                        _lines = _lf.read()
+                    _relevant = [l for l in _lines.splitlines()
+                                 if any(kw in l.lower() for kw in
+                                        ("authorized on", "disconnected from", "invalid account",
+                                         "terminal synchronized"))]
+                    if _relevant:
+                        _last = _relevant[-1].lower()
+                        if "terminal synchronized" in _last:
+                            logger.info("MT5 terminal log shows stable broker connection — proceeding.")
+                            break
+                        elif "invalid account" in _last:
+                            logger.error(
+                                "MT5 terminal log shows 'Invalid account' — credentials rejected "
+                                "by IC Markets. Check TRADING_ID/MT5_PASSWORD/MT5_SERVER in .env."
+                            )
+                            return False
+                except (FileNotFoundError, PermissionError):
+                    pass
+            logger.info("Waiting for MT5 terminal broker connection… (%ds elapsed)", _preflight_waited)
+            _time.sleep(10)
+            _preflight_waited += 10
+
         for attempt in range(1, retries + 1):
             logger.info("MT5 connect attempt %d/%d …", attempt, retries)
             kwargs: dict = {
@@ -88,7 +131,12 @@ class MT5Gateway:
                 if code == -10005:
                     logger.error("Terminal not running. Open MT5, log in, wait for charts.")
                 elif code == -6:
-                    logger.error("Auth failed. Run as same user/admin level as MT5.")
+                    logger.error(
+                        "mt5.initialize() -6: terminal is running but rejected the IPC session. "
+                        "This happens when MT5 is disconnected from the broker (IC Markets "
+                        "Access Server rotation) or the demo account is expired/invalid. "
+                        "Check MT5 terminal log for 'disconnected' or 'Invalid account'."
+                    )
                 elif code == -2:
                     logger.error("Bad server name '%s'. Check File→Open Account in MT5.", self.server)
                 if attempt < retries:
