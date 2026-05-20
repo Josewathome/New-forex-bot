@@ -105,7 +105,15 @@ if [ -n "${TRADING_ID:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:
     printf '[Experts]\r\n'                         >> "${MT5_COMMON_INI}"
     printf 'AllowDllImport=1\r\n'                  >> "${MT5_COMMON_INI}"
     printf 'Enabled=1\r\n'                         >> "${MT5_COMMON_INI}"
+    # Api=1  → do NOT disable Python API access
+    # Account=0 → do NOT auto-disable trading when account changes (this is
+    #              the root cause: IC Markets login triggers "account changed"
+    #              which auto-ticks "Disable via external Python API")
+    # Profile=0, Chart=0 → do not disable on profile/chart changes either
     printf 'Api=1\r\n'                             >> "${MT5_COMMON_INI}"
+    printf 'Account=0\r\n'                         >> "${MT5_COMMON_INI}"
+    printf 'Profile=0\r\n'                         >> "${MT5_COMMON_INI}"
+    printf 'Chart=0\r\n'                           >> "${MT5_COMMON_INI}"
     # Append any remaining sections (Charts, Objects, etc.) that were preserved
     if [ -n "${EXISTING}" ]; then
         printf '%s\r\n' "${EXISTING}"              >> "${MT5_COMMON_INI}"
@@ -114,6 +122,25 @@ if [ -n "${TRADING_ID:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:
 else
     show_message "[3/6] WARNING: TRADING_ID/MT5_PASSWORD/MT5_SERVER not set — manual VNC login required."
 fi
+
+# ── [3/6] Wipe stale MT5 account cache ───────────────────────────
+# MT5 stores broker sessions in an encrypted accounts.dat tied to the
+# Wine machine identity. On IC Markets, a stale/mismatched cache causes
+# the terminal to silently fail broker auth (no login dialog, no -6 at
+# terminal level — just the Python API gets Authorization failed).
+# Deleting it before every launch forces MT5 to do a clean login using
+# the credentials in common.ini rather than replaying a broken session.
+MT5_INSTALL_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5"
+for stale_file in \
+    "${MT5_INSTALL_DIR}/config/accounts.dat" \
+    "${MT5_INSTALL_DIR}/config/metaeditor.ini" \
+    "${MT5_INSTALL_DIR}/config/network.dat"; do
+    if [ -f "${stale_file}" ]; then
+        show_message "[3/6] Removing stale cache: $(basename ${stale_file})"
+        rm -f "${stale_file}"
+    fi
+done
+show_message "[3/6] Account cache cleared — MT5 will do a fresh login."
 
 # ── [3/6] Launch MT5 terminal ─────────────────────────────────────
 if [ -e "$mt5file" ]; then
@@ -142,12 +169,29 @@ if [ -e "$mt5file" ]; then
         show_message "[3/6] WARNING: MT5 auth not confirmed after ${MT5_WAIT_SECS}s — starting bot anyway."
         show_message "[3/6] If IC Markets shows a mobile auth request, approve it in your client portal."
     fi
-    # MT5 rewrites common.ini on startup and resets Api=0.
-    # Patch it back to Api=1 now that MT5 has finished its init write.
+    # MT5 rewrites common.ini after auth and resets Api=0, Account=1 etc.
+    # Wait an extra 10s for MT5 to finish its post-auth file writes,
+    # then patch every "disable" flag back to the correct values.
+    sleep 10
     if [ -f "${MT5_COMMON_INI:-}" ]; then
-        show_message "[3/6] Patching Api=1 in common.ini after MT5 init..."
-        sed -i 's/^Api=.*/Api=1/' "${MT5_COMMON_INI}"
-        show_message "[3/6] Api=1 patched."
+        show_message "[3/6] Patching Expert Advisor flags in common.ini..."
+        # Api=1     — allow Python API (key fix: MT5 resets this to 0)
+        # Account=0 — do NOT disable trading when account changes
+        # Profile=0 — do NOT disable trading when profile changes
+        # Chart=0   — do NOT disable trading when chart changes
+        # Ensure file is writable before patching (in case previous run locked it)
+        chmod 644 "${MT5_COMMON_INI}" 2>/dev/null || true
+        sed -i \
+            -e 's/^Api=.*/Api=1/' \
+            -e 's/^Account=.*/Account=0/' \
+            -e 's/^Profile=.*/Profile=0/' \
+            -e 's/^Chart=.*/Chart=0/' \
+            "${MT5_COMMON_INI}"
+        # Lock the file read-only so MT5 cannot reset these flags again.
+        # MT5 will log a write error but will still run using the in-memory
+        # values it already loaded — the flags stay correct for this session.
+        chmod 444 "${MT5_COMMON_INI}"
+        show_message "[3/6] EA flags patched and file locked read-only — Python API stays enabled."
     fi
 else
     show_message "[3/6] ERROR: MT5 binary not found — cannot continue."
