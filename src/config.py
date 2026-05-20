@@ -557,7 +557,7 @@ ZONES_DIR            = "zones"
 
 # ── Checkpoint ────────────────────────────────────────────────────
 CHECKPOINT_DIR           = ".checkpoints"
-CHECKPOINT_INTERVAL_MIN  = 15      # save checkpoint every N minutes
+CHECKPOINT_INTERVAL_MIN  = 5       # save checkpoint every N minutes (worst-case gap on power loss)
 CHECKPOINT_RETAIN_DAYS   = 7       # keep dated daily backups for this many days, then delete
 
 # ── Dashboard ─────────────────────────────────────────────────────

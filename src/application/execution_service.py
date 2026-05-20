@@ -118,6 +118,7 @@ class ExecutionService:
         min_rr:            float,
         account_currency:  str,
         journal:           Optional[TradeJournal] = None,
+        clock=             None,   # BrokerClock instance — injected from main.py
     ) -> None:
         self._md          = market_data
         self._tr          = trade_repo
@@ -130,6 +131,7 @@ class ExecutionService:
         self._min_rr      = min_rr
         self._currency    = account_currency
         self._journal     = journal
+        self._clock       = clock   # BrokerClock | None
         self._zone_mapper = ZoneMapper()
         self._trade_states: Dict[int, _OpenTradeState] = {}
         self._loss_streak:  Dict[str, int]      = {}
@@ -140,6 +142,25 @@ class ExecutionService:
         # M30/M5 bar close.  Dict key = symbol, value = List[Zone].
         self._m30_zones: Dict[str, List[Zone]] = {}
         self._m5_zones:  Dict[str, List[Zone]] = {}
+        # Gap-recovery controls:
+        #   _replay_mode     — when True, collect_entry_candidate() is a no-op.
+        #                      Used by GapRecoveryService to replay historical candles
+        #                      through monitoring logic without triggering entries.
+        #   _min_signal_time — after gap recovery, any signal whose created_at ≤ this
+        #                      timestamp is treated as stale and blocked from execution.
+        #                      Reset to None after the first live loop completes.
+        self._replay_mode:     bool                  = False
+        self._min_signal_time: Optional[datetime]    = None
+
+    def _now(self) -> datetime:
+        """
+        Current time from IC Markets broker clock.
+        Falls back to datetime.now(utc) only if no clock was injected
+        (e.g. during unit tests or backtester runs).
+        """
+        if self._clock is not None:
+            return self._clock.now()
+        return datetime.now(tz=timezone.utc)
 
     def run_zone_mapping(self, symbol: str) -> None:
         h1 = self._md.get_candles(symbol, Timeframe.H1, config.H1_CANDLE_COUNT)
@@ -207,7 +228,7 @@ class ExecutionService:
 
     def run_monitoring_only(self, symbol: str) -> None:
         """Prune closed positions and run the trade-monitor for symbol."""
-        now = datetime.now(tz=timezone.utc)
+        now = self._now()
         self._prune_closed_positions()
         if getattr(config, "MONITOR_ENABLED", True):
             self._monitor_open_trades(symbol, now)
@@ -222,7 +243,13 @@ class ExecutionService:
         EntryCandidate without placing a trade.  Returns None when no
         signal qualifies or preconditions (news / session / data) fail.
         """
-        now = datetime.now(tz=timezone.utc)
+        # During gap recovery replay, do not evaluate entries. Zone tapping and
+        # signal detection on historical bars would corrupt touch counts and
+        # could generate phantom trades.
+        if self._replay_mode:
+            return None
+
+        now = self._now()
 
         if self._news.is_blocked(symbol, now):
             return None
@@ -327,7 +354,8 @@ class ExecutionService:
 
             if not (ask <= zone.high + zone_buf and ask >= zone.low - zone_buf):
                 continue
-            zone.mark_tapped()
+            if not self._replay_mode:
+                zone.mark_tapped()
 
             m5 = self._md.get_candles(symbol, Timeframe.M5, config.M5_CANDLE_COUNT)
             if not m5:
@@ -521,6 +549,22 @@ class ExecutionService:
         symbol = candidate.symbol
         signal = candidate.signal
 
+        # Gap-recovery staleness guard: after a restart, ignore any signal whose
+        # source candle timestamp falls within the recovered gap period.  This
+        # prevents acting on a formation that was already "historical" at restart
+        # time rather than a fresh live signal.
+        if self._min_signal_time is not None:
+            sig_time = getattr(signal, "created_at", None)
+            if sig_time is not None and sig_time <= self._min_signal_time:
+                logger.info(
+                    "GAP GUARD | %s | signal created_at=%s ≤ gap boundary=%s — skipping stale signal",
+                    symbol, sig_time.isoformat(), self._min_signal_time.isoformat(),
+                )
+                return None
+            # Clear the guard after the first valid live signal attempt so it
+            # doesn't block entries indefinitely once the gap period has passed.
+            self._min_signal_time = None
+
         trade = self._build_trade(
             signal, candidate.broker_cost, candidate.pip_calc,
             candidate.tick_value, risk_pct_override=candidate.risk_pct,
@@ -564,7 +608,7 @@ class ExecutionService:
             lot_size=trade.lot_size,
             initial_risk=trade.initial_risk,
             mfe_price=signal.entry_price,
-            created_at=datetime.now(tz=timezone.utc),
+            created_at=self._now(),
             digits=candidate.digits,
             grade=candidate.grade,
         )
@@ -989,7 +1033,7 @@ class ExecutionService:
             del self._trade_states[t]
 
     def _update_streak(self, symbol: str, total_pips: float) -> None:
-        now = datetime.now(tz=timezone.utc)
+        now = self._now()
         if total_pips < 0:
             streak = self._loss_streak.get(symbol, 0) + 1
             self._loss_streak[symbol] = streak
@@ -1014,6 +1058,22 @@ class ExecutionService:
         """
         states = {}
         for ticket, s in self._trade_states.items():
+            # Serialise the M5 sliding window as a list of dicts so gap recovery
+            # can restore it and continue swing-trail calculations without needing
+            # to re-fetch candles just to rebuild the window.
+            m5_win_serialised = []
+            for c in s.m5_window:
+                try:
+                    m5_win_serialised.append({
+                        "time":  c.time.isoformat(),
+                        "open":  c.open,
+                        "high":  c.high,
+                        "low":   c.low,
+                        "close": c.close,
+                    })
+                except Exception:
+                    pass  # skip unserializable candle — window rebuilt on next live bar
+
             states[str(ticket)] = {
                 "ticket":           s.ticket,
                 "symbol":           s.symbol,
@@ -1034,6 +1094,8 @@ class ExecutionService:
                 "grade":            s.grade,
                 "created_at":       s.created_at.isoformat() if s.created_at else None,
                 "sl_trailed":       s.sl_trailed,
+                "last_m5_time":     s.last_m5_time.isoformat() if s.last_m5_time else None,
+                "m5_window":        m5_win_serialised,
             }
         streaks = {sym: count for sym, count in self._loss_streak.items()}
         pauses  = {sym: dt.isoformat() for sym, dt in self._streak_pause.items()}
@@ -1050,6 +1112,38 @@ class ExecutionService:
                 ticket = int(ticket_str)
                 created = (datetime.fromisoformat(s["created_at"])
                            if s.get("created_at") else None)
+
+                # Restore last M5 bar time so monitoring correctly detects
+                # new bars on the first loop tick after restart.
+                last_m5_iso = s.get("last_m5_time")
+                last_m5_dt  = None
+                if last_m5_iso:
+                    try:
+                        last_m5_dt = datetime.fromisoformat(last_m5_iso)
+                    except Exception:
+                        pass
+
+                # Restore the M5 sliding window from the checkpoint so that
+                # swing-trail calculations have context immediately on restart
+                # without waiting for 12 new live bars to accumulate.
+                m5_win: List[Candle] = []
+                digits_val = int(s.get("digits", 5))
+                sym_val    = s.get("symbol", "")
+                for cdict in s.get("m5_window", []):
+                    try:
+                        m5_win.append(Candle(
+                            time=      datetime.fromisoformat(cdict["time"]),
+                            open=      float(cdict["open"]),
+                            high=      float(cdict["high"]),
+                            low=       float(cdict["low"]),
+                            close=     float(cdict["close"]),
+                            volume=    0,
+                            symbol=    sym_val,
+                            timeframe= Timeframe.M5,
+                        ))
+                    except Exception:
+                        pass  # skip malformed candle entry
+
                 self._trade_states[ticket] = _OpenTradeState(
                     ticket=ticket,
                     symbol=s["symbol"],
@@ -1066,13 +1160,15 @@ class ExecutionService:
                     initial_risk=float(s.get("initial_risk", 0.0)),
                     mfe_price=float(s.get("mfe_price", s["entry"])),
                     accumulated_pips=float(s.get("accumulated_pips", 0.0)),
-                    digits=int(s.get("digits", 5)),
+                    digits=digits_val,
                     grade=s.get("grade", "?"),
                     created_at=created,
                     sl_trailed=bool(s.get("sl_trailed", False)),
+                    last_m5_time=last_m5_dt,
+                    m5_window=m5_win,
                 )
-                logger.info("Restored trade state: ticket=%s %s %s tp1_hit=%s",
-                            ticket, s["symbol"], s["direction"], s.get("tp1_hit"))
+                logger.info("Restored trade state: ticket=%s %s %s tp1_hit=%s m5_win=%d bars",
+                            ticket, s["symbol"], s["direction"], s.get("tp1_hit"), len(m5_win))
             except Exception as exc:
                 logger.warning("load_runtime_state: skip ticket=%s — %s", ticket_str, exc)
 
@@ -1123,7 +1219,7 @@ class ExecutionService:
             take_profit= final_tp,
             lot_size=    lot_size,
             status=      TradeStatus.PENDING,
-            created_at=  datetime.now(tz=timezone.utc),
+            created_at=  self._now(),
             commission=  sym_commission * lot_size,
             spread_cost= broker_cost.spread_pips,
         )

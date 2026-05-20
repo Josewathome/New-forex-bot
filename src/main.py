@@ -27,7 +27,7 @@ from typing import Optional
 import src.config as config
 
 from src.infrastructure.mt5_bridge.mt5_gateway  import MT5Gateway
-from src.infrastructure.market_data_repo         import MT5MarketDataRepository
+from src.infrastructure.market_data_repo         import MT5MarketDataRepository, BrokerClock
 from src.infrastructure.trade_repo               import MT5TradeRepository
 from src.infrastructure.news_client              import ForexNewsClient
 from src.infrastructure.mt5_news_client          import MT5NewsClient
@@ -116,7 +116,7 @@ def connect_mt5() -> MT5Gateway:
     return gw
 
 
-def build_services(gw: MT5Gateway, journal=None):
+def build_services(gw: MT5Gateway, journal=None, clock=None):
     market_data  = MT5MarketDataRepository(gw)
     trade_repo   = MT5TradeRepository(gw)
     zone_repo    = InMemoryZoneRepository(persist=True)
@@ -149,6 +149,7 @@ def build_services(gw: MT5Gateway, journal=None):
         min_rr=            config.MIN_RR,
         account_currency=  config.ACCOUNT_CURRENCY,
         journal=           journal,
+        clock=             clock,
     )
     return execution, news_manager, market_data, zone_repo
 
@@ -201,12 +202,10 @@ def _build_commission_map() -> dict:
 
 
 class H1ClockWatcher:
-    def __init__(self):
+    def __init__(self, broker_now: datetime) -> None:
         # Pre-seed with the current hour so the first loop tick does NOT fire.
-        # The initial zone mapping is already done explicitly before the loop starts;
-        # without seeding, _last=None would trigger a second redundant remap immediately.
-        now = datetime.now(tz=timezone.utc)
-        self._last = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
+        # Uses broker time so bar boundaries align with IC Markets candle closes.
+        self._last = int(broker_now.replace(minute=0, second=0, microsecond=0).timestamp())
 
     def should_remap(self, now: datetime) -> bool:
         h = int(now.replace(minute=0, second=0, microsecond=0).timestamp())
@@ -223,11 +222,28 @@ class _BarClockWatcher:
     Fires once per bar close — i.e. when the current bar boundary
     (floor(now / bar_seconds) * bar_seconds) changes from the last seen value.
     Pre-seeded at construction so the first loop tick never fires spuriously.
+    Always seeded from broker time, never the server's local clock.
     """
-    def __init__(self, bar_seconds: int) -> None:
+    def __init__(self, bar_seconds: int, broker_now: datetime) -> None:
         self._bar_seconds = bar_seconds
-        now = datetime.now(tz=timezone.utc)
-        self._last = int(now.timestamp()) // bar_seconds * bar_seconds
+        self._last = int(broker_now.timestamp()) // bar_seconds * bar_seconds
+
+    @classmethod
+    def with_last_bar(cls, bar_seconds: int, last_bar_ts: int) -> "_BarClockWatcher":
+        """
+        Construct with a known last-bar timestamp from a checkpoint.
+        Prevents the first live loop tick from spuriously firing a remap
+        for a bar that was already processed before the restart.
+        """
+        obj = cls.__new__(cls)
+        obj._bar_seconds = bar_seconds
+        obj._last = last_bar_ts
+        return obj
+
+    @property
+    def last_bar_ts(self) -> int:
+        """Epoch-seconds of the last bar boundary that was processed."""
+        return self._last
 
     def should_remap(self, now: datetime) -> bool:
         current = int(now.timestamp()) // self._bar_seconds * self._bar_seconds
@@ -237,17 +253,27 @@ class _BarClockWatcher:
         return False
 
 
-# Convenience aliases — used in run_live() to create watchers with clear names.
-M30ClockWatcher = lambda: _BarClockWatcher(30 * 60)   # fires every 30 min
-M5ClockWatcher  = lambda: _BarClockWatcher(5  * 60)   # fires every 5 min
+# Convenience factories — pass broker_now so bar boundaries use IC Markets time.
+def M30ClockWatcher(broker_now: datetime) -> _BarClockWatcher:
+    return _BarClockWatcher(30 * 60, broker_now)
+
+def M5ClockWatcher(broker_now: datetime) -> _BarClockWatcher:
+    return _BarClockWatcher(5 * 60, broker_now)
 
 
 def run_live() -> None:
     gw  = connect_mt5()
 
-    # Auto-detect broker server UTC offset. Only overwrite the config default when
-    # the detection returns a non-zero value — a 0 result means the market is closed
-    # and the EURUSD tick is stale (not that the broker is genuinely on UTC+0).
+    # ── Broker clock — single source of truth for "now" ───────────────
+    # All time-sensitive decisions use IC Markets server time, not the
+    # Linux host clock.  One instance is created here and passed to every
+    # component that needs the current time.
+    clock = BrokerClock(gw)
+    broker_now = clock.now()
+    logger.info("Broker time at startup: %s UTC", broker_now.strftime("%Y-%m-%dT%H:%M:%S"))
+
+    # Auto-detect broker server UTC offset (informational only — used to
+    # correct trade open_time display, not for any trading decisions).
     _detected_offset = gw.detect_utc_offset()
     if _detected_offset != 0:
         config.BROKER_UTC_OFFSET_HOURS = _detected_offset
@@ -260,7 +286,7 @@ def run_live() -> None:
                     acc.get("currency","?"), acc.get("server"))
 
     journal    = TradeJournal()
-    execution, news_manager, market_data, zone_repo = build_services(gw, journal)
+    execution, news_manager, market_data, zone_repo = build_services(gw, journal, clock=clock)
 
     cleanup    = CleanupService()
     checkpoint = CheckpointService(getattr(config,"CHECKPOINT_DIR",".checkpoints"))
@@ -278,6 +304,35 @@ def run_live() -> None:
                 execution.load_runtime_state(rt_state)
             except Exception as _rt_exc:
                 logger.warning("Runtime state restore failed — starting fresh: %s", _rt_exc)
+
+    # ── Gap recovery — reconstruct missed candles / zones since last checkpoint ──
+    # Must run AFTER load_runtime_state (so open trade states exist) and
+    # BEFORE initial zone mapping (gap recovery may do zone mapping itself).
+    from src.application.gap_recovery_service import GapRecoveryService
+    _gap_recovery      = GapRecoveryService(
+        execution=   execution,
+        market_data= market_data,
+        zone_repo=   zone_repo,
+        zone_store=  zone_store,
+        trade_repo=  gw,          # GapRecoveryService uses MT5Gateway for open positions
+        symbols=     config.SYMBOLS,
+        email_svc=   email_svc,
+        clock=       clock,
+    )
+    _gap_result        = None
+    _gap_zones_fresh   = False
+    if cp:
+        try:
+            _gap_result      = _gap_recovery.run(cp)
+            # zones_remapped is True whenever _remap_all_zones() ran — including the
+            # >3h skip path, which still remaps zones even though candle replay is skipped.
+            _gap_zones_fresh = _gap_result.zones_remapped
+            if _gap_result.warning_messages:
+                for _w in _gap_result.warning_messages:
+                    logger.warning("GAP RECOVERY: %s", _w)
+        except Exception as _gap_exc:
+            logger.exception("Gap recovery failed — continuing with fresh zone mapping: %s", _gap_exc)
+            _gap_zones_fresh = False
 
     # Re-apply any config values changed via the dashboard before last shutdown.
     # Must run AFTER checkpoint load and BEFORE building services that read config.
@@ -317,27 +372,44 @@ def run_live() -> None:
     try: signal.signal(signal.SIGTERM, _shutdown)
     except (OSError, ValueError): pass
 
-    logger.info("Initial zone mapping...")
-    for sym in config.SYMBOLS:
-        try:
-            execution.run_zone_mapping(sym)
-            zone_store.save_snapshot(sym, zone_repo.get_active_zones(sym), zone_repo.get_liquidity_pool(sym))
-        except Exception as exc:
-            logger.exception("Zone mapping [%s]: %s", sym, exc)
+    # Initial zone mapping — skip if gap recovery already produced fresh zones.
+    if not _gap_zones_fresh:
+        logger.info("Initial zone mapping...")
+        for sym in config.SYMBOLS:
+            try:
+                execution.run_zone_mapping(sym)
+                zone_store.save_snapshot(sym, zone_repo.get_active_zones(sym), zone_repo.get_liquidity_pool(sym))
+            except Exception as exc:
+                logger.exception("Zone mapping [%s]: %s", sym, exc)
 
     logger.info("Bot live. Account type: %s | Watching: %s",
                 getattr(config, "HFM_ACCOUNT_TYPE", "ZERO_SPREAD"),
                 " | ".join(config.SYMBOLS))
 
-    h1_watcher      = H1ClockWatcher()
-    m30_watcher     = M30ClockWatcher()
-    m5_watcher      = M5ClockWatcher()
-    last_checkpoint = datetime.now(tz=timezone.utc)
-    cp_interval     = getattr(config,"CHECKPOINT_INTERVAL_MIN",15) * 60
+    # Seed bar-clock watchers from checkpoint timestamps when available,
+    # otherwise from broker time so bar boundaries align with IC Markets.
+    # This prevents the first loop tick from falsely triggering a zone remap
+    # for a bar that was already processed before the last checkpoint.
+    def _make_watcher(bar_secs: int, cp_key: str) -> _BarClockWatcher:
+        if cp and cp.get(cp_key):
+            try:
+                return _BarClockWatcher.with_last_bar(bar_secs, int(cp[cp_key]))
+            except Exception:
+                pass
+        return _BarClockWatcher(bar_secs, clock.now())
+
+    h1_watcher      = _make_watcher(3600,      "last_h1_bar_ts")
+    m30_watcher     = _make_watcher(30 * 60,   "last_m30_bar_ts")
+    m5_watcher      = _make_watcher(5  * 60,   "last_m5_bar_ts")
+    last_checkpoint = clock.now()
+    cp_interval     = getattr(config,"CHECKPOINT_INTERVAL_MIN", 5) * 60
     loop_n          = 0
 
     while running[0]:
-        loop_start = datetime.now(tz=timezone.utc)
+        # Invalidate clock cache at the start of each tick so we get a
+        # fresh broker timestamp for this iteration.
+        clock.invalidate()
+        loop_start = clock.now()
         try:
             news_manager.refresh_if_needed(loop_start)
 
@@ -455,18 +527,28 @@ def run_live() -> None:
                     logger.warning("Runtime state serialisation failed: %s", _cp_exc)
                     rt_state = {}
                 checkpoint.save({
-                    "loop_n":        loop_n,
-                    "symbols":       config.SYMBOLS,
-                    "risk_pct":      config.RISK_PERCENT,
-                    "min_rr":        config.MIN_RR,
-                    "runtime_state": rt_state,
+                    "loop_n":          loop_n,
+                    "symbols":         config.SYMBOLS,
+                    "risk_pct":        config.RISK_PERCENT,
+                    "min_rr":          config.MIN_RR,
+                    "runtime_state":   rt_state,
+                    # Gap-recovery anchors — record the last bar boundary seen for
+                    # each timeframe so GapRecoveryService can detect missed bars.
+                    "last_h1_bar_ts":  h1_watcher.last_bar_ts,
+                    "last_m30_bar_ts": m30_watcher.last_bar_ts,
+                    "last_m5_bar_ts":  m5_watcher.last_bar_ts,
+                    "last_loop_ts":    loop_start.isoformat(),
                 })
                 last_checkpoint = loop_start
 
         except Exception as exc:
             logger.exception("Loop error: %s", exc)
 
-        elapsed = (datetime.now(tz=timezone.utc) - loop_start).total_seconds()
+        # Use monotonic wall-clock for sleep timing only — this is pure
+        # performance measurement (how long did the loop take?), not a
+        # trading decision, so local clock is correct here.
+        import time as _wall
+        elapsed = (clock.now() - loop_start).total_seconds()
         time.sleep(max(0.0, config.LOOP_INTERVAL_SECONDS - elapsed))
 
     scheduler.stop()

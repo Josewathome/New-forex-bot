@@ -566,7 +566,9 @@ def find_liquidity_pool(
         high=max(c.high for c in window),
         low=min(c.low   for c in window),
         lookback_candles=config.LIQUIDITY_LOOKBACK,
-        created_at=datetime.now(tz=timezone.utc),
+        # Use the last candle's timestamp — this is the broker-time moment
+        # the pool was detected, directly from IC Markets candle data.
+        created_at=window[-1].time,
     )
 
 
