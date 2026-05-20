@@ -166,52 +166,6 @@ if [ -e "$mt5file" ]; then
     show_message "[3/6] Launching MT5 terminal..."
     $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS &
     show_message "[3/6] MT5 launched (PID $!)."
-    # Wait for MT5 to fully connect to the broker before starting the Python bot.
-    # MT5 writes "authorized on <server>" to its daily log when the broker
-    # handshake is complete. We poll that file instead of using a blind sleep —
-    # this is robust against IC Markets' variable Access Server latency.
-    MT5_LOG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Logs"
-    MT5_LOG_FILE="${MT5_LOG_DIR}/$(date +%Y%m%d).log"
-    MT5_WAIT_SECS=120   # IC Markets Access Server pool rotation can take 60-90s
-    MT5_POLL_SECS=5     # polling interval
-    waited=0
-    last_auth_time=0
-    show_message "[3/6] Waiting for MT5 broker auth (up to ${MT5_WAIT_SECS}s)…"
-    while [ $waited -lt $MT5_WAIT_SECS ]; do
-        if [ -f "${MT5_LOG_FILE}" ]; then
-            # Check for a STABLE authorized state: "authorized" must appear AND
-            # "disconnected" must NOT appear after the last "authorized" line.
-            # IC Markets sometimes authorizes then immediately disconnects (log shows
-            # "authorized at 09:53:46" then "disconnected at 09:53:46" same second).
-            # We only proceed when the last relevant line is an auth confirmation.
-            last_relevant=$(grep -i -E "(authorized on|disconnected from|Invalid account)" "${MT5_LOG_FILE}" 2>/dev/null | tail -1)
-            if echo "${last_relevant}" | grep -qi "authorized on"; then
-                show_message "[3/6] MT5 broker auth stable after ${waited}s."
-                last_auth_time=$waited
-                # Wait an extra 10s to confirm it doesn't immediately disconnect again
-                sleep 10
-                last_after=$(grep -i -E "(authorized on|disconnected from|Invalid account)" "${MT5_LOG_FILE}" 2>/dev/null | tail -1)
-                if echo "${last_after}" | grep -qi "authorized on"; then
-                    show_message "[3/6] MT5 auth confirmed stable — proceeding."
-                    break
-                else
-                    show_message "[3/6] MT5 auth unstable (disconnected after auth) — waiting..."
-                    waited=$((waited + 10))
-                fi
-            elif echo "${last_relevant}" | grep -qi "Invalid account"; then
-                show_message "[3/6] WARNING: IC Markets rejected account (Invalid account). Demo may be expired."
-                show_message "[3/6] Check your IC Markets demo account status — it may need renewal."
-                break
-            fi
-        fi
-        sleep $MT5_POLL_SECS
-        waited=$((waited + MT5_POLL_SECS))
-    done
-    if [ $waited -ge $MT5_WAIT_SECS ]; then
-        show_message "[3/6] MT5 auth not confirmed in ${MT5_WAIT_SECS}s — continuing anyway."
-    fi
-    # Give MT5 a moment to finish writing its own post-auth updates to common.ini
-    sleep 5
 else
     show_message "[3/6] ERROR: MT5 binary not found — cannot continue."
     exit 1
@@ -256,64 +210,32 @@ if [ -f /bot/src/requirements.txt ]; then
     $wine_executable python -m pip install --no-cache-dir -r /bot/src/requirements.txt
 fi
 
-# ── FIRST-RUN INSTRUCTIONS ────────────────────────────────────────
-echo ""
-echo "════════════════════════════════════════════════════════"
-echo "  Zone Bot — running INSIDE Wine alongside MT5"
-echo "  (direct MetaTrader5 API — zero bridge latency)"
-echo "════════════════════════════════════════════════════════"
-echo ""
-echo "  ⚠️  One-time setup (first run only):"
-echo "  1. Open http://localhost:3000 in your browser"
-echo "  2. Log in to your broker account inside MT5"
-echo "  3. Tools → Options → Expert Advisors"
-echo "     → ✅ Allow Algorithmic Trading"
-echo "  4. When ready, run:"
-echo "     docker exec mt5 touch /config/ready_to_trade"
-echo ""
-
-# Remove any stale ready_to_trade flag from a previous run so the bot
-# cannot start against a terminal that hasn't finished broker auth yet.
-# The flag must be re-created by the operator (or the auto-wait below)
-# after MT5 reaches a stable connected state on THIS container start.
-rm -f /config/ready_to_trade
-
-# Auto-confirm once MT5 reaches a stable broker connection — no manual
-# touch needed on routine restarts.  The operator only needs to intervene
-# when MT5 shows a login dialog (first run or after credential change).
-MT5_LOG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Logs"
-MT5_AUTO_WAIT=180   # seconds to wait for stable connection before giving up
-MT5_AUTO_POLL=5
-auto_waited=0
-show_message "[auto] Waiting for MT5 stable broker connection before starting bot…"
-while [ $auto_waited -lt $MT5_AUTO_WAIT ]; do
-    # Find the most recent MT5 log file (handles Wine/system timezone mismatch)
-    latest_log=$(ls -t "${MT5_LOG_DIR}"/*.log 2>/dev/null | head -1)
-    if [ -n "${latest_log}" ]; then
-        last_relevant=$(grep -i -E "(authorized on|terminal synchronized|disconnected from|invalid account)" \
-            "${latest_log}" 2>/dev/null | tail -1)
-        if echo "${last_relevant}" | grep -qi "terminal synchronized"; then
-            show_message "[auto] MT5 broker connection stable — auto-confirming ready_to_trade."
-            touch /config/ready_to_trade
-            break
-        elif echo "${last_relevant}" | grep -qi "invalid account"; then
-            show_message "[auto] MT5 reports 'Invalid account' — manual VNC login required."
-            show_message "[auto] Open http://localhost:3000, log in, then run:"
-            show_message "[auto]   docker exec mt5 touch /config/ready_to_trade"
-            break
-        fi
-    fi
-    sleep $MT5_AUTO_POLL
-    auto_waited=$((auto_waited + MT5_AUTO_POLL))
-done
-if [ $auto_waited -ge $MT5_AUTO_WAIT ]; then
-    show_message "[auto] MT5 stable connection not detected in ${MT5_AUTO_WAIT}s — manual confirmation required."
+# ── WAIT FOR OPERATOR CONFIRMATION (first run only) ───────────────
+# /config is a persistent Docker volume — ready_to_trade survives
+# container restarts and power cuts so the bot resumes automatically.
+# Only missing on the very first run, or after:
+#   docker exec mt5 rm /config/ready_to_trade  (manual reset)
+if [ ! -f /config/ready_to_trade ]; then
+    echo ""
+    echo "════════════════════════════════════════════════════════"
+    echo "  Zone Bot — first-run setup required"
+    echo "════════════════════════════════════════════════════════"
+    echo ""
+    echo "  1. Open http://localhost:3000 — confirm MT5 is logged in"
+    echo "     and charts are loaded"
+    echo "  2. Tools → Options → Expert Advisors"
+    echo "     → ✅ Allow Algorithmic Trading"
+    echo "  3. Run this command to start the bot:"
+    echo "     docker exec mt5 touch /config/ready_to_trade"
+    echo ""
+    echo "  Waiting for ready_to_trade signal…"
+    while [ ! -f /config/ready_to_trade ]; do
+        sleep 5
+    done
+    echo "  ready_to_trade received — starting bot."
+else
+    echo "  ready_to_trade present — resuming bot immediately."
 fi
-
-# ready_to_trade lives in the persisted config volume (/config).
-while [ ! -f /config/ready_to_trade ]; do
-    sleep 5
-done
 
 # ── START BOT ─────────────────────────────────────────────────────
 # Wine reports os.name == "nt" so mt5_gateway.py uses direct
