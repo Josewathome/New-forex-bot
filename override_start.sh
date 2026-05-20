@@ -88,10 +88,21 @@ fi
 # MT5 reads login/password/server from Config/common.ini at startup.
 # Writing them here before terminal64.exe launches means MT5 auto-logs in
 # silently on every container restart — no GUI login dialog, no VNC needed.
-# We also set Api=1 (Allow Algorithmic Trading) so the bot can connect
-# immediately without requiring a manual Tools→Options→Expert Advisors step.
 MT5_CONFIG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Config"
 MT5_COMMON_INI="${MT5_CONFIG_DIR}/common.ini"
+
+# Docker Compose interpolates $VAR inside env values, corrupting passwords
+# that contain $ (e.g. SX2K$YBdH&zw5F becomes SX2K&zw5F).
+# Fix: re-read MT5_PASSWORD directly from /bot/.env using grep+sed so the
+# raw value is used exactly as typed — no shell or Compose interpolation.
+# /bot is the project root mounted as a volume (see docker-compose.yml).
+ENV_FILE="/bot/.env"
+if [ -f "${ENV_FILE}" ]; then
+    _raw_password=$(grep -m1 '^MT5_PASSWORD=' "${ENV_FILE}" | sed 's/^MT5_PASSWORD=//')
+    if [ -n "${_raw_password}" ]; then
+        MT5_PASSWORD="${_raw_password}"
+    fi
+fi
 
 if [ -n "${TRADING_ID:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:-}" ]; then
     show_message "[3/6] Writing MT5 credentials to common.ini …"
