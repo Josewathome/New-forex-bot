@@ -538,7 +538,7 @@ def run_live() -> None:
                     "last_m30_bar_ts": m30_watcher.last_bar_ts,
                     "last_m5_bar_ts":  m5_watcher.last_bar_ts,
                     "last_loop_ts":    loop_start.isoformat(),
-                })
+                }, now=loop_start)   # broker time → saved_at aligned with last_loop_ts
                 last_checkpoint = loop_start
 
         except Exception as exc:
@@ -552,7 +552,7 @@ def run_live() -> None:
         time.sleep(max(0.0, config.LOOP_INTERVAL_SECONDS - elapsed))
 
     scheduler.stop()
-    checkpoint.save({"symbols": config.SYMBOLS, "shutdown": "clean"})
+    checkpoint.save({"symbols": config.SYMBOLS, "shutdown": "clean"}, now=clock.now())
     gw.disconnect()
     logger.info("Bot stopped cleanly.")
 
