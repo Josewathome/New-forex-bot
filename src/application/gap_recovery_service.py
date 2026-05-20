@@ -5,7 +5,7 @@ When the bot stops (power cut, crash, manual restart), it misses
 live market events.  On restart this service:
 
   1. Computes the gap between the last checkpoint and now.
-  2. If the gap is ≤ 3 hours, reconstructs what happened:
+  2. Reconstructs what happened for the gap period (capped to 3 hours):
        a. Re-maps zones for any H1/M30/M5 bars that closed during gap.
        b. Fetches M5 candles from the gap period.
        c. Replays those candles through monitoring logic to update:
@@ -18,7 +18,9 @@ live market events.  On restart this service:
   3. Marks a `_min_signal_time` on ExecutionService so the first live
      loop does not act on signals whose formation candle fell inside
      the gap (stale historical setups).
-  4. If the gap is > 3 hours, re-maps zones only and logs a warning.
+  4. If the gap is > 3 hours, caps the reconstruction window to 3 hours
+     (always recovers the last 3h so the bot knows the current market
+     context and doesn't miss an imminent setup) and sends an alert email.
 
 Safety guarantees
 ─────────────────
@@ -37,7 +39,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, TYPE_CHECKING
 
 import src.config as config
@@ -169,30 +171,41 @@ class GapRecoveryService:
             now.strftime("%Y-%m-%dT%H:%M:%S"),
         )
 
-        # ── Step 2: enforce max gap ──────────────────────────────────
+        # ── Step 2: cap over-long gaps to MAX_GAP_SECONDS ───────────
+        # Even when the bot was offline for > 3 hours we still reconstruct
+        # the most-recent 3 hours of candles.  This ensures we always know
+        # the current market context: ongoing zone interactions, MFE progress
+        # on open trades, and any imminent setup that is about to trigger.
+        # `result.skipped = True` signals to main.py that the FULL gap was
+        # NOT reconstructed (so it can warn the operator), while the partial
+        # reconstruction still runs.
+        capped = False
         if gap_secs > MAX_GAP_SECONDS:
             msg = (
                 f"Gap of {gap_secs/3600:.1f}h exceeds the 3-hour recovery limit. "
-                f"Zone mapping only — trade monitoring NOT reconstructed."
+                f"Reconstruction capped to the last {MAX_GAP_SECONDS//3600}h — "
+                f"earlier market history is NOT replayed."
             )
-            logger.warning("GAP RECOVERY SKIP | %s", msg)
+            logger.warning("GAP RECOVERY | %s", msg)
             result.warning_messages.append(msg)
-            result.skipped = True
-            # Still run zone remapping and SL reconciliation — these are always safe.
-            self._remap_all_zones(result)
-            self._reconcile_sl_with_mt5(result)
+            result.skipped = True   # marks full-gap reconstruction as skipped
+            capped         = True
+            # Re-anchor gap_start to exactly 3 hours ago so the fetch and
+            # bar-count calculations work on the capped window.
+            gap_start = now - timedelta(seconds=MAX_GAP_SECONDS)
             self._send_gap_alert(gap_secs)
-            return result
 
         # ── Step 3: compute missed bar counts ────────────────────────
-        gs = gap_start.timestamp()
+        gs = gap_start.timestamp()   # already capped if gap > 3h
         ne = now.timestamp()
 
         # Prefer per-timeframe anchors from the checkpoint if available;
-        # fall back to the loop timestamp for all timeframes.
-        h1_anchor  = int(checkpoint.get("last_h1_bar_ts",  gs))
-        m30_anchor = int(checkpoint.get("last_m30_bar_ts", gs))
-        m5_anchor  = int(checkpoint.get("last_m5_bar_ts",  gs))
+        # fall back to gap_start for all timeframes.
+        # When the gap was capped, gs is now-3h, so bar counts reflect only
+        # the reconstruction window (not the total outage duration).
+        h1_anchor  = max(int(checkpoint.get("last_h1_bar_ts",  gs)), int(gs))
+        m30_anchor = max(int(checkpoint.get("last_m30_bar_ts", gs)), int(gs))
+        m5_anchor  = max(int(checkpoint.get("last_m5_bar_ts",  gs)), int(gs))
 
         result.h1_bars_missed  = _missed_bars(h1_anchor,  ne, 3600)
         result.m30_bars_missed = _missed_bars(m30_anchor, ne, 1800)
@@ -209,6 +222,8 @@ class GapRecoveryService:
         self._remap_all_zones(result)
 
         # ── Step 5: fetch gap M5 candles ─────────────────────────────
+        # gap_start is already capped to now-3h when the original gap was
+        # over the limit, so this fetch always covers at most 3 hours.
         gap_candles: Dict[str, List[Candle]] = {}
         for sym in self._symbols:
             try:
@@ -278,10 +293,11 @@ class GapRecoveryService:
                 latest_gap_m5.strftime("%Y-%m-%dT%H:%M:%S"),
             )
 
+        cap_note = f" (capped to last {MAX_GAP_SECONDS//3600}h)" if capped else ""
         logger.info(
-            "GAP RECOVERY COMPLETE | gap=%.0fs | H1=%d M30=%d M5=%d bars remapped | "
+            "GAP RECOVERY COMPLETE | gap=%.0fs%s | H1=%d M30=%d M5=%d bars in window | "
             "%d trade(s) reconstructed",
-            gap_secs,
+            gap_secs, cap_note,
             result.h1_bars_missed, result.m30_bars_missed, result.m5_bars_missed,
             result.trades_reconstructed,
         )
@@ -511,21 +527,26 @@ class GapRecoveryService:
         if not self._email:
             return
         try:
-            hours = gap_secs / 3600
-            subject = f"ZONE BOT: Long gap detected ({hours:.1f}h) — zones recomputed"
+            hours      = gap_secs / 3600
+            cap_hours  = MAX_GAP_SECONDS // 3600
+            subject    = f"ZONE BOT: Long gap detected ({hours:.1f}h) — partial recovery applied"
             body = (
                 f"The bot was offline for {hours:.1f} hours.\n\n"
-                f"Gap exceeded the 3-hour recovery limit, so trade monitoring "
-                f"was NOT reconstructed from historical candles.\n\n"
+                f"Gap exceeded the {cap_hours}-hour recovery limit.  The bot has "
+                f"automatically reconstructed the last {cap_hours} hours of market "
+                f"data to restore current context.  The earlier portion of the "
+                f"outage ({hours - cap_hours:.1f}h) could not be replayed.\n\n"
                 f"Actions taken automatically:\n"
                 f"  ✓ H1 / M30 / M5 zones recomputed from current candles\n"
                 f"  ✓ SL values reconciled against live MT5 positions\n"
-                f"  ✗ M5 candle replay skipped (gap too large)\n\n"
+                f"  ✓ Last {cap_hours}h of M5 candles replayed (MFE, m5_window, swing-trail)\n"
+                f"  ✗ Market events before the {cap_hours}h window were NOT replayed\n\n"
                 f"Action required:\n"
-                f"  • Review any open trades in MT5 — MFE tracking and swing-trail\n"
-                f"    SL calculations will resume from the current bar forward.\n"
-                f"  • If a trade should have been closed by time-exit logic, close it\n"
-                f"    manually via the MT5 terminal.\n\n"
+                f"  • Review any open trades in MT5 — particularly trades that were\n"
+                f"    opened before the {cap_hours}h reconstruction window.  MFE and\n"
+                f"    swing-trail history from before that window is lost.\n"
+                f"  • If a trade should have been closed by time-exit logic during\n"
+                f"    the full outage window, close it manually in MT5.\n\n"
                 f"Account : {config.TRADING_ID}\n"
                 f"Server  : {config.MT5_SERVER}\n"
             )
