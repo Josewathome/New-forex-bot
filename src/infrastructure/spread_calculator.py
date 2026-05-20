@@ -77,6 +77,9 @@ class SpreadCalculator:
         self._md             = market_data
         self._commission     = commission_per_lot         # fallback
         self._commission_map = commission_map or {}
+        # Last known good spread per symbol — used instead of static fallback
+        # when MT5 tick is momentarily unavailable. No sleep, no delay.
+        self._last_spread:   Dict[str, float] = {}
 
     def get_broker_cost(self, symbol: str) -> BrokerCost:
         digits     = self._md.get_symbol_digits(symbol)
@@ -108,6 +111,7 @@ class SpreadCalculator:
                 if 0 < spread_pips < 50:
                     logger.debug("%s live spread: %.2f pips (bid=%.5f ask=%.5f)",
                                  symbol, spread_pips, bid, ask)
+                    self._last_spread[symbol] = spread_pips  # cache it
                     return spread_pips
                 logger.warning("%s spread %.2f pips out of range — using fallback", symbol, spread_pips)
         except Exception as exc:
@@ -118,11 +122,17 @@ class SpreadCalculator:
             sp = self._md.get_spread_pips(symbol)
             if sp and 0 < sp < 50:
                 logger.debug("%s spread from symbol_info: %.2f pips", symbol, sp)
+                self._last_spread[symbol] = sp  # cache it
                 return sp
         except Exception as exc:
             logger.warning("symbol_info spread unavailable for %s: %s", symbol, exc)
 
-        # ── Method 3: account-type-specific static fallback ───────
+        # ── Method 3: last known good spread (no delay, no stale static) ─
+        if symbol in self._last_spread:
+            logger.debug("%s using last known spread: %.2f pips", symbol, self._last_spread[symbol])
+            return self._last_spread[symbol]
+
+        # ── Method 4: account-type-specific static fallback (first-run only) ─
         acct_type = getattr(config, "BROKER_ACCOUNT_TYPE", "ZERO_SPREAD").upper()
         if acct_type in ("PREMIUM", "PRO"):
             table = PREMIUM_FALLBACK_PIPS
@@ -133,7 +143,7 @@ class SpreadCalculator:
         fallback = table.get(symbol, DEFAULT_FALLBACK_PIPS)
         logger.warning(
             "%s using static fallback spread: %.2f pips "
-            "(MT5 data unavailable — market may be closed; account_type=%s)",
+            "(no live tick and no cached spread yet — market may be closed; account_type=%s)",
             symbol, fallback, acct_type,
         )
         return fallback

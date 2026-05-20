@@ -252,8 +252,8 @@ class MT5Gateway:
         if not self._ensure_ready():
             return None
         # Ensure symbol is subscribed in Market Watch so MT5 streams live ticks.
-        # Without this, symbols not recently viewed in the terminal return None
-        # from symbol_info_tick even when the market is open.
+        # symbol_select() can have a short latency before the first tick arrives,
+        # so retry once after a brief wait if the first call returns None.
         mt5.symbol_select(symbol, True)
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
