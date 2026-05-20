@@ -143,7 +143,7 @@ if [ -e "$mt5file" ]; then
     # this is robust against IC Markets' variable Access Server latency.
     MT5_LOG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Logs"
     MT5_LOG_FILE="${MT5_LOG_DIR}/$(date +%Y%m%d).log"
-    MT5_WAIT_SECS=120   # maximum seconds to wait for broker auth
+    MT5_WAIT_SECS=30    # maximum seconds to wait for broker auth
     MT5_POLL_SECS=3     # polling interval
     waited=0
     show_message "[3/6] Waiting for MT5 broker auth (up to ${MT5_WAIT_SECS}s)…"
@@ -156,8 +156,7 @@ if [ -e "$mt5file" ]; then
         waited=$((waited + MT5_POLL_SECS))
     done
     if [ $waited -ge $MT5_WAIT_SECS ]; then
-        show_message "[3/6] WARNING: MT5 auth not confirmed after ${MT5_WAIT_SECS}s — starting bot anyway."
-        show_message "[3/6] If IC Markets shows a mobile auth request, approve it in your client portal."
+        show_message "[3/6] MT5 auth not confirmed in ${MT5_WAIT_SECS}s — continuing anyway."
     fi
     # Give MT5 a moment to finish writing its own post-auth updates to common.ini
     sleep 5
