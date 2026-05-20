@@ -79,6 +79,8 @@ MT5_COMMON_INI="${MT5_CONFIG_DIR}/common.ini"
 if [ -n "${TRADING_ID:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:-}" ]; then
     show_message "[3/6] Writing MT5 credentials to common.ini …"
     mkdir -p "${MT5_CONFIG_DIR}"
+    # Unlock in case previous run locked it read-only
+    chmod 644 "${MT5_COMMON_INI}" 2>/dev/null || true
 
     # Preserve any existing sections other than [Common] and [Experts].
     # We rewrite only those two sections so we don't lose chart/object settings.
