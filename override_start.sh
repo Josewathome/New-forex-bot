@@ -27,6 +27,23 @@ is_wine_python_package_installed() {
 check_dependency "curl"
 check_dependency "$wine_executable"
 
+# ── [0/6] Pin Wine MachineGuid ────────────────────────────────────
+# IC Markets treats each unique MachineGuid as a new device and triggers
+# a mobile authorization request. Wine regenerates this GUID on every
+# fresh WINEPREFIX, making every container restart look like a new device.
+# We write a fixed, stable GUID so IC Markets always sees the same machine.
+# The GUID below was generated once with uuidgen — do not change it.
+FIXED_MACHINE_GUID="${WINE_MACHINE_GUID:-a1b2c3d4-e5f6-7890-abcd-ef1234567890}"
+CURRENT_GUID=$(wine reg query "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid 2>/dev/null | grep -i MachineGuid | awk '{print $NF}' || true)
+if [ "${CURRENT_GUID}" != "${FIXED_MACHINE_GUID}" ]; then
+    show_message "[0/6] Pinning Wine MachineGuid → ${FIXED_MACHINE_GUID} …"
+    wine reg add "HKLM\\SOFTWARE\\Microsoft\\Cryptography" \
+        /v MachineGuid /t REG_SZ /d "${FIXED_MACHINE_GUID}" /f 2>/dev/null
+    show_message "[0/6] MachineGuid pinned."
+else
+    show_message "[0/6] MachineGuid already pinned."
+fi
+
 # ── [1/6] Mono ────────────────────────────────────────────────────
 if [ ! -e "/config/.wine/drive_c/windows/mono" ]; then
     show_message "[1/6] Downloading and installing Mono..."
@@ -103,12 +120,28 @@ if [ -e "$mt5file" ]; then
     show_message "[3/6] Launching MT5 terminal..."
     $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS &
     show_message "[3/6] MT5 launched (PID $!)."
-    # Give MT5 time to fully start, connect to broker, and complete the
-    # access server handshake before the Python bot attempts mt5.initialize().
-    # IC Markets takes longer than HFM due to their access server proxy layer.
-    # 60s is the safe minimum — IC Markets' access server proxy pool can take
-    # up to 45-60s to complete the initial authentication handshake.
-    sleep 60
+    # Wait for MT5 to fully connect to the broker before starting the Python bot.
+    # MT5 writes "authorized on <server>" to its daily log when the broker
+    # handshake is complete. We poll that file instead of using a blind sleep —
+    # this is robust against IC Markets' variable Access Server latency.
+    MT5_LOG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Logs"
+    MT5_LOG_FILE="${MT5_LOG_DIR}/$(date +%Y%m%d).log"
+    MT5_WAIT_SECS=120   # maximum seconds to wait for broker auth
+    MT5_POLL_SECS=3     # polling interval
+    waited=0
+    show_message "[3/6] Waiting for MT5 broker auth (up to ${MT5_WAIT_SECS}s)…"
+    while [ $waited -lt $MT5_WAIT_SECS ]; do
+        if [ -f "${MT5_LOG_FILE}" ] && grep -qi "authorized" "${MT5_LOG_FILE}" 2>/dev/null; then
+            show_message "[3/6] MT5 broker auth confirmed after ${waited}s."
+            break
+        fi
+        sleep $MT5_POLL_SECS
+        waited=$((waited + MT5_POLL_SECS))
+    done
+    if [ $waited -ge $MT5_WAIT_SECS ]; then
+        show_message "[3/6] WARNING: MT5 auth not confirmed after ${MT5_WAIT_SECS}s — starting bot anyway."
+        show_message "[3/6] If IC Markets shows a mobile auth request, approve it in your client portal."
+    fi
     # MT5 rewrites common.ini on startup and resets Api=0.
     # Patch it back to Api=1 now that MT5 has finished its init write.
     if [ -f "${MT5_COMMON_INI:-}" ]; then
