@@ -218,10 +218,12 @@ echo "  2. Log in to your broker account inside MT5"
 echo "  3. Tools → Options → Expert Advisors"
 echo "     → ✅ Allow Algorithmic Trading"
 echo "  4. When ready, run:"
-echo "     docker exec mt5 touch /bot/ready_to_trade"
+echo "     docker exec mt5 touch /config/ready_to_trade"
 echo ""
 
-while [ ! -f /bot/ready_to_trade ]; do
+# ready_to_trade lives in the persisted config volume (/config) so that
+# wiping volumes on a full reset forces the setup prompt again.
+while [ ! -f /config/ready_to_trade ]; do
     sleep 5
 done
 
