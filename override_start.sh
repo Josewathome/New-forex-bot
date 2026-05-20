@@ -1,8 +1,8 @@
 #!/bin/bash
 
 mt5file='/config/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe'
-WINEPREFIX='/config/.wine'
-WINEDEBUG='-all'
+export WINEPREFIX='/config/.wine'
+export WINEDEBUG='-all'
 wine_executable="wine"
 metatrader_version="5.0.37"
 MT5_CMD_OPTIONS="${MT5_CMD_OPTIONS:-}"
@@ -265,5 +265,5 @@ echo "  🚀 Starting bot in Wine Python..."
 # PYTHONUTF8=1 forces UTF-8 everywhere.
 # Without it Wine Python defaults to cp1252 and crashes on any
 # Unicode character (e.g. the ━ box-drawing chars in main.py logs).
-cd /bot && DISPLAY=:1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
+cd /bot && DISPLAY=:1 WINEPREFIX=/config/.wine PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
     $wine_executable python -m src.main
