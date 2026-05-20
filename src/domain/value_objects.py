@@ -54,24 +54,34 @@ class BrokerCost:
     All-in cost of entering a trade for a given symbol.
 
     spread_pips     — live spread in pips
-    commission_usd  — round-turn commission in ACCOUNT CURRENCY per lot
+    commission_usd  — one-way (per-side) commission in ACCOUNT CURRENCY per lot
                       (for KES accounts this is already in KES — see config_loader)
-    tick_value      — ACCOUNT CURRENCY value of 1 tick for 1 standard lot
+    tick_value      — ACCOUNT CURRENCY value of 1 tick (smallest price move)
+                      for 1 standard lot, as returned by MT5 trade_tick_value.
+                      For 5-digit pairs: 1 tick = 0.00001, pip_value = tick_value × 10.
+                      For 3-digit pairs (JPY): 1 tick = 0.001, pip_value = tick_value × 10.
+                      For XAUUSD (2 digits): 1 tick = 0.01, pip_value = tick_value × 10.
     """
     spread_pips:    float
     commission_usd: float   # naming kept for legacy compat; value is in account currency
     tick_value:     float
 
     @property
+    def pip_value(self) -> float:
+        """Account currency value of 1 pip for 1 standard lot.
+        MT5 trade_tick_value is per tick; 1 pip = 10 ticks for all standard pairs."""
+        return self.tick_value * 10
+
+    @property
     def commission_pips(self) -> float:
-        """Convert the fixed commission to pip-equivalent."""
-        if self.tick_value <= 0:
+        """Convert the one-way commission to pip-equivalent using pip_value."""
+        if self.pip_value <= 0:
             return 0.0
-        return self.commission_usd / self.tick_value
+        return self.commission_usd / self.pip_value
 
     @property
     def total_cost_pips(self) -> float:
-        """Total cost of entry + exit in pips."""
+        """Total entry cost in pips (spread + one-way commission)."""
         return self.spread_pips + self.commission_pips
 
 
@@ -84,16 +94,15 @@ class RiskParameters:
     """
     Account-level risk configuration.
 
-    All monetary values are in ACCOUNT CURRENCY.
-    For Demojose's HFMarketsKE account that currency is KES.
+    All monetary values are in ACCOUNT CURRENCY (USD for IC Markets).
 
     Lot-size formula:
         risk_amount   = account_balance × (risk_percent / 100)
-        lots          = risk_amount / (sl_pips × tick_value_per_lot)
+        pip_value     = MT5_tick_value × 10   (1 pip = 10 ticks)
+        lots          = risk_amount / (effective_sl_pips × pip_value)
 
-    tick_value_per_lot is provided by MT5 in account currency — so the
-    formula works identically whether the account is USD, KES, or any other
-    currency supported by HFM.
+    MT5 trade_tick_value is in account currency, so the formula works
+    identically for USD, KES, or any other account currency.
     """
     account_balance:    float
     risk_percent:       float        # e.g. 1.0 means 1 %
@@ -109,24 +118,30 @@ class RiskParameters:
     def lot_size(
         self,
         sl_pips:    float,
-        tick_value: float,           # per lot, in account currency
+        tick_value: float,           # MT5 trade_tick_value per lot in account currency
         pip_calculator: "PipCalculator",
     ) -> float:
         """
         Calculate position size in standard lots.
 
-        Example (KES account):
-            balance        = 500,000 KES
-            risk_percent   = 1.0
-            risk_amount    = 5,000 KES
-            sl_pips        = 20
-            tick_value     = 1,300 KES/pip/lot  (MT5 value for EURUSD on KES acct)
-            lots           = 5,000 / (20 × 1,300) = 0.19 lots ≈ 0.19
+        tick_value is MT5's trade_tick_value (value of 1 tick = smallest price move).
+        pip_value  = tick_value × 10  (1 pip = 10 ticks for all standard pairs).
+
+        Example (USD account, IC Markets):
+            balance        = 400 USD
+            risk_percent   = 2.0
+            risk_amount    = 8 USD
+            sl_pips        = 30
+            tick_value     = 1.0 USD/tick/lot  (MT5 value for GBPUSD)
+            pip_value      = 10.0 USD/pip/lot
+            commission     = 3.50 USD/lot (one-way)
+            commission_pips= 3.50 / 10.0 = 0.35 pips
+            effective_sl   = 30 + 0.35 = 30.35 pips
+            lots           = 8 / (30.35 × 10.0) = 0.0264 → 0.02 lots
         """
         if sl_pips <= 0 or tick_value <= 0:
             return 0.0
-        # Include round-trip commission in the effective SL so position size
-        # reflects the true cost of the trade, not just the pip-stop distance.
-        commission_pips = self.commission_per_lot / tick_value if tick_value > 0 else 0.0
+        pip_value = tick_value * 10
+        commission_pips = self.commission_per_lot / pip_value if pip_value > 0 else 0.0
         effective_sl_pips = sl_pips + commission_pips
-        return self.risk_amount / (effective_sl_pips * tick_value)
+        return self.risk_amount / (effective_sl_pips * pip_value)
