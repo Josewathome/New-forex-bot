@@ -22,6 +22,7 @@ services:
       - DISPLAY_SIZEH=900
       - DISPLAY_REFRESH=60
       - KASMVNC_RECT_THREADS=4
+      
       # MT5_PASSWORD, TRADING_ID, MT5_SERVER, NEWS_API_KEY, DASHBOARD_PASSWORD,
       # JWT_* and all other bot credentials are passed via env_file: .env above.
       # They must NOT be re-declared here — Docker Compose interpolates $VAR
