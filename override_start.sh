@@ -95,11 +95,7 @@ MT5_COMMON_INI="${MT5_CONFIG_DIR}/common.ini"
 
 if [ -n "${TRADING_ID:-}" ] && [ -n "${MT5_PASSWORD:-}" ] && [ -n "${MT5_SERVER:-}" ]; then
     show_message "[3/6] Writing MT5 credentials to common.ini …"
-    # DEBUG: print exactly what the shell sees for each credential
-    show_message "[DEBUG] TRADING_ID  = '${TRADING_ID}'"
-    show_message "[DEBUG] MT5_SERVER  = '${MT5_SERVER}'"
-    show_message "[DEBUG] MT5_PASSWORD length = $(printf '%s' "${MT5_PASSWORD}" | wc -c) chars"
-    show_message "[DEBUG] MT5_PASSWORD = '${MT5_PASSWORD}'"
+    show_message "[3/6] TRADING_ID=${TRADING_ID}  SERVER=${MT5_SERVER}  PASSWORD_LEN=$(printf '%s' "${MT5_PASSWORD}" | wc -c)"
     mkdir -p "${MT5_CONFIG_DIR}"
     # Unlock in case a previous run locked it
     chmod 644 "${MT5_COMMON_INI}" 2>/dev/null || true
