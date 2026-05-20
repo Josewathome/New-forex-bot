@@ -312,6 +312,24 @@
   </div>
 
   <div class="section">
+    <div class="section-header">Reset Account Stats</div>
+    <div style="padding:18px">
+      <p style="color:var(--muted);font-size:13px;margin-bottom:12px">
+        Marks <strong style="color:var(--text)">right now</strong> as a fresh start for all performance stats —
+        win rate, drawdown, and trade history will only count trades placed <em>after</em> this reset.
+        Your actual MT5 account and open trades are <strong style="color:var(--text)">not affected</strong>.
+        Use this when you switch strategy, after a funded-account evaluation, or at the start of a new month.
+      </p>
+      <div class="form-group" style="max-width:360px;margin-bottom:14px">
+        <label>Reason (optional)</label>
+        <input type="text" id="reset-note" placeholder="e.g. New month / strategy change" maxlength="80"/>
+      </div>
+      <button class="btn btn-danger" onclick="resetAccount()" type="button">Reset Account Stats</button>
+      <span id="resetMsg" style="font-size:12px;color:var(--green);margin-left:12px;opacity:0;transition:.3s"></span>
+    </div>
+  </div>
+
+  <div class="section">
     <div class="section-header">Security</div>
     <div style="padding:18px">
       <p style="color:var(--muted);font-size:13px;margin-bottom:16px">
@@ -762,8 +780,9 @@ async function loadBalanceHistory() {
         const sign = diff >= 0 ? '+' : '';
         delta = `<span style="font-size:11px;color:${diff>=0?'var(--green)':'var(--red)'}">${sign}${fmt(diff)}</span>`;
       }
+      const isReset = e.type === 'reset';
       return `<tr${isLatest ? ' style="background:rgba(108,99,255,.06)"' : ''}>
-        <td>${new Date(e.set_at).toLocaleString()}${isLatest ? ' <span class="badge badge-blue" style="font-size:10px">current</span>' : ''}</td>
+        <td>${new Date(e.set_at).toLocaleString()}${isLatest ? ' <span class="badge badge-blue" style="font-size:10px">current</span>' : ''}${isReset ? ' <span class="badge badge-yellow" style="font-size:10px">RESET</span>' : ''}</td>
         <td><strong>${fmt(e.balance)} ${e.currency||''}</strong> ${delta}</td>
         <td>${escHtml(e.note || '')}</td>
       </tr>`;
@@ -803,6 +822,36 @@ async function updateBalance() {
       alert(d.error || 'Error updating balance.');
     }
   } catch(e) { alert('Error: ' + e); }
+}
+
+// ── Reset account stats ───────────────────────────────────────────────
+async function resetAccount() {
+  const note = document.getElementById('reset-note').value.trim();
+  const confirmed = confirm(
+    'Reset all performance stats to start fresh from now?\n\n' +
+    'Your MT5 account and open trades are NOT affected.\n' +
+    'Win rate, drawdown, and trade history will only count trades after this point.'
+  );
+  if (!confirmed) return;
+  try {
+    const r = await apiFetch('/api/reset-balance', {
+      method:  'POST',
+      headers: {'Content-Type': 'application/json'},
+      body:    JSON.stringify({note: note || 'Manual stats reset'}),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('reset-note').value = '';
+      const msg = document.getElementById('resetMsg');
+      msg.textContent = 'Stats reset — tracking from now.';
+      msg.style.opacity = '1';
+      setTimeout(() => { msg.style.opacity = '0'; }, 3500);
+      loadBalanceHistory();
+      loadStats();
+    } else {
+      alert(d.error || 'Error resetting account stats.');
+    }
+  } catch(e) { if (e.message !== 'unauthenticated') alert('Error: ' + e); }
 }
 
 // ── Logs ──────────────────────────────────────────────────────────────
