@@ -53,7 +53,10 @@ volumes:
 networks:
   default: {}
   forex-shared:
-    # Created here if it doesn't exist; harmless if the forex-api project also
-    # defines it — Docker Compose simply attaches to the existing network.
-    # Change to `external: true` only if forex-api always starts before this bot.
-    driver: bridge
+    # external: true tells Docker Compose to attach to the pre-existing network
+    # named exactly "forex-shared" instead of creating a new prefixed one
+    # (e.g. "new-forex-bot_forex-shared").  The forex-api project creates this
+    # network first; this bot simply joins it on every restart.
+    # If forex-api is not running yet, create the network manually once:
+    #   docker network create forex-shared
+    external: true
