@@ -244,7 +244,7 @@ class GapRecoveryService:
                         unique[-1].time.strftime("%H:%M"),
                     )
                 else:
-                    logger.info("GAP RECOVERY | %s | no M5 candles in gap (market closed?)", sym)
+                    logger.info("GAP RECOVERY | %s | no M5 candles in gap window (symbol may have had no bars in this period)", sym)
             except Exception as exc:
                 logger.warning("GAP RECOVERY | %s | M5 fetch failed: %s", sym, exc)
                 gap_candles[sym] = []

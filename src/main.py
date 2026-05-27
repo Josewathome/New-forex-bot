@@ -69,21 +69,19 @@ def _send_mt5_failure_email() -> None:
         svc = EmailService()
         subject = "ZONE BOT ALERT: MT5 connection failed — action required"
         body = (
-            f"The trading bot on server could not connect to MT5 after 5 attempts.\n\n"
+            f"The trading bot could not connect to MT5 after all attempts.\n\n"
             f"Account : {config.TRADING_ID}\n"
             f"Server  : {config.MT5_SERVER}\n\n"
-            f"This usually means MT5 needs to be logged in manually.\n\n"
+            f"MOST LIKELY CAUSE:\n"
+            f"  The demo account has expired or the credentials are wrong.\n"
+            f"  MT5 log is showing 'Invalid account'.\n\n"
             f"ACTION REQUIRED:\n"
-            f"  1. Open the VNC interface at http://your-server-ip:3000\n"
-            f"  2. In MT5: File → Login to Trade Account\n"
-            f"     Login: {config.TRADING_ID}\n"
-            f"     Server: {config.MT5_SERVER}\n"
-            f"  3. Enable: Tools → Options → Expert Advisors → Allow Algorithmic Trading\n"
-            f"  4. Run this command to start the bot:\n"
-            f"     docker exec mt5 touch /bot/ready_to_trade\n\n"
-            f"The bot has stopped retrying to save server resources.\n"
-            f"Restart the container after completing VNC setup:\n"
-            f"  docker compose restart mt5\n"
+            f"  1. Create a new demo account at your broker's website.\n"
+            f"  2. Update TRADING_ID, MT5_PASSWORD, MT5_SERVER in .env\n"
+            f"  3. Restart: docker compose restart\n\n"
+            f"If credentials are correct, MT5 may just be reconnecting.\n"
+            f"In that case restart the container:\n"
+            f"  docker compose restart\n"
         )
         if svc.send_report(subject, body):
             logger.info("MT5 failure alert sent to %s", config.EMAIL_RECIPIENT)

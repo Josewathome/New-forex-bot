@@ -142,6 +142,24 @@ class ExecutionService:
         # M30/M5 bar close.  Dict key = symbol, value = List[Zone].
         self._m30_zones: Dict[str, List[Zone]] = {}
         self._m5_zones:  Dict[str, List[Zone]] = {}
+        # Streaming guard: track the timestamp of the most recent H1 candle
+        # that was used to build the zone list for each symbol.  run_zone_mapping
+        # bails out early when the newest H1 bar has not changed since the last
+        # call, preventing repeated recomputation on the same candle window.
+        self._last_h1_zone_ts: Dict[str, datetime] = {}
+        # H4 / D1 bias cache — these change at most once per 4 hours / 24 hours
+        # respectively, but collect_entry_candidate() runs every M1 close (60s).
+        # Recomputing OB/FVG detection on 50 H4 candles 60× per hour is wasted
+        # work.  Cache the result; invalidate when the relevant bar boundary
+        # advances.  Keys are symbol strings; values are (result, last_bar_epoch).
+        self._h4_cache: Dict[str, Tuple] = {}   # sym → (h4_bars, h4_bias, h4_eq, h4_zones, bar_epoch)
+        self._d1_cache: Dict[str, Tuple] = {}   # sym → (d1_bars, d1_bias, bar_epoch)
+        # Zone tap dedup: tracks the H1 bar epoch (int seconds) when each zone
+        # was last tapped.  Prevents mark_tapped() from firing on every 60-second
+        # loop tick during a single price visit — a zone is tapped at most once
+        # per H1 bar.  Persisted in save/load_runtime_state so a restart mid-bar
+        # does not double-count the tap that already fired before the crash.
+        self._zone_last_tap: Dict[str, int] = {}
         # Gap-recovery controls:
         #   _replay_mode     — when True, collect_entry_candidate() is a no-op.
         #                      Used by GapRecoveryService to replay historical candles
@@ -166,13 +184,37 @@ class ExecutionService:
         h1 = self._md.get_candles(symbol, Timeframe.H1, config.H1_CANDLE_COUNT)
         if not h1:
             return
+        # Streaming guard: skip the full remap when the newest closed H1 bar
+        # is the same one we already processed.  The main loop calls this every
+        # 60 seconds; without this guard the same 100-bar window is rescanned
+        # up to 59 times between actual bar closes — pure batch-style reprocessing.
+        newest_h1_ts = h1[-1].time
+        if self._last_h1_zone_ts.get(symbol) == newest_h1_ts:
+            return
+        self._last_h1_zone_ts[symbol] = newest_h1_ts
         zones, pool = self._zone_mapper.map_zones(h1, symbol, Timeframe.H1)
+        # Carry forward touch counts so a zone that was tapped before this remap
+        # does not silently reset to 0.  Match by (created_at, direction, zone_type)
+        # — these three facts uniquely identify a zone's anchor candle and type,
+        # and are stable across remaps of the same candle window.
+        existing_counts = {
+            (z.created_at, z.direction, z.zone_type): z.touch_count
+            for z in self._zr.get_active_zones(symbol)
+        }
         for old in self._zr.get_active_zones(symbol):
             self._zr.invalidate_zone(old.id)
         for z in zones:
+            key = (z.created_at, z.direction, z.zone_type)
+            if key in existing_counts:
+                z.touch_count = existing_counts[key]
             self._zr.save_zone(z)
         if pool:
             self._zr.save_liquidity_pool(pool)
+        # Remove stale _zone_last_tap entries for zones that no longer exist so
+        # the dict doesn't accumulate dead zone IDs across sessions.
+        active_ids = {z.id for z in self._zr.get_active_zones(symbol)}
+        self._zone_last_tap = {k: v for k, v in self._zone_last_tap.items()
+                               if k in active_ids}
 
     def run_m30_zone_mapping(self, symbol: str) -> None:
         """
@@ -263,9 +305,16 @@ class ExecutionService:
             return None
 
         broker_cost = self._spread.get_broker_cost(symbol)
-        # 100 H1 bars: 14 for ATR warmup + 50 for baseline_atr + headroom.
-        h1_short   = self._md.get_candles(symbol, Timeframe.H1, 100)
-        h1_atr     = atr(h1_short) if h1_short else 0.0
+        # Fetch 65 H1 bars: 14 for current-session ATR + 50 for baseline_atr
+        # + 1 extra for True Range computation.  Do NOT fetch 100 here — the
+        # zone repo already holds zones mapped from the full H1_CANDLE_COUNT
+        # window; fetching 100 bars every loop tick to recompute ATR is pure
+        # batch-style reprocessing of the same window over and over.
+        h1_short   = self._md.get_candles(symbol, Timeframe.H1, 65)
+        # Current-session ATR: use only the most recent 14 bars so the FVG
+        # threshold tracks today's volatility, not a multi-day average that
+        # inflates after a high-volatility session and starves the zone list.
+        h1_atr     = atr(h1_short[-15:]) if h1_short and len(h1_short) >= 15 else (atr(h1_short) if h1_short else 0.0)
         digits     = self._md.get_symbol_digits(symbol)
         pip_calc   = PipCalculator(digits=digits)
         tick_value = self._md.get_tick_value(symbol)
@@ -274,19 +323,38 @@ class ExecutionService:
                 symbol, h1_atr, broker_cost, pip_calc):
             return None
 
-        h4 = self._md.get_candles(symbol, Timeframe.H4, config.H4_CANDLE_COUNT)
-        if not h4:
+        # ── H4 context — cached per H4 bar boundary (4-hour epoch) ────
+        # H4 bias, H4 equilibrium, and H4 zones do not change between H4 bar
+        # closes.  Recomputing OB/FVG detection on 50 H4 candles every 60s
+        # (every M1 close) is pure wasted work.  Cache the result keyed by the
+        # current H4 bar boundary epoch; invalidate automatically when the epoch
+        # advances (i.e., a new H4 bar has opened).
+        _h4_bar_epoch = int(now.timestamp()) // 14400 * 14400
+        _h4_cached = self._h4_cache.get(symbol)
+        if _h4_cached is not None and _h4_cached[4] == _h4_bar_epoch:
+            h4, h4_bias, h4_eq, h4_zones = _h4_cached[0], _h4_cached[1], _h4_cached[2], _h4_cached[3]
+        else:
+            h4 = self._md.get_candles(symbol, Timeframe.H4, config.H4_CANDLE_COUNT)
+            if not h4:
+                return None
+            h4_bias    = find_h4_bias(h4)
+            _, _, h4_eq = compute_h4_equilibrium(h4)
+            h4_zones, _ = self._zone_mapper.map_zones(h4, symbol, Timeframe.H4) if len(h4) >= 20 else ([], None)
+            self._h4_cache[symbol] = (h4, h4_bias, h4_eq, h4_zones, _h4_bar_epoch)
+
+        if h4 is None:
             return None
 
-        h4_bias         = find_h4_bias(h4)
-        _, _, h4_eq     = compute_h4_equilibrium(h4)
-
-        # H4 zone map — OBs/FVGs on H4 for confluence scoring
-        h4_zones, _ = self._zone_mapper.map_zones(h4, symbol, Timeframe.H4) if len(h4) >= 20 else ([], None)
-
-        # ── D1 macro trend ─────────────────────────────────────────
-        d1         = self._md.get_candles(symbol, Timeframe.D1, config.D1_CANDLE_COUNT)
-        d1_bias    = find_d1_bias(d1) if d1 else None
+        # ── D1 macro trend — cached per D1 bar boundary (24-hour epoch) ──
+        # D1 bias changes at most once per day.  Cache with the same pattern.
+        _d1_bar_epoch = int(now.timestamp()) // 86400 * 86400
+        _d1_cached = self._d1_cache.get(symbol)
+        if _d1_cached is not None and _d1_cached[2] == _d1_bar_epoch:
+            d1, d1_bias = _d1_cached[0], _d1_cached[1]
+        else:
+            d1      = self._md.get_candles(symbol, Timeframe.D1, config.D1_CANDLE_COUNT)
+            d1_bias = find_d1_bias(d1) if d1 else None
+            self._d1_cache[symbol] = (d1, d1_bias, _d1_bar_epoch)
         ask             = self._md.get_current_price(symbol)
         if ask == 0.0:
             return None
@@ -298,7 +366,10 @@ class ExecutionService:
             return None
 
         sym_min_score = config.SYMBOL_MIN_SCORE.get(symbol, config.SETUP_SCORE_THRESHOLD)
-        baseline_atr  = atr(h1_short[-50:]) if len(h1_short) >= 50 else h1_atr
+        # baseline_atr: use all available bars in h1_short (up to 65) as the
+        # medium-term reference.  compute_dynamic_tp compares current 14-bar
+        # ATR against this baseline to detect high/low volatility regimes.
+        baseline_atr  = atr(h1_short) if h1_short else h1_atr
 
         for zone in zones:
             # ── Trend pre-filters ──────────────────────────────────
@@ -355,7 +426,14 @@ class ExecutionService:
             if not (ask <= zone.high + zone_buf and ask >= zone.low - zone_buf):
                 continue
             if not self._replay_mode:
-                zone.mark_tapped()
+                # Gate: tap at most once per H1 bar.  Without this, the 60-second
+                # main loop increments touch_count every tick while price is near
+                # the zone, exhausting FVG (limit=2) in ~2 min and OB (limit=3)
+                # in ~3 min — long before any signal can form.
+                current_h1_bar = int(now.timestamp()) // 3600 * 3600
+                if self._zone_last_tap.get(zone.id, 0) < current_h1_bar:
+                    zone.mark_tapped()
+                    self._zone_last_tap[zone.id] = current_h1_bar
 
             m5 = self._md.get_candles(symbol, Timeframe.M5, config.M5_CANDLE_COUNT)
             if not m5:
@@ -439,22 +517,32 @@ class ExecutionService:
 
                 # ── M1 Predictive Signal (primary) ────────────────
                 m1 = self._md.get_candles(symbol, Timeframe.M1, config.M1_CANDLE_COUNT)
+                # m5[-1] is the last CLOSED bar (get_candles drops the forming bar).
+                # The M5 colour gate inside find_m1_predictive_signal correctly uses
+                # this closed bar's colour.  But the bar-position gate
+                # (m1_is_early_in_m5_bar) must compare M1 time against the FORMING
+                # M5 bar's open — not the previous closed bar's open.  Derive the
+                # forming bar's open from broker time so the gate is accurate in live.
                 current_m5_candle = m5[-1] if m5 else None
+                _m5_forming_open = datetime.fromtimestamp(
+                    int(now.timestamp()) // 300 * 300, tz=timezone.utc
+                )
                 signal = None
 
                 if m1:
                     signal = find_m1_predictive_signal(
-                        m1_candles=     m1,
-                        zone=           zone,
-                        pip_calc=       pip_calc,
-                        spread_pips=    broker_cost.spread_pips,
-                        liquidity_pool= pool,
-                        current_m5=     current_m5_candle,
-                        atr_price=      h1_atr,
-                        zone_buffer=    zone_buf,
-                        min_rr_override=min_rr,
-                        m30_zones=      self._m30_zones.get(symbol, []),
-                        m5_candles=     m5,
+                        m1_candles=      m1,
+                        zone=            zone,
+                        pip_calc=        pip_calc,
+                        spread_pips=     broker_cost.spread_pips,
+                        liquidity_pool=  pool,
+                        current_m5=      current_m5_candle,
+                        atr_price=       h1_atr,
+                        zone_buffer=     zone_buf,
+                        min_rr_override= min_rr,
+                        m30_zones=       self._m30_zones.get(symbol, []),
+                        m5_candles=      m5,
+                        m5_bar_open_time=_m5_forming_open,
                     )
                     if signal:
                         logger.info(
@@ -561,9 +649,18 @@ class ExecutionService:
                     symbol, sig_time.isoformat(), self._min_signal_time.isoformat(),
                 )
                 return None
-            # Clear the guard after the first valid live signal attempt so it
-            # doesn't block entries indefinitely once the gap period has passed.
-            self._min_signal_time = None
+            # Clear the guard only when we see a signal timestamped AFTER the gap
+            # boundary — meaning we are now processing genuinely live candles.
+            # Do NOT clear on the first evaluation call regardless of outcome; the
+            # guard must persist until a post-gap signal is confirmed, otherwise a
+            # high-scoring stale signal evaluated right after a fresh one could slip
+            # through on the same M1 cycle.
+            if sig_time is not None and sig_time > self._min_signal_time:
+                logger.debug(
+                    "GAP GUARD cleared | %s | first live signal at %s (gap boundary was %s)",
+                    symbol, sig_time.isoformat(), self._min_signal_time.isoformat(),
+                )
+                self._min_signal_time = None
 
         trade = self._build_trade(
             signal, candidate.broker_cost, candidate.pip_calc,
@@ -1099,7 +1196,15 @@ class ExecutionService:
             }
         streaks = {sym: count for sym, count in self._loss_streak.items()}
         pauses  = {sym: dt.isoformat() for sym, dt in self._streak_pause.items()}
-        return {"trade_states": states, "loss_streak": streaks, "streak_pause": pauses}
+        # Persist zone tap dedup state so a restart mid-H1-bar does not
+        # double-count a tap that already fired before the crash.
+        zone_taps = {k: v for k, v in self._zone_last_tap.items()}
+        return {
+            "trade_states": states,
+            "loss_streak":  streaks,
+            "streak_pause": pauses,
+            "zone_last_tap": zone_taps,
+        }
 
     def load_runtime_state(self, data: dict) -> None:
         """
@@ -1177,6 +1282,12 @@ class ExecutionService:
         for sym, iso in data.get("streak_pause", {}).items():
             try:
                 self._streak_pause[sym] = datetime.fromisoformat(iso)
+            except Exception:
+                pass
+        # Restore zone tap dedup state so restarts mid-H1-bar don't double-count.
+        for zone_id, bar_epoch in data.get("zone_last_tap", {}).items():
+            try:
+                self._zone_last_tap[zone_id] = int(bar_epoch)
             except Exception:
                 pass
         if self._trade_states:

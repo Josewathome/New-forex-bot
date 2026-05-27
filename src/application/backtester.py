@@ -49,6 +49,8 @@ from src.application.analysis import (
     find_htf_zone_confluence,
     find_m30_zone_confluence,
     find_m5_zone_confluence,
+    read_m30_zone_story,
+    read_m5_zone_story,
 )
 from src.application.diagnostics import DiagnosticsCollector
 from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl, find_runner_protection_sl
@@ -213,9 +215,12 @@ class Backtester:
             if diag: diag.record_rejection(symbol, "streak_pause")
             return None
 
-        # 6h window: live system keeps zones alive until mitigated — price often taps
-        # 4-8h after H1 bar close. 3h was the #1 cause of no_tap (2,600+ rejections).
-        m5_win = [c for c in m5 if bar_time <= c.time < bar_time + timedelta(hours=6)]
+        # Past-only window: use the 60 most recent M5 bars that closed BEFORE
+        # bar_time.  The previous 6-hour forward window (bar_time to bar_time+6h)
+        # gave the signal finders future candles that do not exist in live trading,
+        # inflating the backtested signal rate and masking live underperformance.
+        # 60 bars = 5 hours of M5 context, matching config.M5_CANDLE_COUNT.
+        m5_win = [c for c in m5 if c.time < bar_time][-60:]
 
         if diag:
             diag.record_h1_bar(
@@ -240,7 +245,11 @@ class Backtester:
         d1_bias  = find_d1_bias(d1_win) if len(d1_win) >= getattr(config, "D1_EQUILIBRIUM_LOOKBACK", 15) else None
 
         bar_px = h1[h1_idx].open
-        h1_atr = atr(h1_win)
+        # Use the most recent 14 H1 bars for ATR — matches execution_service.py
+        # which uses atr(h1_short[-14:]).  The old full-window ATR inflated the
+        # FVG size filter and SL buffer after high-volatility sessions, causing
+        # backtest FVG counts and SL distances to diverge from live behaviour.
+        h1_atr = atr(h1_win[-15:]) if len(h1_win) >= 15 else atr(h1_win)
         zbuf = calculate_zone_buffer(h1_atr)
 
         if self._in_news(bar_time, symbol, ntw):
@@ -271,8 +280,10 @@ class Backtester:
         m5_zones_bt, _ = (self._mapper.map_zones(m5_zone_win, symbol, Timeframe.M5)
                           if len(m5_zone_win) >= 10 else ([], None))
 
-        # M1 bars in the same 6-hour window as m5_win (for M1 predictive signal).
-        m1_win = [c for c in m1 if bar_time <= c.time < bar_time + timedelta(hours=6)]
+        # Past-only window: use the 60 most recent M1 bars before bar_time,
+        # matching the live system which fetches config.M1_CANDLE_COUNT (60)
+        # closed M1 bars from MT5.  Forward M1 bars must not be included here.
+        m1_win = [c for c in m1 if c.time < bar_time][-60:]
 
         sym_min_score = config.SYMBOL_MIN_SCORE.get(symbol, config.SETUP_SCORE_THRESHOLD)
 
@@ -327,6 +338,25 @@ class Backtester:
                     if diag: diag.record_rejection(symbol, reject_reason)
                     continue
             else:
+                # ── M30 story gate (matches live execution_service.py) ────────
+                # Block when the last M30 bar inside the zone closed against zone
+                # direction — a 30-minute institutional statement that outweighs
+                # any M5/M1 signal we might find.
+                m30_story_win = [c for c in m30 if c.time < bar_time][-getattr(config, "M30_STORY_LOOKBACK", 8):]
+                if m30_story_win:
+                    m30_st = read_m30_zone_story(zone, m30_story_win, h1_atr)
+                    if m30_st == "against":
+                        if diag: diag.record_rejection(symbol, "m30_story_against")
+                        continue
+
+                # ── M5 zone story gate (matches live execution_service.py) ─────
+                # Block when M5 bars inside the zone show distribution — closes
+                # drifting away from TP direction with elevated bearish volume.
+                m5_st = read_m5_zone_story(zone, m5_win, h1_atr)
+                if m5_st == "distributing":
+                    if diag: diag.record_rejection(symbol, "m5_story_distributing")
+                    continue
+
                 # ── M1 predictive signal (primary) ────────────────
                 signal = None
                 if m1_win:
@@ -336,7 +366,7 @@ class Backtester:
                         pip_calc=pip_calc,
                         spread_pips=bc.spread_pips,
                         liquidity_pool=pool,
-                        current_m5=m5_win[0] if m5_win else None,
+                        current_m5=m5_win[-1] if m5_win else None,
                         atr_price=h1_atr,
                         zone_buffer=zbuf,
                         min_rr_override=min_rr,
@@ -350,6 +380,7 @@ class Backtester:
                         spread_pips=bc.spread_pips, liquidity_pool=pool,
                         atr_price=h1_atr, diag=diag,
                         zone_buffer=zbuf, min_rr_override=min_rr,
+                        m30_zones=m30_zones_bt,
                     )
                 if signal is None:
                     continue
@@ -380,8 +411,10 @@ class Backtester:
 
             risk_pct = dynamic_risk(trade_score)
 
-            # Dynamic TP — same logic as live execution_service (no static override)
-            baseline_atr = atr(h1_win[-50:]) if len(h1_win) >= 50 else h1_atr
+            # Dynamic TP — same logic as live execution_service (no static override).
+            # Use 65-bar baseline to match execution_service.py which fetches 65 H1 bars
+            # and uses all of them as the baseline_atr window.
+            baseline_atr = atr(h1_win[-65:]) if len(h1_win) >= 65 else atr(h1_win)
             tp1_ratio, tp2_ratio = compute_dynamic_tp(
                 signal.direction, signal.entry_price, signal.stop_loss,
                 h1_atr, baseline_atr

@@ -31,6 +31,27 @@ except ImportError as e:
     print("IMPORT ERROR:", e)
     MT5_AVAILABLE = False
 
+def _mt5_log_has_invalid_account() -> bool:
+    """
+    Read the current MT5 terminal log and return True if the broker returned
+    'Invalid account' for this session.  The log is UTF-16LE under Wine.
+    Returns False if the log cannot be read (safe default — keep retrying).
+    """
+    import glob as _glob
+    import datetime as _dt
+    log_dir = r"C:\Program Files\MetaTrader 5\logs"
+    today   = _dt.date.today().strftime("%Y%m%d")
+    pattern = os.path.join(log_dir, f"{today}.log")
+    matches = _glob.glob(pattern)
+    if not matches:
+        return False
+    try:
+        data = open(matches[0], "rb").read().decode("utf-16-le", errors="replace")
+        return "invalid account" in data.lower()
+    except Exception:
+        return False
+
+
 class MT5Gateway:
     """
     Thin, stateless wrapper over the MetaTrader5 Python package.
@@ -58,10 +79,19 @@ class MT5Gateway:
 
     def connect(self, retries: int = 3, delay: float = 5.0) -> bool:
         """
-        Uses the exact same pattern as known-working MT5 Python code:
-            mt5.initialize(login=, password=, server=, timeout=)
-        No path= unless explicitly set — passing path= to a running
-        terminal causes -6 Authorization errors.
+        Attach to the already-running MT5 terminal without disturbing its
+        broker session.  Strategy:
+          1. Call mt5.initialize() with NO credentials — this just opens the
+             IPC pipe to the terminal process without touching the broker login.
+          2. Check account_info() — if the terminal is already logged in and
+             connected, we are done.
+          3. Only if the terminal is NOT logged in yet, call mt5.login() once
+             to send credentials to the broker.
+
+        Passing login/password/server to mt5.initialize() on an already-logged-in
+        terminal forces MT5 to re-authenticate, which kicks the existing session
+        and causes the broker to return 'Invalid account' on the reconnect.
+        That is the root cause of the -6 loop observed in production.
         """
         global mt5
 
@@ -73,65 +103,62 @@ class MT5Gateway:
 
         for attempt in range(1, retries + 1):
             logger.info("MT5 connect attempt %d/%d …", attempt, retries)
-            kwargs: dict = {
-                "login":    self.login,
-                "password": self.password,
-                "server":   self.server,
-                "timeout":  60000,
-            }
-            if self.mt5_path:
-                kwargs["path"] = self.mt5_path
 
-            if not mt5.initialize(**kwargs):
+            # Step 1: attach to terminal IPC only — no credentials
+            init_kwargs: dict = {"timeout": 60000}
+            if self.mt5_path:
+                init_kwargs["path"] = self.mt5_path
+
+            if not mt5.initialize(**init_kwargs):
                 code, msg = mt5.last_error()
                 logger.error("mt5.initialize() failed: (%s, %s)", code, msg)
                 if code == -10005:
-                    logger.error("Terminal not running. Open MT5, log in, wait for charts.")
-                elif code == -6:
-                    logger.error(
-                        "mt5.initialize() -6: terminal is running but rejected the IPC session. "
-                        "This happens when MT5 is disconnected from the broker (IC Markets "
-                        "Access Server rotation) or the demo account is expired/invalid. "
-                        "Check MT5 terminal log for 'disconnected' or 'Invalid account'."
-                    )
-                elif code == -2:
-                    logger.error("Bad server name '%s'. Check File→Open Account in MT5.", self.server)
+                    logger.error("Terminal not running — waiting for MT5 to start.")
                 if attempt < retries:
                     logger.info("Retrying in %.0fs …", delay)
                     _time.sleep(delay)
                 continue
 
-            # Explicitly call mt5.login() after initialize() succeeds.
-            # IC Markets routes connections through a pool of Access Server proxy
-            # nodes. On reconnect a different node may answer, invalidating the
-            # terminal's cached session. mt5.initialize() only attaches to the
-            # terminal process — mt5.login() forces a fresh broker-level
-            # authentication handshake regardless of what the terminal has cached.
-            login_result = mt5.login(
-                login=self.login,
-                password=self.password,
-                server=self.server,
-            )
-            if not login_result:
-                code, msg = mt5.last_error()
-                logger.error(
-                    "mt5.login() failed after initialize() (attempt %d/%d): (%s, %s)",
-                    attempt, retries, code, msg,
-                )
-                mt5.shutdown()
-                if attempt < retries:
-                    logger.info("Retrying in %.0fs …", delay)
-                    _time.sleep(delay)
-                continue
-            logger.info("mt5.login() succeeded — broker session established.")
-
+            # Step 2: check if terminal already has an active broker session
             acc = mt5.account_info()
-            if acc is None:
-                logger.error("initialize()+login() OK but account_info() None: %s", mt5.last_error())
-                mt5.shutdown()
-                if attempt < retries:
-                    _time.sleep(delay)
-                continue
+            if acc is not None and acc.login == self.login:
+                logger.info("Terminal already logged in as %s — skipping mt5.login().", acc.login)
+            else:
+                # Step 3: terminal is not logged in — send credentials to broker
+                if acc is not None:
+                    logger.info(
+                        "Terminal logged in as %s but expected %s — calling mt5.login().",
+                        acc.login, self.login,
+                    )
+                else:
+                    logger.info("Terminal not logged in — calling mt5.login().")
+
+                login_result = mt5.login(
+                    login=self.login,
+                    password=self.password,
+                    server=self.server,
+                )
+                if not login_result:
+                    code, msg = mt5.last_error()
+                    logger.error(
+                        "mt5.login() failed (attempt %d/%d): (%s, %s) — "
+                        "MT5 may still be connecting to broker, will retry.",
+                        attempt, retries, code, msg,
+                    )
+                    mt5.shutdown()
+                    if attempt < retries:
+                        logger.info("Retrying in %.0fs …", delay)
+                        _time.sleep(delay)
+                    continue
+                logger.info("mt5.login() succeeded — broker session established.")
+
+                acc = mt5.account_info()
+                if acc is None:
+                    logger.error("login() OK but account_info() None: %s", mt5.last_error())
+                    mt5.shutdown()
+                    if attempt < retries:
+                        _time.sleep(delay)
+                    continue
 
             self._ready = True
 
@@ -586,6 +613,12 @@ class MT5Gateway:
             start_dt = start_dt.replace(tzinfo=None)
         if end_dt.tzinfo is not None:
             end_dt = end_dt.replace(tzinfo=None)
+
+        # Prime MT5's history cache with a copy_rates_from_pos call before
+        # the range query.  MT5 under Wine with a fresh session often hasn't
+        # loaded historical M5 data into memory yet — copy_rates_from_pos
+        # forces a cache load so the subsequent copy_rates_range succeeds.
+        mt5.copy_rates_from_pos(symbol, tf, 0, 10)
 
         rates = None
         for attempt, delay in enumerate([0, 3, 8, 15]):

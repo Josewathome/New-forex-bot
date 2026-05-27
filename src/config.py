@@ -404,6 +404,12 @@ SESSION_BUFFER_MIN: int = int(os.environ.get("SESSION_BUFFER_MIN", "15"))
 
 LOOP_INTERVAL_SECONDS = 60
 
+# ZeroMQ endpoint the MT5 EA publishes on (ZoneBotBridge.mq5 PUB_ENDPOINT).
+# Used by main_stream.py. Must match the EA's configured PUB_ENDPOINT.
+# Use 127.0.0.1 explicitly — Wine's loopback resolver does not always
+# resolve "localhost" to the correct IPv4 address.
+ZMQ_ENDPOINT: str = os.environ.get("ZMQ_ENDPOINT", "tcp://127.0.0.1:5556")
+
 
 # ── Symbol Metadata ───────────────────────────────────────────────
 SYMBOL_DIGITS: dict[str, int] = {

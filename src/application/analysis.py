@@ -310,11 +310,17 @@ def _breaks_structure_down(candles: List[Candle], from_index: int, lookback: int
 
 def _is_mitigated(candles: List[Candle], start_idx: int,
                   zone_low: float, zone_high: float, direction: Direction) -> bool:
+    # A zone is consumed only when a candle CLOSES through it, not merely
+    # wicks into it.  Using wick-touch here was stricter than evaluate_zone_health
+    # check 1 (which uses close-through), causing zones to be silently discarded
+    # in map_zones while still appearing valid to the health check — producing
+    # an empty active-zone list in live trading.  Both gates must use the same
+    # definition so a zone that survives map_zones also survives health evaluation.
     for i in range(start_idx, len(candles)):
         c = candles[i]
-        if direction == Direction.BULLISH and c.low <= zone_high:
+        if direction == Direction.BULLISH and c.close < zone_low:
             return True
-        if direction == Direction.BEARISH and c.high >= zone_low:
+        if direction == Direction.BEARISH and c.close > zone_high:
             return True
     return False
 
@@ -801,9 +807,13 @@ def find_m5_choch_signal(
         c = m5_candles[i]
 
         # ── Step 1: zone tap (with ATR buffer) ────────────────────
-        # zone_buffer expands zone edges so a 1-3 pip institution
-        # front-run doesn't disqualify an otherwise valid setup.
+        # Skip candles that predate the zone — they cannot be a valid tap
+        # because the zone did not yet exist when those candles formed.
+        # Without this, a zone tap from hours before map_zones ran would
+        # start the retracement wave in the past, producing stale signals.
         if not zone_tapped:
+            if c.time <= zone.created_at:
+                continue
             if c.low <= zone.high + zone_buffer and c.high >= zone.low - zone_buffer:
                 zone_tapped           = True
                 retracement_start_idx = i
@@ -906,6 +916,20 @@ def find_m5_choch_signal(
                 diag.record_rejection(symbol, "rr")
             continue
 
+        # ── Step 10: Signal age gate ───────────────────────────────
+        # The scan runs oldest-to-newest and accepts the first qualifying
+        # candle.  Without this gate, a valid ChoCh from 4 hours ago fires
+        # as if it's happening now — in live trading that would place a
+        # limit order at a level price has long since left.
+        # Only signals from the most recent MAX_SIGNAL_AGE_M5_BARS bars
+        # are actionable.  The scan continues rather than returning None so
+        # a more recent qualifying signal in the same window is not missed.
+        max_age = getattr(config, "MAX_SIGNAL_AGE_M5_BARS", 12)  # 1 hour
+        if i < len(m5_candles) - max_age:
+            if diag:
+                diag.record_rejection(symbol, "choch_signal_too_old")
+            continue
+
         if diag:
             diag.record_signal(symbol)
 
@@ -947,6 +971,7 @@ def find_m1_predictive_signal(
     liquidity_pool:  LiquidityPool,
     current_m5:      Optional[Candle]    = None,
     atr_price:       float               = 0.0,
+    m5_bar_open_time: Optional[datetime] = None,
     diag:            Optional["DiagnosticsCollector"] = None,
     zone_buffer:     float               = 0.0,
     min_rr_override: Optional[float]     = None,
@@ -1035,11 +1060,18 @@ def find_m1_predictive_signal(
     # ── Bar-position gate ─────────────────────────────────────────
     # The M1 signal must fire in the EARLY portion of the M5 bar (first 3 min).
     # A ChoCh at minute 4 of the M5 bar is not predictive — it describes what
-    # already happened.  We check this against the current M5 bar open time.
-    if current_m5 is not None and m1_candles:
-        m5_open = current_m5.time
-        m1_latest_time = m1_candles[-1].time
-        if not m1_is_early_in_m5_bar(m1_latest_time, m5_open):
+    # already happened.
+    # In live trading, m5_bar_open_time is derived from broker time as
+    # floor(now / 300) * 300 — this is the forming bar's open, which is what
+    # we need.  Without it, we'd use current_m5.time (last CLOSED bar's open),
+    # which is 5 minutes behind and would reject valid early-bar M1 signals.
+    # Backtest callers do not pass m5_bar_open_time, so they fall back to
+    # current_m5.time — preserving existing backtest behaviour.
+    _m5_gate_open = m5_bar_open_time if m5_bar_open_time is not None else (
+        current_m5.time if current_m5 is not None else None
+    )
+    if _m5_gate_open is not None and m1_candles:
+        if not m1_is_early_in_m5_bar(m1_candles[-1].time, _m5_gate_open):
             if diag:
                 diag.record_rejection(symbol, "m1_late_in_m5_bar")
             return None
@@ -1062,7 +1094,10 @@ def find_m1_predictive_signal(
         c = m1_candles[i]
 
         # ── Step 1: zone tap ───────────────────────────────────────
+        # Skip candles predating the zone — the zone did not exist when they formed.
         if not zone_tapped:
+            if c.time <= zone.created_at:
+                continue
             if c.low <= zone.high + zone_buffer and c.high >= zone.low - zone_buffer:
                 zone_tapped           = True
                 retracement_start_idx = i
@@ -1215,6 +1250,16 @@ def find_m1_predictive_signal(
         if rr < min_rr:
             if diag:
                 diag.record_rejection(symbol, "m1_rr")
+            continue
+
+        # ── Step 11: Signal age gate ───────────────────────────────
+        # Same rationale as find_m5_choch_signal: a qualifying M1 ChoCh
+        # that happened 60+ bars (1 hour) ago is stale in live trading.
+        # Continue scanning so a more recent qualifying candle is found.
+        max_age = getattr(config, "MAX_SIGNAL_AGE_M1_BARS", 60)  # 1 hour
+        if i < len(m1_candles) - max_age:
+            if diag:
+                diag.record_rejection(symbol, "m1_signal_too_old")
             continue
 
         if diag:
@@ -1964,7 +2009,17 @@ class ZoneMapper:
         symbol:    str,
         timeframe: Timeframe = Timeframe.H1,
     ) -> tuple[List[Zone], Optional[LiquidityPool]]:
-        h1_atr    = atr(candles)          # used to filter micro-FVGs
+        # Use the most recent 15 candles for ATR so the FVG size threshold
+        # reflects current-session volatility, not a multi-day average that
+        # inflates during post-spike windows and starves the zone list.
+        # The full candle list is still used for structure detection (OB/FVG
+        # scan) — only the ATR computation is narrowed.
+        # NOTE: atr(period=14) requires period+1 = 15 candles to produce 14
+        # True Range values (each TR needs the previous bar's close).  Using
+        # candles[-14:] gave exactly 14 — always one short — so atr() always
+        # returned 0.0.  Fixed: slice to 15.
+        atr_window = candles[-15:] if len(candles) >= 15 else candles
+        h1_atr    = atr(atr_window)       # used to filter micro-FVGs
         obs       = find_order_blocks(candles, symbol, timeframe)
         fvgs      = find_fair_value_gaps(candles, symbol, timeframe, atr_value=h1_atr)
         pool      = find_liquidity_pool(candles, symbol, timeframe)

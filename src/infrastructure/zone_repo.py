@@ -67,8 +67,12 @@ class InMemoryZoneRepository(IZoneRepository):
                 "zones":  [self._zone_to_dict(z) for z in self._zones.values()],
                 "pools":  [self._pool_to_dict(p) for p in self._pools.values()],
             }
-            with open(PERSIST_PATH, "w") as f:
+            # Atomic write: write to .tmp then rename so a crash mid-write
+            # never leaves a half-written zones.json that wipes touch counts.
+            tmp = PERSIST_PATH.with_suffix(".tmp")
+            with open(tmp, "w") as f:
                 json.dump(data, f, indent=2)
+            tmp.replace(PERSIST_PATH)
         except OSError as exc:
             logger.warning("Zone persist failed: %s", exc)
 

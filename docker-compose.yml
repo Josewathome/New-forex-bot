@@ -7,6 +7,9 @@ services:
     image: gmag11/metatrader5_vnc:latest
     container_name: mt5
     restart: unless-stopped
+    stop_grace_period: 30s   # Give SIGTERM 30s to trigger the bot's clean shutdown
+                              # handler and flush a final checkpoint before SIGKILL.
+                              # Default Docker timeout is 10s — too short for MT5 + Wine.
     ports:
       - "3000:3000"       # noVNC browser UI → http://localhost:3000
       - "8000:8080"       # Trading dashboard → http://localhost:8000
@@ -27,6 +30,7 @@ services:
       # JWT_* and all other bot credentials are passed via env_file: .env above.
       # They must NOT be re-declared here — Docker Compose interpolates $VAR
       # inside environment: values, which corrupts passwords containing $ or &.
+    shm_size: "256m"     # Wine + KasmVNC needs > 64 MB default; 256 MB prevents crashes
     dns:
       - 1.1.1.1
       - 1.0.0.1
@@ -49,4 +53,7 @@ volumes:
 networks:
   default: {}
   forex-shared:
-    external: true         # created by forex-api project; do not manage here
+    # Created here if it doesn't exist; harmless if the forex-api project also
+    # defines it — Docker Compose simply attaches to the existing network.
+    # Change to `external: true` only if forex-api always starts before this bot.
+    driver: bridge
