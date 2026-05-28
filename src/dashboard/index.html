@@ -98,6 +98,21 @@
   .login-btn{width:100%;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:600;cursor:pointer;transition:.2s;margin-top:4px}
   .login-btn:hover{filter:brightness(1.12)}
   .login-btn:disabled{opacity:.6;cursor:default}
+  /* Backtest page */
+  .bt-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .bt-sel-count{font-size:12px;color:var(--muted);min-width:80px}
+  input[type=checkbox].bt-cb{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;flex-shrink:0}
+  /* 3-dot menu */
+  .dot-menu-wrap{position:relative;display:inline-block}
+  .dot-btn{background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;line-height:1;padding:2px 6px;border-radius:4px;transition:.15s}
+  .dot-btn:hover{color:var(--text);background:rgba(255,255,255,.06)}
+  .dot-popup{position:absolute;right:0;top:100%;margin-top:4px;background:var(--card);border:1px solid var(--border);border-radius:8px;min-width:150px;box-shadow:0 8px 24px rgba(0,0,0,.5);z-index:500;display:none;overflow:hidden}
+  .dot-popup.open{display:block}
+  .dot-item{display:flex;align-items:center;gap:8px;padding:9px 14px;cursor:pointer;font-size:13px;color:var(--text);transition:.15s;white-space:nowrap}
+  .dot-item:hover{background:rgba(255,255,255,.05)}
+  .dot-item.danger{color:var(--red)}
+  .dot-item.danger:hover{background:rgba(239,68,68,.08)}
+  .dot-sep{border:none;border-top:1px solid var(--border);margin:3px 0}
 </style>
 </head>
 <body>
@@ -357,20 +372,34 @@
   <!-- Reports list -->
   <div class="section">
     <div class="section-header">
-      Generated Reports
-      <button class="btn btn-sm btn-ghost" onclick="loadBacktestReports()">↻ Refresh</button>
+      <div class="bt-toolbar">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-weight:600">
+          <input type="checkbox" class="bt-cb" id="btSelectAll" onchange="toggleSelectAll(this)"/>
+          Generated Reports
+        </label>
+        <span class="bt-sel-count" id="btSelCount"></span>
+        <button class="btn btn-sm btn-ghost" id="btnDownloadSel" style="display:none"
+                onclick="downloadSelected()">↓ Download Selected</button>
+        <button class="btn btn-sm btn-danger" id="btnDeleteSel" style="display:none"
+                onclick="deleteSelected()">🗑 Delete Selected</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn btn-sm btn-ghost" onclick="downloadAllReports()">↓ Download All</button>
+        <button class="btn btn-sm btn-ghost" onclick="loadBacktestReports()">↻ Refresh</button>
+      </div>
     </div>
     <table id="btReportTable">
       <thead>
         <tr>
+          <th style="width:34px"></th>
           <th>Report File</th>
           <th>Size</th>
           <th>Generated</th>
-          <th style="text-align:right">Actions</th>
+          <th style="text-align:right;width:60px">Actions</th>
         </tr>
       </thead>
       <tbody id="btReportBody">
-        <tr><td colspan="4" class="empty">Loading reports…</td></tr>
+        <tr><td colspan="5" class="empty">Loading reports…</td></tr>
       </tbody>
     </table>
   </div>
@@ -935,32 +964,149 @@ async function saveBtConfig() {
 
 async function loadBacktestReports() {
   const tbody = document.getElementById('btReportBody');
-  tbody.innerHTML = '<tr><td colspan="4" class="empty">Loading…</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="5" class="empty">Loading…</td></tr>';
+  // reset select-all
+  const sa = document.getElementById('btSelectAll');
+  if (sa) sa.checked = false;
+  updateSelCount();
   try {
     const r = await apiFetch('/api/backtest-reports');
     const d = await r.json();
     const reports = d.reports || [];
     if (!reports.length) {
-      tbody.innerHTML = '<tr><td colspan="4" class="empty">No reports yet. Run a backtest first.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">No reports yet. Run a backtest first.</td></tr>';
       return;
     }
     tbody.innerHTML = reports.map(rep => {
       const kb   = (rep.size / 1024).toFixed(1);
       const date = new Date(rep.modified).toLocaleString();
       const name = escHtml(rep.name);
+      const safeName = name.replace(/'/g, "\\'");
       return `<tr>
+        <td style="width:34px;text-align:center">
+          <input type="checkbox" class="bt-cb bt-row-cb" value="${name}"
+                 onchange="updateSelCount()"/>
+        </td>
         <td><strong>${name}</strong></td>
         <td style="color:var(--muted)">${kb} KB</td>
         <td style="color:var(--muted)">${date}</td>
         <td style="text-align:right;white-space:nowrap">
-          <button class="btn btn-sm btn-ghost" onclick="viewBtReport('${name}')" style="margin-right:6px">View</button>
-          <button class="btn btn-sm btn-primary" onclick="downloadBtReport('${name}')">↓ Download</button>
+          <div class="dot-menu-wrap">
+            <button class="dot-btn" onclick="toggleDotMenu(this)" title="Actions">⋯</button>
+            <div class="dot-popup">
+              <div class="dot-item" onclick="viewBtReport('${safeName}');closeDotMenus()">
+                👁 View
+              </div>
+              <div class="dot-item" onclick="downloadBtReport('${safeName}');closeDotMenus()">
+                ↓ Download
+              </div>
+              <div class="dot-item" onclick="downloadAllReports();closeDotMenus()">
+                ↓ Download All
+              </div>
+              <hr class="dot-sep"/>
+              <div class="dot-item danger" onclick="deleteReport('${safeName}');closeDotMenus()">
+                🗑 Delete
+              </div>
+            </div>
+          </div>
         </td>
       </tr>`;
     }).join('');
   } catch(e) {
     if(e.message !== 'unauthenticated')
-      tbody.innerHTML = '<tr><td colspan="4" class="empty">Failed to load reports.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" class="empty">Failed to load reports.</td></tr>';
+  }
+}
+
+function toggleSelectAll(cb) {
+  document.querySelectorAll('.bt-row-cb').forEach(c => c.checked = cb.checked);
+  updateSelCount();
+}
+
+function updateSelCount() {
+  const all = document.querySelectorAll('.bt-row-cb');
+  const sel = document.querySelectorAll('.bt-row-cb:checked');
+  const cnt = document.getElementById('btSelCount');
+  const btnDl  = document.getElementById('btnDownloadSel');
+  const btnDel = document.getElementById('btnDeleteSel');
+  if (cnt)    cnt.textContent = sel.length ? `${sel.length} selected` : '';
+  if (btnDl)  btnDl.style.display  = sel.length ? 'inline-flex' : 'none';
+  if (btnDel) btnDel.style.display = sel.length ? 'inline-flex' : 'none';
+  // sync select-all checkbox state
+  const sa = document.getElementById('btSelectAll');
+  if (sa) {
+    sa.checked = all.length > 0 && sel.length === all.length;
+    sa.indeterminate = sel.length > 0 && sel.length < all.length;
+  }
+}
+
+function toggleDotMenu(btn) {
+  const popup = btn.nextElementSibling;
+  const isOpen = popup.classList.contains('open');
+  closeDotMenus();
+  if (!isOpen) popup.classList.add('open');
+}
+
+function closeDotMenus() {
+  document.querySelectorAll('.dot-popup.open').forEach(p => p.classList.remove('open'));
+}
+
+// Close dot menus on outside click
+document.addEventListener('click', e => {
+  if (!e.target.closest('.dot-menu-wrap')) closeDotMenus();
+});
+
+async function downloadSelected() {
+  const selected = [...document.querySelectorAll('.bt-row-cb:checked')].map(c => c.value);
+  if (!selected.length) return;
+  for (const name of selected) {
+    await downloadBtReport(name);
+  }
+}
+
+async function downloadAllReports() {
+  try {
+    const r = await apiFetch('/api/backtest-reports');
+    const d = await r.json();
+    const reports = d.reports || [];
+    if (!reports.length) { alert('No reports to download.'); return; }
+    for (const rep of reports) {
+      await downloadBtReport(rep.name);
+    }
+  } catch(e) {
+    if (e.message !== 'unauthenticated') alert('Error: ' + e);
+  }
+}
+
+async function deleteReport(filename) {
+  if (!confirm(`Delete report "${filename}"?\n\nThis cannot be undone.`)) return;
+  try {
+    const r = await apiFetch('/api/backtest-reports/' + encodeURIComponent(filename), {method: 'DELETE'});
+    const d = await r.json();
+    if (d.ok) {
+      loadBacktestReports();
+      // If viewer was showing this file, close it
+      if (document.getElementById('btViewerTitle')?.textContent === filename) closeBtViewer();
+    } else {
+      alert(d.error || 'Delete failed.');
+    }
+  } catch(e) {
+    if (e.message !== 'unauthenticated') alert('Delete failed: ' + e);
+  }
+}
+
+async function deleteSelected() {
+  const selected = [...document.querySelectorAll('.bt-row-cb:checked')].map(c => c.value);
+  if (!selected.length) return;
+  if (!confirm(`Delete ${selected.length} report(s)?\n\nThis cannot be undone.`)) return;
+  try {
+    for (const name of selected) {
+      await apiFetch('/api/backtest-reports/' + encodeURIComponent(name), {method: 'DELETE'});
+    }
+    loadBacktestReports();
+    closeBtViewer();
+  } catch(e) {
+    if (e.message !== 'unauthenticated') alert('Delete failed: ' + e);
   }
 }
 

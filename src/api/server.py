@@ -800,7 +800,7 @@ class DashboardServer:
             )
             return jsonify({"reports": reports})
 
-        @app.route("/api/backtest-reports/<path:filename>")
+        @app.route("/api/backtest-reports/<path:filename>", methods=["GET", "DELETE"])
         @require_auth
         def get_backtest_report(filename):
             report_dir = Path("src/backtest_results")
@@ -810,6 +810,14 @@ class DashboardServer:
                 return jsonify({"error": "Invalid path"}), 400
             if not p.exists():
                 return jsonify({"error": "Not found"}), 404
+
+            if request.method == "DELETE":
+                try:
+                    p.unlink()
+                    return jsonify({"ok": True})
+                except Exception as exc:
+                    return jsonify({"error": str(exc)}), 500
+
             return p.read_text(encoding="utf-8", errors="replace"), 200, {
                 "Content-Type": "text/plain; charset=utf-8"
             }
