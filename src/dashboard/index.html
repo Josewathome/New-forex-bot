@@ -138,6 +138,7 @@
   <div class="tab active" onclick="showTab('analytics')">Analytics</div>
   <div class="tab" onclick="showTab('pairs')">Pairs</div>
   <div class="tab" onclick="showTab('config')">Configuration</div>
+  <div class="tab" onclick="showTab('backtest')">Backtest</div>
   <div class="tab" onclick="showTab('logs')">Logs</div>
 </div>
 
@@ -155,14 +156,6 @@
       <div class="card-label">Max Drawdown <span id="dd-period-label" style="color:var(--muted);font-weight:400">(5 months)</span></div>
       <div class="card-value" id="sc-dd">-</div>
     </div>
-  </div>
-
-  <!-- Manual backtest trigger -->
-  <div style="display:flex;justify-content:flex-end;margin-bottom:16px">
-    <button class="btn btn-ghost btn-sm" onclick="runWeeklyBacktest()" type="button"
-      title="Fetch candle data from MT5, generate report files and email them now">
-      ▶ Run Weekly Backtest Now
-    </button>
   </div>
 
   <!-- Period filter + period stats -->
@@ -282,12 +275,6 @@
       <div class="form-group"><label>ATR Cost Threshold</label><input type="number" id="cfg-atr_cost_threshold" step="0.01" min="0.01" max="1"/></div>
       <div class="form-group"><label>Loop Interval (seconds)</label><input type="number" id="cfg-loop_interval" step="5" min="10"/></div>
       <div class="form-group"><label>Breakeven RR Trigger</label><input type="number" id="cfg-breakeven_rr" step="0.1" min="0.5"/></div>
-      <div class="form-group">
-        <label>Backtest Initial Balance</label>
-        <input type="number" id="cfg-backtest_balance" step="1000" min="1"
-               title="Starting balance used for every backtest simulation. Set this to the amount you want to test with — it does not affect your live account."/>
-        <span style="font-size:11px;color:var(--muted);margin-top:3px">Used by weekly &amp; manual backtests only — not your live balance.</span>
-      </div>
     </div>
     <div class="form-actions">
       <button class="btn btn-primary" onclick="saveConfig()">Save & Apply</button>
@@ -339,6 +326,64 @@
       <button class="btn btn-danger" onclick="rotateSecret()">Rotate JWT Secret</button>
     </div>
   </div>
+</div>
+
+<!-- BACKTEST -->
+<div class="page" id="page-backtest">
+
+  <!-- Settings + Run button -->
+  <div class="section" style="margin-bottom:20px">
+    <div class="section-header">Backtest Settings</div>
+    <div class="form-grid">
+      <div class="form-group">
+        <label>Simulation Initial Balance (<span id="bt-ccy">?</span>)</label>
+        <input type="number" id="cfg-backtest_balance" step="1000" min="1"
+               title="Starting balance used for every backtest simulation. Does not affect your live account."/>
+        <span style="font-size:11px;color:var(--muted);margin-top:3px">Used by weekly &amp; manual backtests only — not your live balance.</span>
+      </div>
+    </div>
+    <div class="form-actions" style="justify-content:space-between;align-items:center">
+      <div style="display:flex;gap:10px;align-items:center">
+        <button class="btn btn-primary" onclick="saveBtConfig()">Save Balance</button>
+        <span class="save-msg" id="saveMsgBt">Saved!</span>
+      </div>
+      <button class="btn btn-ghost" onclick="runWeeklyBacktest()" type="button"
+        title="Fetch candle data from MT5, run the backtest, generate report files and email them now">
+        ▶ Run Backtest Now
+      </button>
+    </div>
+  </div>
+
+  <!-- Reports list -->
+  <div class="section">
+    <div class="section-header">
+      Generated Reports
+      <button class="btn btn-sm btn-ghost" onclick="loadBacktestReports()">↻ Refresh</button>
+    </div>
+    <table id="btReportTable">
+      <thead>
+        <tr>
+          <th>Report File</th>
+          <th>Size</th>
+          <th>Generated</th>
+          <th style="text-align:right">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="btReportBody">
+        <tr><td colspan="4" class="empty">Loading reports…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Inline report viewer -->
+  <div class="section" id="btViewerSection" style="display:none">
+    <div class="section-header">
+      <span id="btViewerTitle">Report</span>
+      <button class="btn btn-sm btn-ghost" onclick="closeBtViewer()">✕ Close</button>
+    </div>
+    <div class="log-box" id="btViewerBox" style="height:600px;white-space:pre;font-size:12px"></div>
+  </div>
+
 </div>
 
 <!-- LOGS -->
@@ -491,14 +536,15 @@ async function tryRefresh() {
 // ── Tab navigation ───────────────────────────────────────────────────
 function showTab(name) {
   document.querySelectorAll('.tab').forEach((t,i)=>{
-    const names = ['analytics','pairs','config','logs'];
+    const names = ['analytics','pairs','config','backtest','logs'];
     t.classList.toggle('active', names[i]===name);
   });
   document.querySelectorAll('.page').forEach(p=>{
     p.classList.toggle('active', p.id===`page-${name}`);
   });
-  if(name==='logs')   loadLogs();
-  if(name==='config') loadBalanceHistory();
+  if(name==='logs')      loadLogs();
+  if(name==='config')    loadBalanceHistory();
+  if(name==='backtest')  { loadBacktestReports(); loadBtConfig(); }
 }
 
 // ── Status ───────────────────────────────────────────────────────────
@@ -675,6 +721,8 @@ async function loadConfig() {
     if(tp) tp.checked = !!d.tiered_tp_enabled;
     const ccyEl = document.getElementById('lbl-balance-ccy');
     if(ccyEl && d.account_currency) ccyEl.textContent = d.account_currency;
+    const btCcy = document.getElementById('bt-ccy');
+    if(btCcy && d.account_currency) btCcy.textContent = d.account_currency;
   } catch(e) { if(e.message!=='unauthenticated') console.error('config load error', e); }
 }
 
@@ -852,6 +900,110 @@ async function resetAccount() {
       alert(d.error || 'Error resetting account stats.');
     }
   } catch(e) { if (e.message !== 'unauthenticated') alert('Error: ' + e); }
+}
+
+// ── Backtest ──────────────────────────────────────────────────────────
+
+async function loadBtConfig() {
+  try {
+    const r = await apiFetch('/api/config');
+    const d = await r.json();
+    const el = document.getElementById('cfg-backtest_balance');
+    if(el) el.value = d.backtest_balance ?? '';
+    const btCcy = document.getElementById('bt-ccy');
+    if(btCcy && d.account_currency) btCcy.textContent = d.account_currency;
+  } catch(e) {}
+}
+
+async function saveBtConfig() {
+  const val = parseFloat(document.getElementById('cfg-backtest_balance')?.value);
+  if(!val || val <= 0) { alert('Enter a valid balance amount.'); return; }
+  try {
+    const r = await apiFetch('/api/config', {
+      method: 'PATCH',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({backtest_balance: val}),
+    });
+    const d = await r.json();
+    if(d.ok) {
+      const msg = document.getElementById('saveMsgBt');
+      msg.classList.add('show');
+      setTimeout(() => msg.classList.remove('show'), 2000);
+    }
+  } catch(e) { if(e.message !== 'unauthenticated') alert('Error saving: ' + e); }
+}
+
+async function loadBacktestReports() {
+  const tbody = document.getElementById('btReportBody');
+  tbody.innerHTML = '<tr><td colspan="4" class="empty">Loading…</td></tr>';
+  try {
+    const r = await apiFetch('/api/backtest-reports');
+    const d = await r.json();
+    const reports = d.reports || [];
+    if (!reports.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">No reports yet. Run a backtest first.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = reports.map(rep => {
+      const kb   = (rep.size / 1024).toFixed(1);
+      const date = new Date(rep.modified).toLocaleString();
+      const name = escHtml(rep.name);
+      return `<tr>
+        <td><strong>${name}</strong></td>
+        <td style="color:var(--muted)">${kb} KB</td>
+        <td style="color:var(--muted)">${date}</td>
+        <td style="text-align:right;white-space:nowrap">
+          <button class="btn btn-sm btn-ghost" onclick="viewBtReport('${name}')" style="margin-right:6px">View</button>
+          <button class="btn btn-sm btn-primary" onclick="downloadBtReport('${name}')">↓ Download</button>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    if(e.message !== 'unauthenticated')
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">Failed to load reports.</td></tr>';
+  }
+}
+
+async function viewBtReport(filename) {
+  const section = document.getElementById('btViewerSection');
+  const box     = document.getElementById('btViewerBox');
+  const title   = document.getElementById('btViewerTitle');
+  section.style.display = 'block';
+  title.textContent = filename;
+  box.textContent = 'Loading…';
+  box.scrollTop = 0;
+  section.scrollIntoView({behavior:'smooth', block:'start'});
+  try {
+    const r = await apiFetch('/api/backtest-reports/' + encodeURIComponent(filename));
+    if (!r.ok) { box.textContent = 'Error: report not found.'; return; }
+    box.textContent = await r.text();
+  } catch(e) {
+    if(e.message !== 'unauthenticated') box.textContent = 'Failed to load report.';
+  }
+}
+
+async function downloadBtReport(filename) {
+  try {
+    const r = await apiFetch('/api/backtest-reports/' + encodeURIComponent(filename));
+    if (!r.ok) { alert('Report not found.'); return; }
+    const text = await r.text();
+    const blob = new Blob([text], {type: 'text/plain'});
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch(e) {
+    if(e.message !== 'unauthenticated') alert('Download failed: ' + e);
+  }
+}
+
+function closeBtViewer() {
+  document.getElementById('btViewerSection').style.display = 'none';
+  document.getElementById('btViewerBox').textContent = '';
 }
 
 // ── Logs ──────────────────────────────────────────────────────────────
