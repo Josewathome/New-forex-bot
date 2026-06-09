@@ -15,6 +15,11 @@ mono_url="https://dl.winehq.org/wine/wine-mono/10.3.0/wine-mono-10.3.0-x86.msi"
 python_url="https://www.python.org/ftp/python/3.9.13/python-3.9.13.exe"
 mt5setup_url="https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
 
+# dingmaotu/mql-zmq — the one-stop source for everything ZMQ needs in MT5:
+#   - Pre-built Win64 DLLs (libzmq.dll + libsodium.dll) in Library/MT5/
+#   - VC2010 variants in Library/VC2010/ (explicitly Wine-compatible per README)
+#   - MQL5 Include/Zmq/ wrapper headers
+# We download the master branch zip (GitHub codeload — never 404s on active repos).
 mql_zmq_url="https://github.com/dingmaotu/mql-zmq/archive/refs/heads/master.zip"
 
 show_message() { echo "$1"; }
@@ -34,6 +39,8 @@ is_wine_python_package_installed() {
 check_dependency "curl"
 check_dependency "$wine_executable"
 
+# unzip is not pre-installed in the base image.
+# Install it silently; if apt-get is unavailable fall back to Python's zipfile.
 if ! command -v unzip &>/dev/null; then
     apt-get install -y --no-install-recommends unzip 2>/dev/null || true
 fi
@@ -56,15 +63,25 @@ fi
 # binary Config/experts.ini keyed to the MachineGuid. Without 127.0.0.1 in
 # the list, SocketConnect returns err=4014 and the EA never connects.
 # Since MachineGuid is pinned (constant across restarts), the encrypted blob
-# remains valid — so we back it up once and restore it on every subsequent start.
-MT5_CONFIG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Config"
-EXPERTS_INI_LIVE="${MT5_CONFIG_DIR}/experts.ini"
+# remains valid — so we can back it up once (after the operator adds 127.0.0.1
+# via VNC) and restore it on every subsequent start.
+_MT5_CONFIG_DIR_EARLY="/config/.wine/drive_c/Program Files/MetaTrader 5/Config"
+EXPERTS_INI_LIVE="${_MT5_CONFIG_DIR_EARLY}/experts.ini"
 EXPERTS_INI_BACKUP="/config/experts_ini.bak"
+# Fresh-volume fallback: if a full Config/ backup exists but the live Config has
+# no experts.ini, restore the backed-up files we don't already have (preserves
+# the whitelist whichever file carries it on this build).
+if [ -d /config/mt5_config_backup ] && [ ! -f "${EXPERTS_INI_LIVE}" ]; then
+    mkdir -p "${_MT5_CONFIG_DIR_EARLY}"
+    cp -rn /config/mt5_config_backup/. "${_MT5_CONFIG_DIR_EARLY}/" 2>/dev/null || true
+    show_message "[0/6] Restored MT5 Config/ from full backup (whitelist preserved)."
+fi
 if [ -f "${EXPERTS_INI_BACKUP}" ] && [ ! -f "${EXPERTS_INI_LIVE}" ]; then
     mkdir -p "$(dirname "${EXPERTS_INI_LIVE}")"
     cp "${EXPERTS_INI_BACKUP}" "${EXPERTS_INI_LIVE}"
     show_message "[0/6] experts.ini restored from backup (127.0.0.1 whitelist preserved)."
 elif [ -f "${EXPERTS_INI_BACKUP}" ] && [ -f "${EXPERTS_INI_LIVE}" ]; then
+    # If the live file is smaller than the backup it was probably reset by MT5 — restore.
     _live_sz=$(stat -c%s "${EXPERTS_INI_LIVE}" 2>/dev/null || echo 0)
     _bak_sz=$(stat -c%s "${EXPERTS_INI_BACKUP}" 2>/dev/null || echo 0)
     if [ "${_live_sz}" -lt "${_bak_sz}" ]; then
@@ -78,6 +95,9 @@ else
 fi
 
 # ── [0/6] Pin Wine MachineGuid ────────────────────────────────────
+# IC Markets treats each unique MachineGuid as a new device and triggers
+# a mobile authorization request. Wine regenerates this GUID on every
+# fresh WINEPREFIX, making every container restart look like a new device.
 FIXED_MACHINE_GUID="${WINE_MACHINE_GUID:-a1b2c3d4-e5f6-7890-abcd-ef1234567890}"
 CURRENT_GUID=$(wine reg query "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid 2>/dev/null | grep -i MachineGuid | awk '{print $NF}' || true)
 if [ "${CURRENT_GUID}" != "${FIXED_MACHINE_GUID}" ]; then
@@ -113,8 +133,11 @@ else
 fi
 
 # ── [3/6] Pre-write MT5 credentials into common.ini ──────────────
+MT5_CONFIG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Config"
 MT5_COMMON_INI="${MT5_CONFIG_DIR}/common.ini"
 
+# Docker Compose interpolates $VAR inside env values, corrupting passwords.
+# Re-read MT5_PASSWORD directly from /bot/.env so the raw value is used.
 ENV_FILE="/bot/.env"
 if [ -f "${ENV_FILE}" ]; then
     _raw_password=$(grep -m1 '^MT5_PASSWORD=' "${ENV_FILE}" | sed 's/^MT5_PASSWORD=//')
@@ -155,13 +178,22 @@ else
 fi
 
 # ── [3/6] Account cache — do NOT wipe on restart ─────────────────
+# MT5 uses accounts.dat and network.dat to restore the broker session
+# on reconnect WITHOUT re-authenticating. Wiping them on every restart
+# forces a fresh auth on every container restart, which HFM demo servers
+# rate-limit and return "Invalid account" on the 2nd+ attempt.
+# We only wipe metaeditor.ini (not a session file — just MetaEditor UI state).
 MT5_INSTALL_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5"
 if [ -f "${MT5_INSTALL_DIR}/config/metaeditor.ini" ]; then
     rm -f "${MT5_INSTALL_DIR}/config/metaeditor.ini"
 fi
 show_message "[3/6] Account cache preserved (session files kept for reconnect)."
 
-# ── [3.5/6] ZMQ library (legacy — kept for volume compatibility) ──
+# ── [3.5/6] ZMQ library (legacy — kept for volume compatibility) ──────────────
+# EA v3 uses MT5 built-in sockets, not libzmq.dll. This section is a no-op
+# on containers that already have /config/.zmq_installed marker. It only runs
+# on fresh volumes — harmless but skipped immediately on restart.
+
 MT5_MQL5_DIR="${MT5_INSTALL_DIR}/MQL5"
 MT5_LIBS_DIR="${MT5_MQL5_DIR}/Libraries"
 MT5_INC_DIR="${MT5_MQL5_DIR}/Include"
@@ -170,6 +202,10 @@ ZMQ_MARKER="/config/.zmq_installed"
 
 mkdir -p "${MT5_LIBS_DIR}" "${MT5_INC_DIR}" "${MT5_EXPERTS_DIR}"
 
+# Invalidate marker if any of:
+#   a) The ZMQ include headers are missing
+#   b) Zmq.mqh is still UTF-16 encoded (MetaEditor needs UTF-8 — UTF-16 causes 226 errors)
+#   c) The mql-lang dependency (Mql/) is missing (causes 226 compile errors in Socket.mqh)
 if [ ! -d "${MT5_INC_DIR}/Zmq" ]; then
     rm -f "${ZMQ_MARKER}"
 elif [ ! -f "${MT5_INC_DIR}/Mql/Lang/Mql.mqh" ]; then
@@ -241,7 +277,7 @@ for fname in os.listdir(inc):
                 if [ -d "${_lang_root}/Lang" ]; then
                     mkdir -p "${MT5_INC_DIR}/Mql/Lang"
                     cp "${_lang_root}/Lang/"*.mqh "${MT5_INC_DIR}/Mql/Lang/" 2>/dev/null || true
-                    show_message "[3.5/6] mql4-lib Mql/Lang/ installed."
+                    show_message "[3.5/6] mql4-lib Mql/Lang/ installed ($(ls "${MT5_INC_DIR}/Mql/Lang/" | wc -l) files)."
                 else
                     show_message "[3.5/6] WARNING: mql4-lib Lang/ not found in archive."
                 fi
@@ -291,54 +327,15 @@ else
     show_message "[3.5/6] ZMQ library already installed."
 fi
 
-# ── EA auto-load via MT5 [StartUp] config (deterministic) ─────────
-STARTUP_INI_UNIX="/config/.wine/drive_c/zonebot_startup.ini"
-STARTUP_INI_WIN='C:\zonebot_startup.ini'
-
-_write_startup_ini() {
-    {
-        printf '[Experts]\r\n'
-        printf 'AllowLiveTrading=true\r\n'
-        printf 'Enabled=true\r\n'
-        printf 'Account=false\r\n'
-        printf 'Profile=false\r\n'
-        printf '[StartUp]\r\n'
-        printf 'Expert=ZoneBotBridge\r\n'
-        printf 'Symbol=GBPUSD\r\n'
-        printf 'Period=H1\r\n'
-    } > "${STARTUP_INI_UNIX}"
-}
-
-_active_charts_dir() {
-    python3 - <<'PYEOF'
-import os, glob
-mt5 = "/config/.wine/drive_c/Program Files/MetaTrader 5"
-cands = [os.path.join(mt5, "MQL5", "Profiles", "Charts", "Default"),
-         os.path.join(mt5, "Profiles", "Charts", "Default")]
-best, bm = None, -1.0
-for d in cands:
-    cs = glob.glob(os.path.join(d, "*.chr"))
-    if cs:
-        m = max(os.path.getmtime(p) for p in cs)
-        if m > bm:
-            best, bm = d, m
-print(best or cands[0])
-PYEOF
-}
-
-_empty_active_profile() {
-    local _dir; _dir="$(_active_charts_dir)"
-    rm -f "${_dir}"/*.chr 2>/dev/null || true
-}
-
-_launch_mt5_with_ea() {
-    _write_startup_ini
-    DISPLAY=:1 WINEPREFIX=/config/.wine WINEDEBUG=-all \
-        $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS "/config:${STARTUP_INI_WIN}" &
-}
-show_message "Pre-launch: [StartUp] EA auto-load configured."
+# EA auto-load is handled by .chr injection (see the relaunch block after
+# compile). The /config:[StartUp] mechanism was tried and does NOT work under
+# this Wine/MT5 build — it left zero EA every time. A stale zonebot_startup.ini
+# may linger in Config/ from that experiment; it's inert and harmless.
 
 # ── Patch terminal.ini: enable AutoTrading ────────────────────────
+# MT5 reads ExpertAdvisors=1 from [Common] in terminal.ini to allow EA
+# execution. Without it the EA is loaded but silently disabled. MT5
+# overwrites terminal.ini on exit, so we re-apply before every launch.
 _patch_terminal_ini() {
     local _ini="${MT5_CONFIG_DIR}/terminal.ini"
     [ -f "${_ini}" ] || return 0
@@ -415,6 +412,31 @@ _PATCH_PYEOF
 _patch_terminal_ini
 show_message "terminal.ini patched for AutoTrading."
 
+# ── Decide whether the EA needs recompiling — BEFORE the launch ───
+# The old script deleted + recompiled the .ex5 on EVERY boot, which forced a
+# compile-then-force-kill-then-relaunch cycle every single time. That restart
+# disrupts MT5 right as the Python bot calls mt5.initialize(), producing the
+# repeating "(-10005, IPC timeout) Terminal not running" loop: MT5 is mid
+# broker-resync and not yet IPC-ready.
+#
+# New rule: only recompile when the EA source actually changed (or no .ex5
+# exists). When the .ex5 is already current, inject the EA into the chart NOW —
+# before the single MT5 launch — so MT5 loads it on startup with NO restart.
+EA_SRC="/bot/src/infrastructure/mt5_bridge/ea/ZoneBotBridge.mq5"
+EA_DST="${MT5_EXPERTS_DIR}/ZoneBotBridge.mq5"
+EA_EX5="${MT5_EXPERTS_DIR}/ZoneBotBridge.ex5"
+_recompile_needed=0
+if [ ! -f "${EA_EX5}" ]; then
+    _recompile_needed=1
+    show_message "EA: no compiled .ex5 yet — will compile, then restart MT5 once."
+elif [ "${EA_SRC}" -nt "${EA_EX5}" ]; then
+    _recompile_needed=1
+    show_message "EA: source newer than .ex5 — will recompile, then restart MT5 once."
+else
+    show_message "EA: .ex5 up to date — injecting into chart before launch (no restart)."
+    SYMBOLS_CSV="${SYMBOLS_CSV:-}" python3 /bot/tools/inject_ea_chart.py || true
+fi
+
 # ── [3/6] Launch MT5 terminal ─────────────────────────────────────
 if [ -e "$mt5file" ]; then
     show_message "[3/6] Launching MT5 terminal..."
@@ -460,14 +482,10 @@ if [ -f /bot/src/requirements.txt ]; then
 fi
 
 # ── WAIT FOR OPERATOR CONFIRMATION (first run only) ───────────────
-# FIRST-RUN CHECKLIST:
-#   1. Open http://localhost:3000 in a browser
-#   2. Confirm MT5 is logged in and charts are loaded
-#   3. Tools → Options → Expert Advisors
-#      → Allow Algorithmic Trading  (tick)
-#      → Allow WebRequest for listed URL → add 127.0.0.1  (REQUIRED for EA socket)
-#      → click OK
-#   4. docker exec <container> touch /config/ready_to_trade
+# /config is a persistent Docker volume — ready_to_trade survives
+# container restarts and power cuts so the bot resumes automatically.
+# Only missing on the very first run, or after:
+#   docker exec mt5 rm /config/ready_to_trade  (manual reset)
 if [ ! -f /config/ready_to_trade ]; then
     echo ""
     echo "════════════════════════════════════════════════════════"
@@ -479,11 +497,10 @@ if [ ! -f /config/ready_to_trade ]; then
     echo "  2. Tools → Options → Expert Advisors"
     echo "     → Allow Algorithmic Trading"
     echo "     → Allow WebRequest: add 127.0.0.1  (REQUIRED — EA socket whitelist)"
-    echo "     → click OK"
     echo "  3. Run this command to start the bot:"
     echo "     docker exec mt5 touch /config/ready_to_trade"
     echo ""
-    echo "  Waiting for ready_to_trade signal…"
+    echo "  Waiting for ready_to_trade signal..."
     while [ ! -f /config/ready_to_trade ]; do
         sleep 5
     done
@@ -492,31 +509,36 @@ else
     echo "  ready_to_trade present — resuming bot immediately."
 fi
 
-# Back up experts.ini now that operator has confirmed setup.
+# Back up the whitelist now that the operator has confirmed setup.
+# The "Allow WebRequest for listed URL" entries (which authorize SocketConnect
+# to 127.0.0.1, fixing err=4014) are stored encrypted in MT5's Config dir,
+# keyed to the MachineGuid. MachineGuid is pinned, so the blob stays valid.
+# The exact filename varies by build (experts.ini on some, folded into the
+# encrypted terminal config on others) — so back up every .ini in Config/ and
+# log what's actually there so we capture whichever file carries the whitelist.
 if [ -f "${EXPERTS_INI_LIVE}" ]; then
     cp "${EXPERTS_INI_LIVE}" "${EXPERTS_INI_BACKUP}"
-    show_message "experts.ini backed up (whitelist will auto-restore on future starts)."
+    show_message "experts.ini backed up to ${EXPERTS_INI_BACKUP} (whitelist will auto-restore on future starts)."
 else
-    show_message "WARNING: ${EXPERTS_INI_LIVE} not found — cannot back up whitelist."
-    show_message "  → Tools → Options → Expert Advisors → add 127.0.0.1, click OK, restart container."
+    show_message "NOTE: ${EXPERTS_INI_LIVE} not present on this build. Config/ contents:"
+    ls -la "${MT5_CONFIG_DIR}" 2>/dev/null | sed 's/^/    /' || true
+    if [ -d "${MT5_CONFIG_DIR}" ]; then
+        rm -rf /config/mt5_config_backup
+        cp -r "${MT5_CONFIG_DIR}" /config/mt5_config_backup 2>/dev/null \
+            && show_message "Full Config/ backed up to /config/mt5_config_backup." \
+            || show_message "WARNING: Config/ backup failed."
+    fi
 fi
 
-# ── Deploy and compile ZoneBotBridge EA ──────────────────────────
-EA_SRC="/bot/src/infrastructure/mt5_bridge/ea/ZoneBotBridge.mq5"
-EA_DST="${MT5_EXPERTS_DIR}/ZoneBotBridge.mq5"
-EA_EX5="${MT5_EXPERTS_DIR}/ZoneBotBridge.ex5"
-
-if [ -f "${EA_EX5}" ]; then
-    rm -f "${EA_EX5}"
-    show_message "Old ZoneBotBridge.ex5 removed — will recompile fresh."
-fi
-_ex5_existed=0
-
+# ── Deploy and compile ZoneBotBridge EA (only when needed) ────────
 mkdir -p "${MT5_EXPERTS_DIR}" "${MT5_CONFIG_DIR}"
 
-if [ -f "${EA_SRC}" ]; then
+if [ "${_recompile_needed}" -eq 0 ]; then
+    show_message "EA already compiled and pre-injected — skipping recompile/restart."
+elif [ -f "${EA_SRC}" ]; then
     cp "${EA_SRC}" "${EA_DST}"
     show_message "ZoneBotBridge.mq5 deployed to MQL5/Experts/"
+    rm -f "${EA_EX5}"
 
     if [ -e '/config/.wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe' ]; then
         metaeditor='/config/.wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe'
@@ -563,7 +585,6 @@ for line in data.splitlines():
         _compile_log="${MT5_EXPERTS_DIR}/ZoneBotBridge.log"
         if [ -f "${EA_EX5}" ]; then
             show_message "ZoneBotBridge.ex5 compiled successfully."
-            [ "${_ex5_existed:-0}" -eq 0 ] && _ex5_compiled=1 || true
         else
             show_message "WARNING: ZoneBotBridge.ex5 not produced."
             if [ -f "${_compile_log}" ]; then
@@ -590,8 +611,12 @@ else
     show_message "WARNING: EA source not found at ${EA_SRC}"
 fi
 
-# ── Relaunch MT5 with [StartUp] so the compiled EA auto-attaches ──
-if [ -f "${EA_EX5}" ]; then
+# ── Relaunch MT5 with the EA injected into its active chart profile ──
+# This restart ONLY runs when we just (re)compiled — i.e. the EA wasn't loaded
+# at the initial launch because the .ex5 didn't exist yet. On a normal restart
+# the .ex5 was current, we pre-injected before launch, and MT5 already has the
+# EA — so we skip this disruptive cycle and avoid the IPC-timeout window.
+if [ "${_recompile_needed}" -eq 1 ] && [ -f "${EA_EX5}" ]; then
     _ea_loads_before=$(python3 -c "
 import glob,os
 ls=sorted(glob.glob('/config/.wine/drive_c/Program Files/MetaTrader 5/logs/*.log'),key=os.path.getmtime)
@@ -601,21 +626,21 @@ for l in ls:
 print(n)
 " 2>/dev/null || echo 0)
 
-    show_message "Stopping MT5 to relaunch with [StartUp] EA (clean single instance)..."
+    show_message "Stopping MT5 to inject EA into its active chart profile..."
     pgrep -f "terminal64.exe" > /dev/null 2>&1 && \
         $wine_executable taskkill /IM terminal64.exe /F 2>/dev/null || true
     sleep 5
-    _empty_active_profile
+    SYMBOLS_CSV="${SYMBOLS_CSV:-}" python3 /bot/tools/inject_ea_chart.py || true
     _patch_terminal_ini
-    _launch_mt5_with_ea
-    show_message "MT5 relaunched with [StartUp] EA — waiting for OnInit + socket connect..."
-    sleep 25
-
-    _ea_loads_before="${_ea_loads_before}" python3 - <<'VERIFY_PYEOF'
+    DISPLAY=:1 WINEPREFIX=/config/.wine WINEDEBUG=-all \
+        $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS &
+    show_message "MT5 relaunched with injected EA — verifying EA load in background (bot starts now)."
+    (
+        _ea_loads_before="${_ea_loads_before}" python3 - <<'VERIFY_PYEOF'
 import glob, os, time
 logdir = "/config/.wine/drive_c/Program Files/MetaTrader 5/logs"
 before = int(os.environ.get("_ea_loads_before", "0"))
-deadline, hit = time.time() + 75, None
+deadline, hit = time.time() + 180, None
 while time.time() < deadline and not hit:
     loads = []
     for l in sorted(glob.glob(os.path.join(logdir, "*.log")), key=os.path.getmtime):
@@ -626,9 +651,11 @@ while time.time() < deadline and not hit:
         hit = loads[-1]
     else:
         time.sleep(5)
-print("EA auto-load check:", hit if hit else
-      "NOT loaded within 75s — [StartUp] did not attach the EA (investigate before relying on it)")
+print("[ea-verify]", "EA loaded:", hit) if hit else print(
+    "[ea-verify] EA not seen in journal after 180s. The EA still loads once MT5 "
+    "finishes broker sync — confirm via 'TcpFeed: EA connected' in the bot log.")
 VERIFY_PYEOF
+    ) &
 fi
 
 # ── MT5 watchdog ─────────────────────────────────────────────────
@@ -636,15 +663,42 @@ fi
     while true; do
         sleep 20
         if ! pgrep -f "terminal64.exe" > /dev/null 2>&1; then
-            show_message "[watchdog] MT5 not running — relaunching with [StartUp] EA..."
-            _empty_active_profile
+            show_message "[watchdog] MT5 not running — re-injecting EA and relaunching..."
+            SYMBOLS_CSV="${SYMBOLS_CSV:-}" python3 /bot/tools/inject_ea_chart.py || true
             _patch_terminal_ini
-            _launch_mt5_with_ea
+            DISPLAY=:1 WINEPREFIX=/config/.wine WINEDEBUG=-all \
+                $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS &
             sleep 30
         fi
     done
 ) &
 show_message "MT5 watchdog started."
+
+# ── Wait until MT5 IPC is actually reachable before starting the bot ─
+# The bot's mt5.initialize() attaches to the RUNNING terminal. MT5 only answers
+# that IPC pipe AFTER it finishes its Wine cold-start + broker handshake (which
+# takes ~4-5 min). Probe the real capability so we start the bot at the right
+# moment instead of guessing from journal strings.
+_probe_timeout=300
+_probe_wait=0
+show_message "Probing MT5 IPC readiness before starting bot (up to ${_probe_timeout}s)..."
+while [ ${_probe_wait} -lt ${_probe_timeout} ]; do
+    _probe_out=$(DISPLAY=:1 WINEPREFIX=/config/.wine PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
+        $wine_executable python /bot/tools/mt5_probe.py 2>/dev/null)
+    _probe_rc=$?
+    show_message "  [probe ${_probe_wait}s] ${_probe_out}"
+    if [ ${_probe_rc} -eq 0 ]; then
+        show_message "MT5 IPC reachable after ${_probe_wait}s — starting bot."
+        break
+    fi
+    sleep 10
+    _probe_wait=$((_probe_wait + 10))
+done
+if [ ${_probe_wait} -ge ${_probe_timeout} ]; then
+    show_message "MT5 IPC probe timed out after ${_probe_timeout}s — starting bot anyway."
+    show_message "  If you see repeated 'IPC timeout', MT5 likely isn't logging in:"
+    show_message "  open VNC (http://localhost:3000) and confirm the terminal is connected."
+fi
 
 # ── START BOT ─────────────────────────────────────────────────────
 echo "Starting ZoneBot (stream mode) in Wine Python..."
