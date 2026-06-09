@@ -4,13 +4,8 @@
 # Replaces the default /Metatrader/start.sh via volume mount in docker-compose.yml.
 
 mt5file='/config/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe'
-# MetaEditor — try both capitalizations since Wine ext4 is case-sensitive
-# and the installer may produce MetaEditor64.exe or metaeditor64.exe.
-if [ -e '/config/.wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe' ]; then
-    metaeditor='/config/.wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe'
-else
-    metaeditor='/config/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe'
-fi
+# MetaEditor path is resolved lazily at compile time (after MT5 installs) — see _resolve_metaeditor().
+metaeditor=''
 export WINEPREFIX='/config/.wine'
 export WINEDEBUG='-all'
 wine_executable="wine"
@@ -20,11 +15,6 @@ mono_url="https://dl.winehq.org/wine/wine-mono/10.3.0/wine-mono-10.3.0-x86.msi"
 python_url="https://www.python.org/ftp/python/3.9.13/python-3.9.13.exe"
 mt5setup_url="https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe"
 
-# dingmaotu/mql-zmq — the one-stop source for everything ZMQ needs in MT5:
-#   - Pre-built Win64 DLLs (libzmq.dll + libsodium.dll) in Library/MT5/
-#   - VC2010 variants in Library/VC2010/ (explicitly Wine-compatible per README)
-#   - MQL5 Include/Zmq/ wrapper headers
-# We download the master branch zip (GitHub codeload — never 404s on active repos).
 mql_zmq_url="https://github.com/dingmaotu/mql-zmq/archive/refs/heads/master.zip"
 
 show_message() { echo "$1"; }
@@ -44,8 +34,6 @@ is_wine_python_package_installed() {
 check_dependency "curl"
 check_dependency "$wine_executable"
 
-# unzip is not pre-installed in the base image.
-# Install it silently; if apt-get is unavailable fall back to Python's zipfile.
 if ! command -v unzip &>/dev/null; then
     apt-get install -y --no-install-recommends unzip 2>/dev/null || true
 fi
@@ -63,10 +51,33 @@ else
     show_message "[0/6] kasmvnc.yaml not found — VNC thread patch skipped."
 fi
 
+# ── [0/6] Restore experts.ini whitelist (127.0.0.1 socket access) ─
+# MT5 stores the "Allow WebRequest for listed URL" entries in an encrypted
+# binary Config/experts.ini keyed to the MachineGuid. Without 127.0.0.1 in
+# the list, SocketConnect returns err=4014 and the EA never connects.
+# Since MachineGuid is pinned (constant across restarts), the encrypted blob
+# remains valid — so we back it up once and restore it on every subsequent start.
+MT5_CONFIG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Config"
+EXPERTS_INI_LIVE="${MT5_CONFIG_DIR}/experts.ini"
+EXPERTS_INI_BACKUP="/config/experts_ini.bak"
+if [ -f "${EXPERTS_INI_BACKUP}" ] && [ ! -f "${EXPERTS_INI_LIVE}" ]; then
+    mkdir -p "$(dirname "${EXPERTS_INI_LIVE}")"
+    cp "${EXPERTS_INI_BACKUP}" "${EXPERTS_INI_LIVE}"
+    show_message "[0/6] experts.ini restored from backup (127.0.0.1 whitelist preserved)."
+elif [ -f "${EXPERTS_INI_BACKUP}" ] && [ -f "${EXPERTS_INI_LIVE}" ]; then
+    _live_sz=$(stat -c%s "${EXPERTS_INI_LIVE}" 2>/dev/null || echo 0)
+    _bak_sz=$(stat -c%s "${EXPERTS_INI_BACKUP}" 2>/dev/null || echo 0)
+    if [ "${_live_sz}" -lt "${_bak_sz}" ]; then
+        cp "${EXPERTS_INI_BACKUP}" "${EXPERTS_INI_LIVE}"
+        show_message "[0/6] experts.ini restored from backup (live file was smaller/reset)."
+    else
+        show_message "[0/6] experts.ini live file OK."
+    fi
+else
+    show_message "[0/6] No experts.ini backup yet — will save after ready_to_trade."
+fi
+
 # ── [0/6] Pin Wine MachineGuid ────────────────────────────────────
-# IC Markets treats each unique MachineGuid as a new device and triggers
-# a mobile authorization request. Wine regenerates this GUID on every
-# fresh WINEPREFIX, making every container restart look like a new device.
 FIXED_MACHINE_GUID="${WINE_MACHINE_GUID:-a1b2c3d4-e5f6-7890-abcd-ef1234567890}"
 CURRENT_GUID=$(wine reg query "HKLM\\SOFTWARE\\Microsoft\\Cryptography" /v MachineGuid 2>/dev/null | grep -i MachineGuid | awk '{print $NF}' || true)
 if [ "${CURRENT_GUID}" != "${FIXED_MACHINE_GUID}" ]; then
@@ -102,11 +113,8 @@ else
 fi
 
 # ── [3/6] Pre-write MT5 credentials into common.ini ──────────────
-MT5_CONFIG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/Config"
 MT5_COMMON_INI="${MT5_CONFIG_DIR}/common.ini"
 
-# Docker Compose interpolates $VAR inside env values, corrupting passwords.
-# Re-read MT5_PASSWORD directly from /bot/.env so the raw value is used.
 ENV_FILE="/bot/.env"
 if [ -f "${ENV_FILE}" ]; then
     _raw_password=$(grep -m1 '^MT5_PASSWORD=' "${ENV_FILE}" | sed 's/^MT5_PASSWORD=//')
@@ -147,31 +155,13 @@ else
 fi
 
 # ── [3/6] Account cache — do NOT wipe on restart ─────────────────
-# MT5 uses accounts.dat and network.dat to restore the broker session
-# on reconnect WITHOUT re-authenticating. Wiping them on every restart
-# forces a fresh auth on every container restart, which HFM demo servers
-# rate-limit and return "Invalid account" on the 2nd+ attempt.
-# We only wipe metaeditor.ini (not a session file — just MetaEditor UI state).
 MT5_INSTALL_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5"
 if [ -f "${MT5_INSTALL_DIR}/config/metaeditor.ini" ]; then
     rm -f "${MT5_INSTALL_DIR}/config/metaeditor.ini"
 fi
 show_message "[3/6] Account cache preserved (session files kept for reconnect)."
 
-# ── [3.5/6] ZMQ library installation ─────────────────────────────
-# Both the MQL5 EA and the Python bot communicate over ZeroMQ.
-# The EA needs:
-#   - zmq.dll in MQL5/Libraries/ (the real Win64 libzmq DLL)
-#   - Zmq/ folder in MQL5/Include/ (MQL5 wrapper)
-# The Python bot needs:
-#   - pyzmq installed under Wine Python
-#
-# WHY zmq.dll lives in MQL5/Libraries/ and NOT the Wine system DLL path:
-#   MetaTrader 5 loads DLLs imported by EAs from MQL5/Libraries/ first,
-#   then falls back to Windows system paths. Placing it here avoids
-#   any Wine DLL override complexity and keeps MT5 self-contained.
-#   The Python pyzmq package bundles its own libzmq — no shared object.
-
+# ── [3.5/6] ZMQ library (legacy — kept for volume compatibility) ──
 MT5_MQL5_DIR="${MT5_INSTALL_DIR}/MQL5"
 MT5_LIBS_DIR="${MT5_MQL5_DIR}/Libraries"
 MT5_INC_DIR="${MT5_MQL5_DIR}/Include"
@@ -180,10 +170,6 @@ ZMQ_MARKER="/config/.zmq_installed"
 
 mkdir -p "${MT5_LIBS_DIR}" "${MT5_INC_DIR}" "${MT5_EXPERTS_DIR}"
 
-# Invalidate marker if any of:
-#   a) The ZMQ include headers are missing
-#   b) Zmq.mqh is still UTF-16 encoded (MetaEditor needs UTF-8 — UTF-16 causes 226 errors)
-#   c) The mql-lang dependency (Mql/) is missing (causes 226 compile errors in Socket.mqh)
 if [ ! -d "${MT5_INC_DIR}/Zmq" ]; then
     rm -f "${ZMQ_MARKER}"
 elif [ ! -f "${MT5_INC_DIR}/Mql/Lang/Mql.mqh" ]; then
@@ -203,19 +189,10 @@ if [ ! -f "${ZMQ_MARKER}" ]; then
     _zmq_tmp="/tmp/zmq_install"
     mkdir -p "${_zmq_tmp}"
 
-    # dingmaotu/mql-zmq is the canonical MQL5 ZMQ distribution.
-    # It ships everything in one archive:
-    #   Include/Zmq/     — MQL5 wrapper headers (what ZoneBotBridge.mq5 includes)
-    #   Library/MT5/     — libzmq.dll + libsodium.dll (Win64, standard build)
-    #   Library/VC2010/  — libzmq.dll + libsodium.dll (Win64, VC2010 runtime — Wine-compatible)
-    # We use the VC2010 variants because they depend on msvcr100.dll which Wine
-    # ships by default, whereas newer MSVC runtimes require manual Wine DLL overrides.
-
     if curl -fL --retry 3 --retry-delay 5 \
             "${mql_zmq_url}" \
             -o "${_zmq_tmp}/mql-zmq.zip"; then
 
-        # Extract — prefer unzip, fall back to Python's zipfile (always present)
         mkdir -p "${_zmq_tmp}/mql-zmq"
         if command -v unzip &>/dev/null; then
             unzip -q "${_zmq_tmp}/mql-zmq.zip" -d "${_zmq_tmp}/mql-zmq" 2>/dev/null || true
@@ -227,19 +204,14 @@ with zipfile.ZipFile('${_zmq_tmp}/mql-zmq.zip') as z:
 " 2>/dev/null || true
         fi
 
-        # GitHub zips have a top-level directory (mql-zmq-master/) — strip it
         _repo_root=$(find "${_zmq_tmp}/mql-zmq" -maxdepth 1 -mindepth 1 -type d | head -1)
         if [ -z "${_repo_root}" ]; then
             _repo_root="${_zmq_tmp}/mql-zmq"
         fi
 
-        # ── Install MQL5 headers ─────────────────────────────────
         if [ -d "${_repo_root}/Include/Zmq" ]; then
             rm -rf "${MT5_INC_DIR}/Zmq"
             cp -r "${_repo_root}/Include/Zmq" "${MT5_INC_DIR}/Zmq"
-            # Some files in the archive are UTF-16 encoded (e.g. Zmq.mqh).
-            # MetaEditor requires UTF-8 or ANSI — UTF-16 produces 226+ errors.
-            # Convert any UTF-16 .mqh files to UTF-8 in place.
             python3 -c "
 import os
 inc = '${MT5_INC_DIR}/Zmq'
@@ -257,11 +229,6 @@ for fname in os.listdir(inc):
             show_message "[3.5/6] WARNING: Include/Zmq/ not found in archive — EA will not compile"
         fi
 
-        # ── Install mql4-lib dependency ───────────────────────────
-        # mql-zmq's Socket.mqh includes <Mql/Lang/Mql.mqh> and
-        # <Mql/Lang/Native.mqh> from dingmaotu/mql4-lib.
-        # Without these, every class/method reference fails → 226 errors.
-        # Archive layout: Lang/Mql.mqh → install at MQL5/Include/Mql/Lang/Mql.mqh
         if [ ! -f "${MT5_INC_DIR}/Mql/Lang/Mql.mqh" ]; then
             show_message "[3.5/6] Downloading mql4-lib dependency..."
             _mql_tmp="/tmp/mql4_lang"
@@ -274,7 +241,7 @@ for fname in os.listdir(inc):
                 if [ -d "${_lang_root}/Lang" ]; then
                     mkdir -p "${MT5_INC_DIR}/Mql/Lang"
                     cp "${_lang_root}/Lang/"*.mqh "${MT5_INC_DIR}/Mql/Lang/" 2>/dev/null || true
-                    show_message "[3.5/6] mql4-lib Mql/Lang/ installed ($(ls "${MT5_INC_DIR}/Mql/Lang/" | wc -l) files)."
+                    show_message "[3.5/6] mql4-lib Mql/Lang/ installed."
                 else
                     show_message "[3.5/6] WARNING: mql4-lib Lang/ not found in archive."
                 fi
@@ -286,12 +253,6 @@ for fname in os.listdir(inc):
             show_message "[3.5/6] mql4-lib already installed."
         fi
 
-        # ── Install DLLs ─────────────────────────────────────────
-        # dingmaotu/mql-zmq archive layout:
-        #   Library/VC2010/x64/  — Win64 VC2010 DLLs (Wine-compatible, preferred)
-        #   Library/VC2010/x86/  — Win32 VC2010 DLLs (skip — MT5 is 64-bit)
-        #   Library/MT5/         — Win64 standard MSVC (fallback)
-        # We need x64 DLLs because MetaTrader 5 is a 64-bit process.
         _dll_src=""
         if [ -d "${_repo_root}/Library/VC2010/x64" ]; then
             _dll_src="${_repo_root}/Library/VC2010/x64"
@@ -302,8 +263,6 @@ for fname in os.listdir(inc):
         fi
 
         if [ -n "${_dll_src}" ]; then
-            # Copy all DLLs from the chosen directory into MQL5/Libraries/.
-            # Use find instead of glob — glob silently fails on paths with spaces.
             _dll_count=0
             while IFS= read -r -d '' _dll; do
                 cp "${_dll}" "${MT5_LIBS_DIR}/"
@@ -312,14 +271,12 @@ for fname in os.listdir(inc):
             done < <(find "${_dll_src}" -maxdepth 1 -name "*.dll" -print0 2>/dev/null)
             if [ "${_dll_count}" -eq 0 ]; then
                 show_message "[3.5/6] WARNING: no .dll files found in ${_dll_src}"
-                show_message "[3.5/6] Contents: $(ls "${_dll_src}" 2>/dev/null | tr '\n' ' ')"
             fi
         else
             show_message "[3.5/6] WARNING: no Library/VC2010/x64 or Library/MT5 found — DLLs missing"
         fi
 
         rm -rf "${_zmq_tmp}"
-        # Only mark success if headers were actually installed
         if [ -d "${MT5_INC_DIR}/Zmq" ]; then
             touch "${ZMQ_MARKER}"
             show_message "[3.5/6] ZMQ library installation complete."
@@ -328,84 +285,135 @@ for fname in os.listdir(inc):
         fi
     else
         show_message "[3.5/6] WARNING: mql-zmq download failed — will retry on next restart."
-        show_message "[3.5/6] ZMQ EA disabled for this session; attach manually via VNC."
         rm -rf "${_zmq_tmp}"
-        # Do NOT touch ZMQ_MARKER — retry on next restart
     fi
 else
     show_message "[3.5/6] ZMQ library already installed."
 fi
 
-# ── Pre-launch: Inject EA into GBPUSD H1 chart file ──────────────
-# This runs BEFORE MT5 starts so the .chr file is ready when MT5
-# loads its profile. MT5 reads chart files at startup and will
-# attach ZoneBotBridge automatically — no VNC or AutoTrade.ini needed.
-_symbols_pre="${SYMBOLS_CSV:-GBPUSD,XAUUSD,USDJPY,AUDUSD,USDCHF}"
-_chr_dir_pre="${MT5_INSTALL_DIR}/Profiles/Charts/Default"
-mkdir -p "${_chr_dir_pre}"
-SYMBOLS_CSV="${_symbols_pre}" python3 - <<'PRELAUNCH_PYEOF'
-import os, sys, glob
+# ── EA auto-load via MT5 [StartUp] config (deterministic) ─────────
+STARTUP_INI_UNIX="/config/.wine/drive_c/zonebot_startup.ini"
+STARTUP_INI_WIN='C:\zonebot_startup.ini'
 
-mt5_dir  = "/config/.wine/drive_c/Program Files/MetaTrader 5"
-chr_dir  = os.path.join(mt5_dir, "Profiles", "Charts", "Default")
-symbols  = os.environ.get("SYMBOLS_CSV", "GBPUSD,XAUUSD,USDJPY,AUDUSD,USDCHF")
-ea_name  = "ZoneBotBridge"
-endpoint = "tcp://127.0.0.1:5556"
+_write_startup_ini() {
+    {
+        printf '[Experts]\r\n'
+        printf 'AllowLiveTrading=true\r\n'
+        printf 'Enabled=true\r\n'
+        printf 'Account=false\r\n'
+        printf 'Profile=false\r\n'
+        printf '[StartUp]\r\n'
+        printf 'Expert=ZoneBotBridge\r\n'
+        printf 'Symbol=GBPUSD\r\n'
+        printf 'Period=H1\r\n'
+    } > "${STARTUP_INI_UNIX}"
+}
 
-EXPERT_BLOCK = "\n<expert>\nname={ea}\nflags=3\nwindow=0\n\n<inputs>\nPUB_ENDPOINT={ep}\nSYMBOLS_CSV={sym}\nHEARTBEAT_SECS=5\n</inputs>\n\n</expert>\n".format(
-    ea=ea_name, ep=endpoint, sym=symbols)
+_active_charts_dir() {
+    python3 - <<'PYEOF'
+import os, glob
+mt5 = "/config/.wine/drive_c/Program Files/MetaTrader 5"
+cands = [os.path.join(mt5, "MQL5", "Profiles", "Charts", "Default"),
+         os.path.join(mt5, "Profiles", "Charts", "Default")]
+best, bm = None, -1.0
+for d in cands:
+    cs = glob.glob(os.path.join(d, "*.chr"))
+    if cs:
+        m = max(os.path.getmtime(p) for p in cs)
+        if m > bm:
+            best, bm = d, m
+print(best or cands[0])
+PYEOF
+}
 
-os.makedirs(chr_dir, exist_ok=True)
-chrs = sorted(glob.glob(os.path.join(chr_dir, "*.chr")))
+_empty_active_profile() {
+    local _dir; _dir="$(_active_charts_dir)"
+    rm -f "${_dir}"/*.chr 2>/dev/null || true
+}
 
-# Find GBPUSD H1 chart (period_type=2 period_size=1 in MT5 = H1)
-target = None
-for path in chrs:
-    try:
-        raw  = open(path, "rb").read()
-        text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-        if "symbol=GBPUSD" in text and "period_type=2" in text and "period_size=1" in text:
-            target = path
-            break
-    except Exception:
-        pass
+_launch_mt5_with_ea() {
+    _write_startup_ini
+    DISPLAY=:1 WINEPREFIX=/config/.wine WINEDEBUG=-all \
+        $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS "/config:${STARTUP_INI_WIN}" &
+}
+show_message "Pre-launch: [StartUp] EA auto-load configured."
 
-# Fallback: any GBPUSD chart
-if target is None:
-    for path in chrs:
-        try:
-            raw  = open(path, "rb").read()
-            text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-            if "symbol=GBPUSD" in text:
-                target = path
-                break
-        except Exception:
-            pass
-
-# Still nothing — create a minimal GBPUSD H1 chart
-if target is None:
-    idx = len(chrs) + 1
-    target = os.path.join(chr_dir, "chart{:02d}.chr".format(idx))
-    minimal = "<chart>\nsymbol=GBPUSD\nperiod_type=2\nperiod_size=1\ndigits=5\ntick_size=0.000000\nscale=4\nmode=1\nbidline=1\n\n<window>\nheight=100\n\n<indicator>\nname=Main\npath=\napply=1\nshow_data=1\nscale_inherit=0\nscale_line=0\nscale_line_percent=50\nscale_line_value=0.000000\nscale_fix_min=0\nscale_fix_min_val=0.000000\nscale_fix_max=0\nscale_fix_max_val=0.000000\n</indicator>\n\n</window>\n\n</chart>\n"
-    open(target, "wb").write(b"\xff\xfe" + minimal.encode("utf-16-le"))
-    print("Created new GBPUSD H1 chart:", target)
-
-raw  = open(target, "rb").read()
-text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-
-if ea_name in text:
-    print("EA already injected in:", os.path.basename(target))
-    sys.exit(0)
-
-if "</chart>" in text:
-    text = text.replace("</chart>", EXPERT_BLOCK + "</chart>", 1)
+# ── Patch terminal.ini: enable AutoTrading ────────────────────────
+_patch_terminal_ini() {
+    local _ini="${MT5_CONFIG_DIR}/terminal.ini"
+    [ -f "${_ini}" ] || return 0
+    python3 - "${_ini}" <<'_PATCH_PYEOF'
+import sys
+path = sys.argv[1]
+data = open(path, 'rb').read()
+if data[:2] in (b'\xff\xfe', b'\xfe\xff'):
+    text = data.decode('utf-16-le', errors='replace').lstrip('﻿')
+    enc, bom = 'utf-16-le', b'\xff\xfe'
 else:
-    text = text.rstrip() + EXPERT_BLOCK + "\n</chart>\n"
+    text = data.decode('utf-8', errors='replace')
+    enc, bom = 'utf-8', b''
+lines = text.splitlines()
 
-open(target, "wb").write(b"\xff\xfe" + text.encode("utf-16-le"))
-print("EA injected into:", os.path.basename(target))
-PRELAUNCH_PYEOF
-show_message "Pre-launch chart injection done."
+in_common = False
+in_expert  = False
+has_experts_common = False
+has_dll_expert     = False
+has_live_expert    = False
+has_import_expert  = False
+has_expert_section = False
+
+new_lines = []
+for line in lines:
+    s = line.strip()
+    if s == '[Common]':
+        in_common = True
+        in_expert  = False
+    elif s == '[Expert]':
+        in_common = False
+        in_expert  = True
+        has_expert_section = True
+    elif s.startswith('[') and s.endswith(']'):
+        if in_common and not has_experts_common:
+            new_lines.append('ExpertAdvisors=1')
+        if in_expert:
+            if not has_dll_expert:    new_lines.append('AllowDll=1')
+            if not has_live_expert:   new_lines.append('AllowLive=1')
+            if not has_import_expert: new_lines.append('AllowImport=1')
+        in_common = False
+        in_expert  = False
+
+    if in_common and s.startswith('ExpertAdvisors='):
+        new_lines.append('ExpertAdvisors=1'); has_experts_common = True; continue
+    if in_expert and s.startswith('AllowDll='):
+        new_lines.append('AllowDll=1');    has_dll_expert    = True; continue
+    if in_expert and s.startswith('AllowLive='):
+        new_lines.append('AllowLive=1');   has_live_expert   = True; continue
+    if in_expert and s.startswith('AllowImport='):
+        new_lines.append('AllowImport=1'); has_import_expert = True; continue
+
+    new_lines.append(line)
+
+if in_common and not has_experts_common:
+    new_lines.append('ExpertAdvisors=1')
+if in_expert:
+    if not has_dll_expert:    new_lines.append('AllowDll=1')
+    if not has_live_expert:   new_lines.append('AllowLive=1')
+    if not has_import_expert: new_lines.append('AllowImport=1')
+
+if not has_expert_section:
+    new_lines.append('')
+    new_lines.append('[Expert]')
+    new_lines.append('AllowDll=1')
+    new_lines.append('AllowLive=1')
+    new_lines.append('AllowImport=1')
+
+result = '\r\n'.join(new_lines) + '\r\n'
+open(path, 'wb').write(bom + result.encode(enc))
+print('terminal.ini patched: ExpertAdvisors=1 AllowDll=1 AllowLive=1 AllowImport=1')
+_PATCH_PYEOF
+}
+_patch_terminal_ini
+show_message "terminal.ini patched for AutoTrading."
 
 # ── [3/6] Launch MT5 terminal ─────────────────────────────────────
 if [ -e "$mt5file" ]; then
@@ -440,20 +448,7 @@ fi
 show_message "[5/6] Pinning numpy<2 for stability..."
 $wine_executable python -m pip install --no-cache-dir "numpy<2" --quiet
 
-# ── [5.5/6] pyzmq for Wine Python ────────────────────────────────
-# pyzmq must be installed inside Wine Python (not the Linux system Python)
-# because the bot runs as `wine python`. pyzmq bundles its own libzmq
-# shared library — it does NOT use the zmq.dll we installed for the MQL5 EA.
-# The two ZMQ instances (EA side / Python side) are completely independent
-# C libraries that communicate over Wine's loopback TCP stack.
-show_message "[5.5/6] Installing pyzmq in Wine Python..."
-if ! is_wine_python_package_installed "pyzmq"; then
-    # Pin to zmq 24.x — compatible with Python 3.9 and the bundled libzmq 4.3.x
-    $wine_executable python -m pip install --no-cache-dir "pyzmq>=24,<26" --quiet
-    show_message "[5.5/6] pyzmq installed."
-else
-    show_message "[5.5/6] pyzmq already installed."
-fi
+show_message "[5.5/6] pyzmq skipped — EA v3 uses MT5 built-in sockets; Python side uses plain TCP."
 
 # ── [6/6] Bot dependencies ────────────────────────────────────────
 show_message "[6/6] Installing bot dependencies in Wine Python..."
@@ -465,10 +460,14 @@ if [ -f /bot/src/requirements.txt ]; then
 fi
 
 # ── WAIT FOR OPERATOR CONFIRMATION (first run only) ───────────────
-# /config is a persistent Docker volume — ready_to_trade survives
-# container restarts and power cuts so the bot resumes automatically.
-# Only missing on the very first run, or after:
-#   docker exec mt5 rm /config/ready_to_trade  (manual reset)
+# FIRST-RUN CHECKLIST:
+#   1. Open http://localhost:3000 in a browser
+#   2. Confirm MT5 is logged in and charts are loaded
+#   3. Tools → Options → Expert Advisors
+#      → Allow Algorithmic Trading  (tick)
+#      → Allow WebRequest for listed URL → add 127.0.0.1  (REQUIRED for EA socket)
+#      → click OK
+#   4. docker exec <container> touch /config/ready_to_trade
 if [ ! -f /config/ready_to_trade ]; then
     echo ""
     echo "════════════════════════════════════════════════════════"
@@ -478,7 +477,9 @@ if [ ! -f /config/ready_to_trade ]; then
     echo "  1. Open http://localhost:3000 — confirm MT5 is logged in"
     echo "     and charts are loaded"
     echo "  2. Tools → Options → Expert Advisors"
-    echo "     → ✅ Allow Algorithmic Trading"
+    echo "     → Allow Algorithmic Trading"
+    echo "     → Allow WebRequest: add 127.0.0.1  (REQUIRED — EA socket whitelist)"
+    echo "     → click OK"
     echo "  3. Run this command to start the bot:"
     echo "     docker exec mt5 touch /config/ready_to_trade"
     echo ""
@@ -491,32 +492,37 @@ else
     echo "  ready_to_trade present — resuming bot immediately."
 fi
 
+# Back up experts.ini now that operator has confirmed setup.
+if [ -f "${EXPERTS_INI_LIVE}" ]; then
+    cp "${EXPERTS_INI_LIVE}" "${EXPERTS_INI_BACKUP}"
+    show_message "experts.ini backed up (whitelist will auto-restore on future starts)."
+else
+    show_message "WARNING: ${EXPERTS_INI_LIVE} not found — cannot back up whitelist."
+    show_message "  → Tools → Options → Expert Advisors → add 127.0.0.1, click OK, restart container."
+fi
+
 # ── Deploy and compile ZoneBotBridge EA ──────────────────────────
 EA_SRC="/bot/src/infrastructure/mt5_bridge/ea/ZoneBotBridge.mq5"
 EA_DST="${MT5_EXPERTS_DIR}/ZoneBotBridge.mq5"
 EA_EX5="${MT5_EXPERTS_DIR}/ZoneBotBridge.ex5"
-AUTO_TRADE_INI="${MT5_CONFIG_DIR}/AutoTrade.ini"
 
-# Ensure directories exist (MT5 should have created them, but be safe)
-mkdir -p "${MT5_EXPERTS_DIR}" "${MT5_CONFIG_DIR}"
-
-# Re-copy ZMQ DLLs now that MQL5/Libraries/ is confirmed to exist
-if [ -f "${MT5_LIBS_DIR}/libzmq.dll" ] || [ -f "${MT5_LIBS_DIR}/zmq.dll" ]; then
-    show_message "ZMQ DLLs already in MQL5/Libraries/."
-else
-    show_message "WARNING: ZMQ DLLs missing from MQL5/Libraries/ — EA will fail to compile."
-    show_message "Run: docker compose restart   to trigger re-download."
+if [ -f "${EA_EX5}" ]; then
+    rm -f "${EA_EX5}"
+    show_message "Old ZoneBotBridge.ex5 removed — will recompile fresh."
 fi
+_ex5_existed=0
+
+mkdir -p "${MT5_EXPERTS_DIR}" "${MT5_CONFIG_DIR}"
 
 if [ -f "${EA_SRC}" ]; then
     cp "${EA_SRC}" "${EA_DST}"
     show_message "ZoneBotBridge.mq5 deployed to MQL5/Experts/"
 
-    # Compile with MetaEditor if available.
-    # MetaEditor needs MT5 to be fully authorized and MQL5 environment loaded
-    # before it can compile — if we run it too early the compile silently
-    # produces nothing.  Poll the MT5 log for "terminal synchronized" (which
-    # only appears AFTER the broker handshake is complete) before compiling.
+    if [ -e '/config/.wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe' ]; then
+        metaeditor='/config/.wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe'
+    elif [ -e '/config/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe' ]; then
+        metaeditor='/config/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe'
+    fi
     if [ -e "$metaeditor" ]; then
         MT5_LOG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/logs"
         _compile_wait=0
@@ -545,11 +551,6 @@ for line in data.splitlines():
         fi
 
         show_message "Compiling ZoneBotBridge.mq5 ..."
-        # CRITICAL: pass a relative path to /compile: — absolute paths under Wine
-        # break #include resolution (Wine strips the leading slash from include lookups).
-        # Fix: cd into the MQL5 root so MetaEditor resolves includes from there.
-        # The log is written next to the source file (Experts/ZoneBotBridge.log)
-        # when no absolute log path is given.
         (
             cd "/config/.wine/drive_c/Program Files/MetaTrader 5" && \
             DISPLAY=:1 WINEPREFIX=/config/.wine timeout 120 \
@@ -562,13 +563,13 @@ for line in data.splitlines():
         _compile_log="${MT5_EXPERTS_DIR}/ZoneBotBridge.log"
         if [ -f "${EA_EX5}" ]; then
             show_message "ZoneBotBridge.ex5 compiled successfully."
+            [ "${_ex5_existed:-0}" -eq 0 ] && _ex5_compiled=1 || true
         else
             show_message "WARNING: ZoneBotBridge.ex5 not produced."
             if [ -f "${_compile_log}" ]; then
                 show_message "Compile errors:"
                 python3 -c "
 data = open('${_compile_log}','rb').read()
-# UTF-16 LE log
 try:
     text = data.decode('utf-16-le')
     if text.startswith('﻿'): text = text[1:]
@@ -589,138 +590,63 @@ else
     show_message "WARNING: EA source not found at ${EA_SRC}"
 fi
 
-# ── Inject EA into GBPUSD H1 chart file (reliable auto-load) ──────
-# AutoTrade.ini only fires when there is no saved chart state — it is
-# ignored if a .chr file already exists for that chart.  Instead we
-# write the <expert> block directly into the GBPUSD H1 .chr file so
-# MT5 loads ZoneBotBridge on EVERY restart, no VNC needed.
-#
-# MT5 .chr files are UTF-16 LE with BOM. We locate the GBPUSD H1
-# chart (or any GBPUSD chart as fallback), then insert the <expert>
-# block right before the closing </chart> tag if it isn't there yet.
-# MT5 must be stopped while we edit — it is still starting at this
-# point (launched above in the background), so we wait for the first
-# sync then edit and let MT5 re-read on the next start. But since we
-# ALSO restart MT5 after this via the bot loop's own restart cycle,
-# the simplest approach is: edit now (MT5 is mid-startup and hasn't
-# locked the .chr files yet), then MT5 will read them fresh.
-#
-# Profile search order: Profiles/Charts/Default/  (the active profile)
+# ── Relaunch MT5 with [StartUp] so the compiled EA auto-attaches ──
 if [ -f "${EA_EX5}" ]; then
-    _symbols="${SYMBOLS_CSV:-GBPUSD,XAUUSD,USDJPY,AUDUSD,USDCHF}"
-    _chr_dir="${MT5_INSTALL_DIR}/Profiles/Charts/Default"
-    mkdir -p "${_chr_dir}"
+    _ea_loads_before=$(python3 -c "
+import glob,os
+ls=sorted(glob.glob('/config/.wine/drive_c/Program Files/MetaTrader 5/logs/*.log'),key=os.path.getmtime)
+n=0
+for l in ls:
+    n+=open(l,'rb').read().decode('utf-16-le','replace').count('ZoneBotBridge')
+print(n)
+" 2>/dev/null || echo 0)
 
-    # Pass _symbols into the Python heredoc via the environment.
-    # The pre-launch block used SYMBOLS_CSV=... prefix; we do the same here so
-    # both injection passes use the same symbol list from the .env file.
-    _chart_inject_result=0
-    SYMBOLS_CSV="${_symbols}" python3 - <<'PYEOF'
-import os, sys, glob
-
-mt5_dir  = "/config/.wine/drive_c/Program Files/MetaTrader 5"
-chr_dir  = os.path.join(mt5_dir, "Profiles", "Charts", "Default")
-symbols  = os.environ.get("SYMBOLS_CSV", "GBPUSD,XAUUSD,USDJPY,AUDUSD,USDCHF")
-ea_name  = "ZoneBotBridge"
-endpoint = "tcp://127.0.0.1:5556"
-
-# The <expert> XML block MT5 uses to persist an attached EA.
-# period_type=2 period_size=1 → H1 (type 2 = hours, size 1)
-EXPERT_BLOCK = """\n<expert>\nname={ea}\nflags=3\nwindow=0\n\n<inputs>\nPUB_ENDPOINT={ep}\nSYMBOLS_CSV={sym}\nHEARTBEAT_SECS=5\n</inputs>\n\n</expert>\n""".format(
-    ea=ea_name, ep=endpoint, sym=symbols)
-
-os.makedirs(chr_dir, exist_ok=True)
-chrs = sorted(glob.glob(os.path.join(chr_dir, "*.chr")))
-
-# Find existing GBPUSD H1 chart or pick a GBPUSD chart
-target = None
-for path in chrs:
-    try:
-        raw  = open(path, "rb").read()
-        text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-        if "symbol=GBPUSD" in text and "period_type=2" in text and "period_size=1" in text:
-            target = path
-            break
-    except Exception:
-        pass
-
-# Fallback: any GBPUSD chart
-if target is None:
-    for path in chrs:
-        try:
-            raw  = open(path, "rb").read()
-            text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-            if "symbol=GBPUSD" in text:
-                target = path
-                break
-        except Exception:
-            pass
-
-# Still nothing — create a minimal GBPUSD H1 chart
-if target is None:
-    idx = len(chrs) + 1
-    target = os.path.join(chr_dir, "chart{:02d}.chr".format(idx))
-    minimal = "<chart>\nsymbol=GBPUSD\nperiod_type=2\nperiod_size=1\ndigits=5\ntick_size=0.000000\nscale=4\nmode=1\nbidline=1\n\n<window>\nheight=100\n\n<indicator>\nname=Main\npath=\napply=1\nshow_data=1\nscale_inherit=0\nscale_line=0\nscale_line_percent=50\nscale_line_value=0.000000\nscale_fix_min=0\nscale_fix_min_val=0.000000\nscale_fix_max=0\nscale_fix_max_val=0.000000\n</indicator>\n\n</window>\n\n</chart>\n"
-    open(target, "wb").write(b"\xff\xfe" + minimal.encode("utf-16-le"))
-    print("Created new GBPUSD H1 chart:", target)
-
-# Read, check, patch
-raw  = open(target, "rb").read()
-text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-
-if ea_name in text:
-    print("EA already in chart file:", target)
-    # Exit 2 = already present, no restart needed
-    sys.exit(2)
-
-# Insert <expert> block before </chart>
-if "</chart>" in text:
-    text = text.replace("</chart>", EXPERT_BLOCK + "</chart>", 1)
-else:
-    text = text.rstrip() + EXPERT_BLOCK + "\n</chart>\n"
-
-# Write UTF-16-LE with BOM.  Prepend the BOM character as the first code-unit
-# so the file starts with the two-byte sequence FF FE.
-open(target, "wb").write(b"\xff\xfe" + text.encode("utf-16-le"))
-print("EA injected into chart file:", target)
-# Exit 0 = freshly injected, MT5 restart required
-sys.exit(0)
-PYEOF
-    _chart_inject_result=$?
-    show_message "EA chart injection complete (exit=${_chart_inject_result})."
-
-    # Also write AutoTrade.ini as belt-and-suspenders for fresh installs
-    # (when no .chr files exist yet, AutoTrade.ini fires on first MT5 launch).
-    if ! grep -q "ZoneBotBridge" "${AUTO_TRADE_INI}" 2>/dev/null; then
-        printf '[Expert]\r\nName=ZoneBotBridge\r\nSymbol=GBPUSD\r\nPeriod=H1\r\n' > "${AUTO_TRADE_INI}"
-        printf 'Parameters=PUB_ENDPOINT=tcp://127.0.0.1:5556;SYMBOLS_CSV=%s;HEARTBEAT_SECS=5\r\n' \
-               "${_symbols}" >> "${AUTO_TRADE_INI}"
-        show_message "AutoTrade.ini written as fallback for fresh installs."
-    fi
-
-    # Restart MT5 ONLY when the chart was freshly modified (exit 0).
-    # When the EA was already in the chart (exit 2) MT5 already has it loaded —
-    # restarting would waste 25 s and briefly drop the broker connection.
-    if [ "${_chart_inject_result}" -eq 0 ]; then
-        show_message "Chart modified — restarting MT5 so it loads the injected EA..."
-        # taskkill is the Windows-native way to stop a process by name inside Wine.
-        # || true: if MT5 already exited for any reason, this is harmless.
+    show_message "Stopping MT5 to relaunch with [StartUp] EA (clean single instance)..."
+    pgrep -f "terminal64.exe" > /dev/null 2>&1 && \
         $wine_executable taskkill /IM terminal64.exe /F 2>/dev/null || true
-        sleep 5
-        # Relaunch MT5 in the background (same way as the initial launch above).
-        $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS &
-        show_message "MT5 restarted — waiting 20s for EA to bind ZMQ PUB socket..."
-        sleep 20
-    else
-        show_message "EA already present in chart — MT5 restart skipped."
-    fi
+    sleep 5
+    _empty_active_profile
+    _patch_terminal_ini
+    _launch_mt5_with_ea
+    show_message "MT5 relaunched with [StartUp] EA — waiting for OnInit + socket connect..."
+    sleep 25
+
+    _ea_loads_before="${_ea_loads_before}" python3 - <<'VERIFY_PYEOF'
+import glob, os, time
+logdir = "/config/.wine/drive_c/Program Files/MetaTrader 5/logs"
+before = int(os.environ.get("_ea_loads_before", "0"))
+deadline, hit = time.time() + 75, None
+while time.time() < deadline and not hit:
+    loads = []
+    for l in sorted(glob.glob(os.path.join(logdir, "*.log")), key=os.path.getmtime):
+        data = open(l, "rb").read().decode("utf-16-le", errors="replace")
+        loads += [ln.strip() for ln in data.splitlines()
+                  if "ZoneBotBridge" in ln and "loaded successfully" in ln]
+    if len(loads) > before:
+        hit = loads[-1]
+    else:
+        time.sleep(5)
+print("EA auto-load check:", hit if hit else
+      "NOT loaded within 75s — [StartUp] did not attach the EA (investigate before relying on it)")
+VERIFY_PYEOF
 fi
 
+# ── MT5 watchdog ─────────────────────────────────────────────────
+(
+    while true; do
+        sleep 20
+        if ! pgrep -f "terminal64.exe" > /dev/null 2>&1; then
+            show_message "[watchdog] MT5 not running — relaunching with [StartUp] EA..."
+            _empty_active_profile
+            _patch_terminal_ini
+            _launch_mt5_with_ea
+            sleep 30
+        fi
+    done
+) &
+show_message "MT5 watchdog started."
+
 # ── START BOT ─────────────────────────────────────────────────────
-# Launch the event-driven streaming bot (main_stream.py).
-# Wine reports os.name == "nt" so mt5_gateway.py uses direct
-# MetaTrader5 import — no RPyC bridge.
-# PYTHONUTF8=1 forces UTF-8 to prevent cp1252 crashes on box-drawing chars.
 echo "Starting ZoneBot (stream mode) in Wine Python..."
 cd /bot && DISPLAY=:1 WINEPREFIX=/config/.wine PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
     $wine_executable python -m src.main_stream
