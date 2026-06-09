@@ -4,13 +4,8 @@
 # Replaces the default /Metatrader/start.sh via volume mount in docker-compose.yml.
 
 mt5file='/config/.wine/drive_c/Program Files/MetaTrader 5/terminal64.exe'
-# MetaEditor — try both capitalizations since Wine ext4 is case-sensitive
-# and the installer may produce MetaEditor64.exe or metaeditor64.exe.
-if [ -e '/config/.wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe' ]; then
-    metaeditor='/config/.wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe'
-else
-    metaeditor='/config/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe'
-fi
+# MetaEditor path is resolved lazily at compile time (after MT5 installs) — see _resolve_metaeditor().
+metaeditor=''
 export WINEPREFIX='/config/.wine'
 export WINEDEBUG='-all'
 wine_executable="wine"
@@ -62,6 +57,47 @@ if [ -f "${KASMVNC_CFG}" ]; then
 else
     show_message "[0/6] kasmvnc.yaml not found — VNC thread patch skipped."
 fi
+
+# ── [0/6] Restore experts.ini whitelist (127.0.0.1 socket access) ─
+# MT5 stores the "Allow WebRequest for listed URL" entries in an encrypted
+# binary Config/experts.ini keyed to the MachineGuid. Without 127.0.0.1 in
+# the list, SocketConnect returns err=4014 and the EA never connects.
+# Since MachineGuid is pinned (constant across restarts), the encrypted blob
+# remains valid — so we can back it up once (after the operator adds 127.0.0.1
+# via VNC) and restore it on every subsequent start.
+_MT5_CONFIG_DIR_EARLY="/config/.wine/drive_c/Program Files/MetaTrader 5/Config"
+EXPERTS_INI_LIVE="${_MT5_CONFIG_DIR_EARLY}/experts.ini"
+EXPERTS_INI_BACKUP="/config/experts_ini.bak"
+# Fresh-volume fallback: if a full Config/ backup exists but the live Config has
+# no experts.ini, restore the backed-up files we don't already have (preserves
+# the whitelist whichever file carries it on this build).
+if [ -d /config/mt5_config_backup ] && [ ! -f "${EXPERTS_INI_LIVE}" ]; then
+    mkdir -p "${_MT5_CONFIG_DIR_EARLY}"
+    cp -rn /config/mt5_config_backup/. "${_MT5_CONFIG_DIR_EARLY}/" 2>/dev/null || true
+    show_message "[0/6] Restored MT5 Config/ from full backup (whitelist preserved)."
+fi
+if [ -f "${EXPERTS_INI_BACKUP}" ] && [ ! -f "${EXPERTS_INI_LIVE}" ]; then
+    mkdir -p "$(dirname "${EXPERTS_INI_LIVE}")"
+    cp "${EXPERTS_INI_BACKUP}" "${EXPERTS_INI_LIVE}"
+    show_message "[0/6] experts.ini restored from backup (127.0.0.1 whitelist preserved)."
+elif [ -f "${EXPERTS_INI_BACKUP}" ] && [ -f "${EXPERTS_INI_LIVE}" ]; then
+    # If the live file is smaller than the backup it was probably reset by MT5 — restore.
+    _live_sz=$(stat -c%s "${EXPERTS_INI_LIVE}" 2>/dev/null || echo 0)
+    _bak_sz=$(stat -c%s "${EXPERTS_INI_BACKUP}" 2>/dev/null || echo 0)
+    if [ "${_live_sz}" -lt "${_bak_sz}" ]; then
+        cp "${EXPERTS_INI_BACKUP}" "${EXPERTS_INI_LIVE}"
+        show_message "[0/6] experts.ini restored from backup (live file was smaller/reset)."
+    else
+        show_message "[0/6] experts.ini live file OK."
+    fi
+else
+    show_message "[0/6] No experts.ini backup yet — will save after ready_to_trade."
+fi
+
+# EA auto-start on this build is handled by the [StartUp] /config: mechanism
+# (see _launch_mt5 below): MT5 opens its own chart and live-attaches the EA on
+# every launch — no reliance on MT5 persisting profile/.chr/order.wnd to disk
+# (which this Wine build does not do).
 
 # ── [0/6] Pin Wine MachineGuid ────────────────────────────────────
 # IC Markets treats each unique MachineGuid as a new device and triggers
@@ -158,19 +194,10 @@ if [ -f "${MT5_INSTALL_DIR}/config/metaeditor.ini" ]; then
 fi
 show_message "[3/6] Account cache preserved (session files kept for reconnect)."
 
-# ── [3.5/6] ZMQ library installation ─────────────────────────────
-# Both the MQL5 EA and the Python bot communicate over ZeroMQ.
-# The EA needs:
-#   - zmq.dll in MQL5/Libraries/ (the real Win64 libzmq DLL)
-#   - Zmq/ folder in MQL5/Include/ (MQL5 wrapper)
-# The Python bot needs:
-#   - pyzmq installed under Wine Python
-#
-# WHY zmq.dll lives in MQL5/Libraries/ and NOT the Wine system DLL path:
-#   MetaTrader 5 loads DLLs imported by EAs from MQL5/Libraries/ first,
-#   then falls back to Windows system paths. Placing it here avoids
-#   any Wine DLL override complexity and keeps MT5 self-contained.
-#   The Python pyzmq package bundles its own libzmq — no shared object.
+# ── [3.5/6] ZMQ library (legacy — kept for volume compatibility) ──────────────
+# EA v3 uses MT5 built-in sockets, not libzmq.dll. This section is a no-op
+# on containers that already have /config/.zmq_installed marker. It only runs
+# on fresh volumes — harmless but skipped immediately on restart.
 
 MT5_MQL5_DIR="${MT5_INSTALL_DIR}/MQL5"
 MT5_LIBS_DIR="${MT5_MQL5_DIR}/Libraries"
@@ -336,81 +363,167 @@ else
     show_message "[3.5/6] ZMQ library already installed."
 fi
 
-# ── Pre-launch: Inject EA into GBPUSD H1 chart file ──────────────
-# This runs BEFORE MT5 starts so the .chr file is ready when MT5
-# loads its profile. MT5 reads chart files at startup and will
-# attach ZoneBotBridge automatically — no VNC or AutoTrade.ini needed.
-_symbols_pre="${SYMBOLS_CSV:-GBPUSD,XAUUSD,USDJPY,AUDUSD,USDCHF}"
-_chr_dir_pre="${MT5_INSTALL_DIR}/Profiles/Charts/Default"
-mkdir -p "${_chr_dir_pre}"
-SYMBOLS_CSV="${_symbols_pre}" python3 - <<'PRELAUNCH_PYEOF'
-import os, sys, glob
+# EA auto-load is handled by .chr injection (see the relaunch block after
+# compile). The /config:[StartUp] mechanism was tried and does NOT work under
+# this Wine/MT5 build — it left zero EA every time. A stale zonebot_startup.ini
+# may linger in Config/ from that experiment; it's inert and harmless.
 
-mt5_dir  = "/config/.wine/drive_c/Program Files/MetaTrader 5"
-chr_dir  = os.path.join(mt5_dir, "Profiles", "Charts", "Default")
-symbols  = os.environ.get("SYMBOLS_CSV", "GBPUSD,XAUUSD,USDJPY,AUDUSD,USDCHF")
-ea_name  = "ZoneBotBridge"
-endpoint = "tcp://127.0.0.1:5556"
-
-EXPERT_BLOCK = "\n<expert>\nname={ea}\nflags=3\nwindow=0\n\n<inputs>\nPUB_ENDPOINT={ep}\nSYMBOLS_CSV={sym}\nHEARTBEAT_SECS=5\n</inputs>\n\n</expert>\n".format(
-    ea=ea_name, ep=endpoint, sym=symbols)
-
-os.makedirs(chr_dir, exist_ok=True)
-chrs = sorted(glob.glob(os.path.join(chr_dir, "*.chr")))
-
-# Find GBPUSD H1 chart (period_type=2 period_size=1 in MT5 = H1)
-target = None
-for path in chrs:
-    try:
-        raw  = open(path, "rb").read()
-        text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-        if "symbol=GBPUSD" in text and "period_type=2" in text and "period_size=1" in text:
-            target = path
-            break
-    except Exception:
-        pass
-
-# Fallback: any GBPUSD chart
-if target is None:
-    for path in chrs:
-        try:
-            raw  = open(path, "rb").read()
-            text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-            if "symbol=GBPUSD" in text:
-                target = path
-                break
-        except Exception:
-            pass
-
-# Still nothing — create a minimal GBPUSD H1 chart
-if target is None:
-    idx = len(chrs) + 1
-    target = os.path.join(chr_dir, "chart{:02d}.chr".format(idx))
-    minimal = "<chart>\nsymbol=GBPUSD\nperiod_type=2\nperiod_size=1\ndigits=5\ntick_size=0.000000\nscale=4\nmode=1\nbidline=1\n\n<window>\nheight=100\n\n<indicator>\nname=Main\npath=\napply=1\nshow_data=1\nscale_inherit=0\nscale_line=0\nscale_line_percent=50\nscale_line_value=0.000000\nscale_fix_min=0\nscale_fix_min_val=0.000000\nscale_fix_max=0\nscale_fix_max_val=0.000000\n</indicator>\n\n</window>\n\n</chart>\n"
-    open(target, "wb").write(b"\xff\xfe" + minimal.encode("utf-16-le"))
-    print("Created new GBPUSD H1 chart:", target)
-
-raw  = open(target, "rb").read()
-text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-
-if ea_name in text:
-    print("EA already injected in:", os.path.basename(target))
-    sys.exit(0)
-
-if "</chart>" in text:
-    text = text.replace("</chart>", EXPERT_BLOCK + "</chart>", 1)
+# ── Patch terminal.ini: enable AutoTrading ────────────────────────
+# MT5 reads ExpertAdvisors=1 from [Common] in terminal.ini to allow EA
+# execution. Without it the EA is loaded but silently disabled. MT5
+# overwrites terminal.ini on exit, so we re-apply before every launch.
+_patch_terminal_ini() {
+    local _ini="${MT5_CONFIG_DIR}/terminal.ini"
+    [ -f "${_ini}" ] || return 0
+    python3 - "${_ini}" <<'_PATCH_PYEOF'
+import sys
+path = sys.argv[1]
+data = open(path, 'rb').read()
+if data[:2] in (b'\xff\xfe', b'\xfe\xff'):
+    text = data.decode('utf-16-le', errors='replace').lstrip('﻿')
+    enc, bom = 'utf-16-le', b'\xff\xfe'
 else:
-    text = text.rstrip() + EXPERT_BLOCK + "\n</chart>\n"
+    text = data.decode('utf-8', errors='replace')
+    enc, bom = 'utf-8', b''
+lines = text.splitlines()
 
-open(target, "wb").write(b"\xff\xfe" + text.encode("utf-16-le"))
-print("EA injected into:", os.path.basename(target))
-PRELAUNCH_PYEOF
-show_message "Pre-launch chart injection done."
+# Track state for [Common] and [Expert] sections
+in_common = False
+in_expert  = False
+has_experts_common = False   # ExpertAdvisors= in [Common]
+has_dll_expert     = False   # AllowDll= in [Expert]
+has_live_expert    = False   # AllowLive= in [Expert]
+has_import_expert  = False   # AllowImport= in [Expert]
+has_expert_section = False   # [Expert] section exists at all
 
-# ── [3/6] Launch MT5 terminal ─────────────────────────────────────
+new_lines = []
+for line in lines:
+    s = line.strip()
+    # Section transitions
+    if s == '[Common]':
+        in_common = True
+        in_expert  = False
+    elif s == '[Expert]':
+        in_common = False
+        in_expert  = True
+        has_expert_section = True
+    elif s.startswith('[') and s.endswith(']'):
+        # Leaving a section — flush any missing keys before the next section header
+        if in_common and not has_experts_common:
+            new_lines.append('ExpertAdvisors=1')
+        if in_expert:
+            if not has_dll_expert:    new_lines.append('AllowDll=1')
+            if not has_live_expert:   new_lines.append('AllowLive=1')
+            if not has_import_expert: new_lines.append('AllowImport=1')
+        in_common = False
+        in_expert  = False
+
+    # Rewrite known keys to force-enable them
+    if in_common and s.startswith('ExpertAdvisors='):
+        new_lines.append('ExpertAdvisors=1'); has_experts_common = True; continue
+    if in_expert and s.startswith('AllowDll='):
+        new_lines.append('AllowDll=1');    has_dll_expert    = True; continue
+    if in_expert and s.startswith('AllowLive='):
+        new_lines.append('AllowLive=1');   has_live_expert   = True; continue
+    if in_expert and s.startswith('AllowImport='):
+        new_lines.append('AllowImport=1'); has_import_expert = True; continue
+
+    new_lines.append(line)
+
+# Flush if the last section was [Common] or [Expert] (no trailing section header)
+if in_common and not has_experts_common:
+    new_lines.append('ExpertAdvisors=1')
+if in_expert:
+    if not has_dll_expert:    new_lines.append('AllowDll=1')
+    if not has_live_expert:   new_lines.append('AllowLive=1')
+    if not has_import_expert: new_lines.append('AllowImport=1')
+
+# If [Expert] section never existed at all, append it
+if not has_expert_section:
+    new_lines.append('')
+    new_lines.append('[Expert]')
+    new_lines.append('AllowDll=1')
+    new_lines.append('AllowLive=1')
+    new_lines.append('AllowImport=1')
+
+result = '\r\n'.join(new_lines) + '\r\n'
+open(path, 'wb').write(bom + result.encode(enc))
+print('terminal.ini patched: ExpertAdvisors=1 AllowDll=1 AllowLive=1 AllowImport=1')
+_PATCH_PYEOF
+}
+_patch_terminal_ini
+show_message "terminal.ini patched for AutoTrading."
+
+# ── EA auto-start via the [StartUp] /config: mechanism ────────────
+# This build of MT5 does NOT persist chart/profile state to disk, so it can
+# never *restore* an EA from a saved chart on launch — only a live attach runs
+# it. The [StartUp] config is exactly that: on every launch MT5 OPENS its own
+# chart (per Symbol/Period) and does a fresh LIVE attach of the Expert — the
+# same code path as a manual drag, which we know works here. It needs no disk
+# persistence. (Official MetaQuotes headless method.)
+#
+# The config lives at drive_c root (no spaces) so the /config: argument needs
+# no awkward quoting under Wine. C:\ maps to /config/.wine/drive_c.
+STARTUP_INI_UNIX="/config/.wine/drive_c/zonebot_startup.ini"
+STARTUP_INI_WIN='C:\zonebot_startup.ini'
+
+_write_startup_ini() {
+    # [Experts] turns the global AutoTrading button ON; [StartUp] opens a
+    # GBPUSD H1 chart and attaches ZoneBotBridge with its (correct) default
+    # inputs. CRLF line endings as MT5 expects.
+    {
+        printf '[Experts]\r\n'
+        printf 'AllowLiveTrading=true\r\n'
+        printf 'Enabled=true\r\n'
+        printf 'Account=false\r\n'
+        printf 'Profile=false\r\n'
+        printf '[StartUp]\r\n'
+        printf 'Expert=ZoneBotBridge\r\n'
+        printf 'Symbol=GBPUSD\r\n'
+        printf 'Period=H1\r\n'
+    } > "${STARTUP_INI_UNIX}"
+}
+
+# Remove any saved charts from the active Default profile so MT5 opens ONLY the
+# chart [StartUp] creates — guarantees exactly one EA instance (the bot's TCP
+# feed is single-client). Safe to call only when MT5 is stopped.
+_empty_default_profile() {
+    rm -f "/config/.wine/drive_c/Program Files/MetaTrader 5/MQL5/Profiles/Charts/Default/"*.chr \
+          "/config/.wine/drive_c/Program Files/MetaTrader 5/MQL5/Profiles/Charts/Default/order.wnd" \
+          2>/dev/null || true
+}
+
+# Launch MT5 so it auto-attaches the EA via [StartUp]. Direct `wine <exe>`
+# (NOT `start /unix`) so the /config: argument reaches terminal64.exe intact.
+_launch_mt5() {
+    _write_startup_ini
+    _patch_terminal_ini
+    _empty_default_profile
+    DISPLAY=:1 WINEPREFIX=/config/.wine WINEDEBUG=-all \
+        $wine_executable "$mt5file" $MT5_CMD_OPTIONS "/config:${STARTUP_INI_WIN}" &
+}
+
+# ── Decide whether the EA needs recompiling — BEFORE the launch ───
+# Only recompile when the EA source actually changed (or no .ex5 exists), so we
+# don't force a disruptive restart on every boot.
+EA_SRC="/bot/src/infrastructure/mt5_bridge/ea/ZoneBotBridge.mq5"
+EA_DST="${MT5_EXPERTS_DIR}/ZoneBotBridge.mq5"
+EA_EX5="${MT5_EXPERTS_DIR}/ZoneBotBridge.ex5"
+_recompile_needed=0
+if [ ! -f "${EA_EX5}" ]; then
+    _recompile_needed=1
+    show_message "EA: no compiled .ex5 yet — will compile, then relaunch with [StartUp]."
+elif [ "${EA_SRC}" -nt "${EA_EX5}" ]; then
+    _recompile_needed=1
+    show_message "EA: source newer than .ex5 — will recompile, then relaunch with [StartUp]."
+else
+    show_message "EA: .ex5 up to date — will auto-attach via [StartUp] on launch."
+fi
+
+# ── [3/6] Launch MT5 terminal (with [StartUp] EA auto-attach) ─────
 if [ -e "$mt5file" ]; then
-    show_message "[3/6] Launching MT5 terminal..."
-    $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS &
+    show_message "[3/6] Launching MT5 terminal with [StartUp] EA auto-attach..."
+    _launch_mt5
     show_message "[3/6] MT5 launched (PID $!)."
 else
     show_message "[3/6] ERROR: MT5 binary not found — cannot continue."
@@ -440,20 +553,7 @@ fi
 show_message "[5/6] Pinning numpy<2 for stability..."
 $wine_executable python -m pip install --no-cache-dir "numpy<2" --quiet
 
-# ── [5.5/6] pyzmq for Wine Python ────────────────────────────────
-# pyzmq must be installed inside Wine Python (not the Linux system Python)
-# because the bot runs as `wine python`. pyzmq bundles its own libzmq
-# shared library — it does NOT use the zmq.dll we installed for the MQL5 EA.
-# The two ZMQ instances (EA side / Python side) are completely independent
-# C libraries that communicate over Wine's loopback TCP stack.
-show_message "[5.5/6] Installing pyzmq in Wine Python..."
-if ! is_wine_python_package_installed "pyzmq"; then
-    # Pin to zmq 24.x — compatible with Python 3.9 and the bundled libzmq 4.3.x
-    $wine_executable python -m pip install --no-cache-dir "pyzmq>=24,<26" --quiet
-    show_message "[5.5/6] pyzmq installed."
-else
-    show_message "[5.5/6] pyzmq already installed."
-fi
+show_message "[5.5/6] pyzmq skipped — EA v3 uses MT5 built-in sockets; Python side uses plain TCP."
 
 # ── [6/6] Bot dependencies ────────────────────────────────────────
 show_message "[6/6] Installing bot dependencies in Wine Python..."
@@ -478,11 +578,11 @@ if [ ! -f /config/ready_to_trade ]; then
     echo "  1. Open http://localhost:3000 — confirm MT5 is logged in"
     echo "     and charts are loaded"
     echo "  2. Tools → Options → Expert Advisors"
-    echo "     → ✅ Allow Algorithmic Trading"
+    echo "     → Allow Algorithmic Trading"
     echo "  3. Run this command to start the bot:"
     echo "     docker exec mt5 touch /config/ready_to_trade"
     echo ""
-    echo "  Waiting for ready_to_trade signal…"
+    echo "  Waiting for ready_to_trade signal..."
     while [ ! -f /config/ready_to_trade ]; do
         sleep 5
     done
@@ -491,32 +591,57 @@ else
     echo "  ready_to_trade present — resuming bot immediately."
 fi
 
-# ── Deploy and compile ZoneBotBridge EA ──────────────────────────
-EA_SRC="/bot/src/infrastructure/mt5_bridge/ea/ZoneBotBridge.mq5"
-EA_DST="${MT5_EXPERTS_DIR}/ZoneBotBridge.mq5"
-EA_EX5="${MT5_EXPERTS_DIR}/ZoneBotBridge.ex5"
-AUTO_TRADE_INI="${MT5_CONFIG_DIR}/AutoTrade.ini"
+# Back up the whitelist now that the operator has confirmed setup.
+# The "Allow WebRequest for listed URL" entries (which authorize SocketConnect
+# to 127.0.0.1, fixing err=4014) are stored encrypted in MT5's Config dir,
+# keyed to the MachineGuid. MachineGuid is pinned, so the blob stays valid.
+# The exact filename varies by build (experts.ini on some, folded into the
+# encrypted terminal config on others) — so back up every .ini in Config/ and
+# log what's actually there so we capture whichever file carries the whitelist.
+if [ -f "${EXPERTS_INI_LIVE}" ]; then
+    cp "${EXPERTS_INI_LIVE}" "${EXPERTS_INI_BACKUP}"
+    show_message "experts.ini backed up to ${EXPERTS_INI_BACKUP} (whitelist will auto-restore on future starts)."
+else
+    show_message "NOTE: ${EXPERTS_INI_LIVE} not present on this build. Config/ contents:"
+    ls -la "${MT5_CONFIG_DIR}" 2>/dev/null | sed 's/^/    /' || true
+    # Back up the whole Config dir as a fallback so no whitelist file is missed.
+    if [ -d "${MT5_CONFIG_DIR}" ]; then
+        rm -rf /config/mt5_config_backup
+        cp -r "${MT5_CONFIG_DIR}" /config/mt5_config_backup 2>/dev/null \
+            && show_message "Full Config/ backed up to /config/mt5_config_backup." \
+            || show_message "WARNING: Config/ backup failed."
+    fi
+fi
 
+# ── Deploy and compile ZoneBotBridge EA (only when needed) ────────
 # Ensure directories exist (MT5 should have created them, but be safe)
 mkdir -p "${MT5_EXPERTS_DIR}" "${MT5_CONFIG_DIR}"
 
-# Re-copy ZMQ DLLs now that MQL5/Libraries/ is confirmed to exist
-if [ -f "${MT5_LIBS_DIR}/libzmq.dll" ] || [ -f "${MT5_LIBS_DIR}/zmq.dll" ]; then
-    show_message "ZMQ DLLs already in MQL5/Libraries/."
-else
-    show_message "WARNING: ZMQ DLLs missing from MQL5/Libraries/ — EA will fail to compile."
-    show_message "Run: docker compose restart   to trigger re-download."
-fi
+# EA v3 uses MT5 built-in sockets — no ZMQ DLLs needed for compile or runtime.
 
-if [ -f "${EA_SRC}" ]; then
+# When the .ex5 is already current we pre-injected the EA before launch and MT5
+# is loading it now — skip the whole compile + restart cycle entirely.
+if [ "${_recompile_needed}" -eq 0 ]; then
+    show_message "EA already compiled and pre-injected — skipping recompile/restart."
+elif [ -f "${EA_SRC}" ]; then
     cp "${EA_SRC}" "${EA_DST}"
     show_message "ZoneBotBridge.mq5 deployed to MQL5/Experts/"
+    # Remove any stale .ex5 so the "compiled successfully" check below is real.
+    rm -f "${EA_EX5}"
 
     # Compile with MetaEditor if available.
     # MetaEditor needs MT5 to be fully authorized and MQL5 environment loaded
     # before it can compile — if we run it too early the compile silently
     # produces nothing.  Poll the MT5 log for "terminal synchronized" (which
     # only appears AFTER the broker handshake is complete) before compiling.
+    #
+    # Resolve metaeditor path HERE (after MT5 install) — not at script start
+    # where MT5 may not be installed yet (fresh volume → binary missing).
+    if [ -e '/config/.wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe' ]; then
+        metaeditor='/config/.wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe'
+    elif [ -e '/config/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe' ]; then
+        metaeditor='/config/.wine/drive_c/Program Files/MetaTrader 5/metaeditor64.exe'
+    fi
     if [ -e "$metaeditor" ]; then
         MT5_LOG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/logs"
         _compile_wait=0
@@ -589,138 +714,192 @@ else
     show_message "WARNING: EA source not found at ${EA_SRC}"
 fi
 
-# ── Inject EA into GBPUSD H1 chart file (reliable auto-load) ──────
-# AutoTrade.ini only fires when there is no saved chart state — it is
-# ignored if a .chr file already exists for that chart.  Instead we
-# write the <expert> block directly into the GBPUSD H1 .chr file so
-# MT5 loads ZoneBotBridge on EVERY restart, no VNC needed.
+# ── Relaunch MT5 with [StartUp] after a fresh compile ────────────
+# MT5 was first launched (above) before the .ex5 existed, so [StartUp] had no
+# expert to attach. Now that ZoneBotBridge.ex5 is compiled, stop MT5 and
+# relaunch it with the [StartUp] config so it opens its chart and attaches the
+# freshly compiled EA. Only runs when we actually (re)compiled this boot.
+if [ "${_recompile_needed}" -eq 1 ] && [ -f "${EA_EX5}" ]; then
+    show_message "Stopping MT5 to relaunch with [StartUp] (freshly compiled EA)..."
+    pgrep -f "terminal64.exe" > /dev/null 2>&1 && \
+        $wine_executable taskkill /IM terminal64.exe /F 2>/dev/null || true
+    sleep 5
+    _launch_mt5
+    show_message "MT5 relaunched with [StartUp] EA auto-attach — bot starts now."
+fi
+
+# ── MT5 auto-heal watchdog (power-loss / crash safety net) ────────
+# The graceful-shutdown trap below handles PLANNED stops (it lets MT5 save its
+# chart+EA session so the next boot restores it). But a power cut / OOM kill /
+# docker kill sends no signal — MT5 never saves, so on the next boot the profile
+# may have no charts and the EA never auto-loads (MetaQuotes docs: "if the
+# current profile has no charts, the Expert Advisor will not be started").
 #
-# MT5 .chr files are UTF-16 LE with BOM. We locate the GBPUSD H1
-# chart (or any GBPUSD chart as fallback), then insert the <expert>
-# block right before the closing </chart> tag if it isn't there yet.
-# MT5 must be stopped while we edit — it is still starting at this
-# point (launched above in the background), so we wait for the first
-# sync then edit and let MT5 re-read on the next start. But since we
-# ALSO restart MT5 after this via the bot loop's own restart cycle,
-# the simplest approach is: edit now (MT5 is mid-startup and hasn't
-# locked the .chr files yet), then MT5 will read them fresh.
+# This watchdog makes the EA connection self-healing regardless of HOW MT5 last
+# died. It watches the ONE thing we actually care about: is the EA's TCP client
+# connected to our feed on port 5556? We read that straight from the kernel via
+# /proc/net/tcp (no `ss`/`netstat` dependency, no log parsing):
+#   ESTAB  → an EA is connected      → healthy, do nothing
+#   LISTEN → bot listening, no EA yet → start counting; if it persists, kick MT5
+#   NONE   → bot not listening yet    → still starting up, never kick
+# Force-kill + re-inject + relaunch repeats until the EA connects. It only ever
+# acts at startup or after a failure — once connected it sits idle, so there is
+# ZERO per-tick latency on the live feed.
 #
-# Profile search order: Profiles/Charts/Default/  (the active profile)
-if [ -f "${EA_EX5}" ]; then
-    _symbols="${SYMBOLS_CSV:-GBPUSD,XAUUSD,USDJPY,AUDUSD,USDCHF}"
-    _chr_dir="${MT5_INSTALL_DIR}/Profiles/Charts/Default"
-    mkdir -p "${_chr_dir}"
-
-    # Pass _symbols into the Python heredoc via the environment.
-    # The pre-launch block used SYMBOLS_CSV=... prefix; we do the same here so
-    # both injection passes use the same symbol list from the .env file.
-    _chart_inject_result=0
-    SYMBOLS_CSV="${_symbols}" python3 - <<'PYEOF'
-import os, sys, glob
-
-mt5_dir  = "/config/.wine/drive_c/Program Files/MetaTrader 5"
-chr_dir  = os.path.join(mt5_dir, "Profiles", "Charts", "Default")
-symbols  = os.environ.get("SYMBOLS_CSV", "GBPUSD,XAUUSD,USDJPY,AUDUSD,USDCHF")
-ea_name  = "ZoneBotBridge"
-endpoint = "tcp://127.0.0.1:5556"
-
-# The <expert> XML block MT5 uses to persist an attached EA.
-# period_type=2 period_size=1 → H1 (type 2 = hours, size 1)
-EXPERT_BLOCK = """\n<expert>\nname={ea}\nflags=3\nwindow=0\n\n<inputs>\nPUB_ENDPOINT={ep}\nSYMBOLS_CSV={sym}\nHEARTBEAT_SECS=5\n</inputs>\n\n</expert>\n""".format(
-    ea=ea_name, ep=endpoint, sym=symbols)
-
-os.makedirs(chr_dir, exist_ok=True)
-chrs = sorted(glob.glob(os.path.join(chr_dir, "*.chr")))
-
-# Find existing GBPUSD H1 chart or pick a GBPUSD chart
-target = None
-for path in chrs:
+# WHY /proc/net/tcp and pgrep (not `wine tasklist`): wine tasklist opens its own
+# wineserver context and sees no processes; the kernel process/socket tables are
+# always authoritative regardless of wineserver state.
+_FEED_PORT=5556
+_feed_state() {
+    _FEED_PORT="${_FEED_PORT}" python3 - <<'PYEOF'
+import os
+port = int(os.environ.get("_FEED_PORT", "5556"))
+hexport = format(port, "04X")
+listen = estab = False
+for f in ("/proc/net/tcp", "/proc/net/tcp6"):
     try:
-        raw  = open(path, "rb").read()
-        text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-        if "symbol=GBPUSD" in text and "period_type=2" in text and "period_size=1" in text:
-            target = path
-            break
+        for line in open(f).read().splitlines()[1:]:
+            p = line.split()
+            if len(p) < 4:
+                continue
+            if p[1].rsplit(":", 1)[-1] != hexport:
+                continue
+            if p[3] == "0A":      # TCP_LISTEN
+                listen = True
+            elif p[3] == "01":    # TCP_ESTABLISHED
+                estab = True
     except Exception:
         pass
-
-# Fallback: any GBPUSD chart
-if target is None:
-    for path in chrs:
-        try:
-            raw  = open(path, "rb").read()
-            text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-            if "symbol=GBPUSD" in text:
-                target = path
-                break
-        except Exception:
-            pass
-
-# Still nothing — create a minimal GBPUSD H1 chart
-if target is None:
-    idx = len(chrs) + 1
-    target = os.path.join(chr_dir, "chart{:02d}.chr".format(idx))
-    minimal = "<chart>\nsymbol=GBPUSD\nperiod_type=2\nperiod_size=1\ndigits=5\ntick_size=0.000000\nscale=4\nmode=1\nbidline=1\n\n<window>\nheight=100\n\n<indicator>\nname=Main\npath=\napply=1\nshow_data=1\nscale_inherit=0\nscale_line=0\nscale_line_percent=50\nscale_line_value=0.000000\nscale_fix_min=0\nscale_fix_min_val=0.000000\nscale_fix_max=0\nscale_fix_max_val=0.000000\n</indicator>\n\n</window>\n\n</chart>\n"
-    open(target, "wb").write(b"\xff\xfe" + minimal.encode("utf-16-le"))
-    print("Created new GBPUSD H1 chart:", target)
-
-# Read, check, patch
-raw  = open(target, "rb").read()
-text = raw.decode("utf-16-le", errors="replace").lstrip("﻿")
-
-if ea_name in text:
-    print("EA already in chart file:", target)
-    # Exit 2 = already present, no restart needed
-    sys.exit(2)
-
-# Insert <expert> block before </chart>
-if "</chart>" in text:
-    text = text.replace("</chart>", EXPERT_BLOCK + "</chart>", 1)
-else:
-    text = text.rstrip() + EXPERT_BLOCK + "\n</chart>\n"
-
-# Write UTF-16-LE with BOM.  Prepend the BOM character as the first code-unit
-# so the file starts with the two-byte sequence FF FE.
-open(target, "wb").write(b"\xff\xfe" + text.encode("utf-16-le"))
-print("EA injected into chart file:", target)
-# Exit 0 = freshly injected, MT5 restart required
-sys.exit(0)
+print("ESTAB" if estab else ("LISTEN" if listen else "NONE"))
 PYEOF
-    _chart_inject_result=$?
-    show_message "EA chart injection complete (exit=${_chart_inject_result})."
+}
 
-    # Also write AutoTrade.ini as belt-and-suspenders for fresh installs
-    # (when no .chr files exist yet, AutoTrade.ini fires on first MT5 launch).
-    if ! grep -q "ZoneBotBridge" "${AUTO_TRADE_INI}" 2>/dev/null; then
-        printf '[Expert]\r\nName=ZoneBotBridge\r\nSymbol=GBPUSD\r\nPeriod=H1\r\n' > "${AUTO_TRADE_INI}"
-        printf 'Parameters=PUB_ENDPOINT=tcp://127.0.0.1:5556;SYMBOLS_CSV=%s;HEARTBEAT_SECS=5\r\n' \
-               "${_symbols}" >> "${AUTO_TRADE_INI}"
-        show_message "AutoTrade.ini written as fallback for fresh installs."
-    fi
+# MT5 is being (re)started — relaunch via the [StartUp] config so it opens its
+# own chart and live-attaches the EA (the mechanism that works on this build).
+_relaunch_mt5() {
+    _launch_mt5
+}
 
-    # Restart MT5 ONLY when the chart was freshly modified (exit 0).
-    # When the EA was already in the chart (exit 2) MT5 already has it loaded —
-    # restarting would waste 25 s and briefly drop the broker connection.
-    if [ "${_chart_inject_result}" -eq 0 ]; then
-        show_message "Chart modified — restarting MT5 so it loads the injected EA..."
-        # taskkill is the Windows-native way to stop a process by name inside Wine.
-        # || true: if MT5 already exited for any reason, this is harmless.
-        $wine_executable taskkill /IM terminal64.exe /F 2>/dev/null || true
-        sleep 5
-        # Relaunch MT5 in the background (same way as the initial launch above).
-        $wine_executable start /unix "$mt5file" $MT5_CMD_OPTIONS &
-        show_message "MT5 restarted — waiting 20s for EA to bind ZMQ PUB socket..."
-        sleep 20
-    else
-        show_message "EA already present in chart — MT5 restart skipped."
+_WATCHDOG_INTERVAL=20
+_HEAL_AFTER_SECS=120         # bot listening but no EA this long → relaunch w/ [StartUp]
+(
+    _no_feed=0
+    while true; do
+        sleep ${_WATCHDOG_INTERVAL}
+
+        # 1) MT5 process gone entirely → relaunch with [StartUp] immediately.
+        if ! pgrep -f "terminal64.exe" > /dev/null 2>&1; then
+            show_message "[watchdog] MT5 not running — relaunching with [StartUp] EA..."
+            _relaunch_mt5
+            _no_feed=0
+            sleep 30
+            continue
+        fi
+
+        # 2) MT5 is up — is the EA actually connected to our feed?
+        case "$(_feed_state)" in
+            ESTAB)
+                _no_feed=0            # healthy — EA streaming ticks, sit idle
+                ;;
+            LISTEN)
+                # Bot listening but EA not connected. Give MT5 time to cold-start
+                # + attach via [StartUp], then force a clean [StartUp] relaunch.
+                _no_feed=$((_no_feed + _WATCHDOG_INTERVAL))
+                if [ ${_no_feed} -ge ${_HEAL_AFTER_SECS} ]; then
+                    show_message "[watchdog] EA not connected to :${_FEED_PORT} for ${_no_feed}s — relaunching MT5 with [StartUp]..."
+                    pgrep -f "terminal64.exe" > /dev/null 2>&1 && \
+                        $wine_executable taskkill /IM terminal64.exe /F 2>/dev/null || true
+                    sleep 5
+                    _relaunch_mt5
+                    _no_feed=0
+                    sleep 60      # let MT5 reconnect + run [StartUp] before re-checking
+                fi
+                ;;
+            *)
+                # NONE — bot's TcpFeed not listening yet (still starting). Never
+                # kick MT5 during this window; just wait for the feed to come up.
+                _no_feed=0
+                ;;
+        esac
+    done
+) &
+_watchdog_pid=$!
+show_message "MT5 auto-heal watchdog started (monitors EA connection on :${_FEED_PORT})."
+
+# ── Wait until MT5 IPC is actually reachable before starting the bot ─
+# The bot's mt5.initialize() attaches to the RUNNING terminal (MT5_PATH is
+# empty, so it does not launch one). MT5 only answers that IPC pipe AFTER it
+# finishes its Wine cold-start + broker handshake; until then initialize()
+# returns (-10005, IPC timeout).
+#
+# Rather than guess MT5's readiness from journal strings (fragile — the daily
+# log carries stale lines and the exact wording varies by build), we PROBE the
+# real capability: run a throwaway wine-python that just calls
+# mt5.initialize() and shuts down. The moment that succeeds, the bot's own
+# initialize() will succeed too. This is the exact thing that was failing, so
+# it is the correct gate — and it can never hang on a missing log string.
+_probe_timeout=300
+_probe_wait=0
+show_message "Probing MT5 IPC readiness before starting bot (up to ${_probe_timeout}s)..."
+while [ ${_probe_wait} -lt ${_probe_timeout} ]; do
+    # The probe prints the exact reason on each failure (import fault vs IPC
+    # not ready vs which path works) so we can diagnose instead of guess.
+    _probe_out=$(DISPLAY=:1 WINEPREFIX=/config/.wine PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
+        $wine_executable python /bot/tools/mt5_probe.py 2>/dev/null)
+    _probe_rc=$?
+    show_message "  [probe ${_probe_wait}s] ${_probe_out}"
+    if [ ${_probe_rc} -eq 0 ]; then
+        show_message "MT5 IPC reachable after ${_probe_wait}s — starting bot."
+        break
     fi
+    sleep 10
+    _probe_wait=$((_probe_wait + 10))
+done
+if [ ${_probe_wait} -ge ${_probe_timeout} ]; then
+    show_message "MT5 IPC probe timed out after ${_probe_timeout}s — starting bot anyway."
+    show_message "  If you see repeated 'IPC timeout', MT5 likely isn't logging in:"
+    show_message "  open VNC (http://localhost:3000) and confirm the terminal is connected."
 fi
+
+# ── Graceful shutdown so MT5 PERSISTS its chart + attached EA ─────
+# THE persistence fix. `docker compose down` sends SIGTERM and the container is
+# killed seconds later — if MT5 is hard-killed it does NOT save its session, so
+# on the next boot it may open with no chart and the EA never auto-loads (even
+# though chart01.chr holds it on disk). That is exactly the intermittent
+# "have to drag the EA again" symptom.
+#
+# Here we trap SIGTERM/SIGINT and close MT5 *cleanly* (taskkill WITHOUT /F = a
+# normal window close). A clean close makes MT5 persist its open chart and the
+# expert attached to it, so on the next start MT5 restores the EA itself — no
+# manual drag, deterministically. We stop the watchdog first so it can't
+# relaunch MT5 mid-shutdown.
+_graceful_shutdown() {
+    show_message "Container stopping — closing MT5 cleanly so it saves the chart+EA session..."
+    # Stop the watchdog so it doesn't relaunch MT5 while we're closing it.
+    [ -n "${_watchdog_pid:-}" ] && kill "${_watchdog_pid}" 2>/dev/null || true
+    # Clean close (NO /F): lets MT5 write its profile/lastsession with the EA.
+    pgrep -f "terminal64.exe" > /dev/null 2>&1 && \
+        $wine_executable taskkill /IM terminal64.exe 2>/dev/null || true
+    # Give MT5 time to flush the session to disk before the container dies.
+    sleep 8
+    # Tell the bot to stop (its own SIGTERM handler flushes a checkpoint).
+    [ -n "${_bot_pid:-}" ] && kill "${_bot_pid}" 2>/dev/null || true
+    wait "${_bot_pid:-}" 2>/dev/null || true
+    show_message "Clean shutdown complete — EA session saved for next start."
+    exit 0
+}
+trap _graceful_shutdown SIGTERM SIGINT
 
 # ── START BOT ─────────────────────────────────────────────────────
 # Launch the event-driven streaming bot (main_stream.py).
 # Wine reports os.name == "nt" so mt5_gateway.py uses direct
 # MetaTrader5 import — no RPyC bridge.
 # PYTHONUTF8=1 forces UTF-8 to prevent cp1252 crashes on box-drawing chars.
+# Run in BACKGROUND + wait so the trap above can fire on container stop
+# (a foreground command would swallow the signal until it returns).
 echo "Starting ZoneBot (stream mode) in Wine Python..."
 cd /bot && DISPLAY=:1 WINEPREFIX=/config/.wine PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
-    $wine_executable python -m src.main_stream
+    $wine_executable python -m src.main_stream &
+_bot_pid=$!
+# `wait` returns when the bot exits OR when a trapped signal fires.
+wait "${_bot_pid}"
