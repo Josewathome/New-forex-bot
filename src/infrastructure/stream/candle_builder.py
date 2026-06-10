@@ -210,7 +210,7 @@ class CandleBuilder:
         This is the drop-in replacement for MT5MarketDataRepository.get_candles().
         Signal finders call this instead of going to MT5.
         """
-        return list(self._closed[timeframe][-count:])
+        return list(self._closed.get(timeframe, [])[-count:])
 
     def get_forming_bar(self, timeframe: Timeframe) -> Optional[Candle]:
         """
