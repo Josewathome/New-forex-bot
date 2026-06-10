@@ -374,7 +374,13 @@ fi
 # overwrites terminal.ini on exit, so we re-apply before every launch.
 _patch_terminal_ini() {
     local _ini="${MT5_CONFIG_DIR}/terminal.ini"
-    [ -f "${_ini}" ] || return 0
+    # Create a minimal terminal.ini if it doesn't exist yet so we don't skip the patch.
+    if [ ! -f "${_ini}" ]; then
+        mkdir -p "${MT5_CONFIG_DIR}"
+        printf '[Common]\r\nExpertAdvisors=1\r\n\r\n[Expert]\r\nAllowDll=1\r\nAllowLive=1\r\nAllowImport=1\r\n' > "${_ini}"
+        show_message "terminal.ini did not exist — created with AutoTrading enabled."
+        return 0
+    fi
     python3 - "${_ini}" <<'_PATCH_PYEOF'
 import sys
 path = sys.argv[1]
@@ -471,12 +477,14 @@ _write_startup_ini() {
     # [Experts] turns the global AutoTrading button ON; [StartUp] opens a
     # GBPUSD H1 chart and attaches ZoneBotBridge with its (correct) default
     # inputs. CRLF line endings as MT5 expects.
+    # IMPORTANT: MT5 ini files use integer booleans (1/0), NOT string "true"/"false".
+    # Using "true" causes MT5 to treat the value as 0 (disabled) — AutoTrading stays red.
     {
         printf '[Experts]\r\n'
-        printf 'AllowLiveTrading=true\r\n'
-        printf 'Enabled=true\r\n'
-        printf 'Account=false\r\n'
-        printf 'Profile=false\r\n'
+        printf 'AllowLiveTrading=1\r\n'
+        printf 'Enabled=1\r\n'
+        printf 'Account=0\r\n'
+        printf 'Profile=0\r\n'
         printf '[StartUp]\r\n'
         printf 'Expert=ZoneBotBridge\r\n'
         printf 'Symbol=GBPUSD\r\n'
@@ -496,6 +504,31 @@ _empty_default_profile() {
 # Launch MT5 so it auto-attaches the EA via [StartUp]. Direct `wine <exe>`
 # (NOT `start /unix`) so the /config: argument reaches terminal64.exe intact.
 _launch_mt5() {
+    # Capture the ExpertAdvisors value from terminal.ini BEFORE we patch it so
+    # the post-IPC-probe block knows whether AutoTrading was off at boot (and
+    # needs a live Ctrl+E toggle).
+    _capture_ea_state() {
+        local _ini="${MT5_CONFIG_DIR}/terminal.ini"
+        local _val="1"
+        if [ -f "${_ini}" ]; then
+            _val=$(python3 -c "
+import sys
+data = open('${_ini}','rb').read()
+if data[:2] in (b'\xff\xfe', b'\xfe\xff'):
+    text = data.decode('utf-16-le', errors='replace')
+else:
+    text = data.decode('utf-8', errors='replace')
+for line in text.splitlines():
+    s = line.strip()
+    if s.startswith('ExpertAdvisors='):
+        print(s.split('=',1)[1])
+        sys.exit(0)
+print('1')
+" 2>/dev/null || echo "1")
+        fi
+        echo "${_val}" > /tmp/_mt5_autotrading_before
+    }
+    _capture_ea_state
     _write_startup_ini
     _patch_terminal_ini
     _empty_default_profile
@@ -859,6 +892,146 @@ if [ ${_probe_wait} -ge ${_probe_timeout} ]; then
     show_message "MT5 IPC probe timed out after ${_probe_timeout}s — starting bot anyway."
     show_message "  If you see repeated 'IPC timeout', MT5 likely isn't logging in:"
     show_message "  open VNC (http://localhost:3000) and confirm the terminal is connected."
+fi
+
+# ── Ensure AutoTrading (Algo Trading) button is ON after MT5 init ─
+# Use MT5 journal log for state detection (no second IPC connection needed),
+# and robust window search with wait loop + diagnostic window listing.
+rm -f /tmp/_mt5_autotrading_before
+
+# Re-patch terminal.ini after MT5 init for next-restart correctness.
+show_message "Re-patching terminal.ini after MT5 init..."
+_patch_terminal_ini
+
+# ── Detect AutoTrading state from MT5 journal log ─────────────────
+MT5_LOG_DIR="/config/.wine/drive_c/Program Files/MetaTrader 5/logs"
+_read_autotrading_from_journal() {
+    local _log
+    _log=$(ls -t "${MT5_LOG_DIR}"/*.log 2>/dev/null | head -1)
+    [ -z "${_log}" ] && echo "UNKNOWN" && return
+    python3 - "${_log}" <<'_JOURNAL_PY'
+import sys
+path = sys.argv[1]
+try:
+    data = open(path, 'rb').read()
+    if data[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        text = data.decode('utf-16-le', errors='replace')
+    else:
+        text = data.decode('utf-8', errors='replace')
+    lines = text.splitlines()
+    for line in reversed(lines):
+        lo = line.lower()
+        if 'expert advisors' in lo or 'autotrading' in lo or 'algo trading' in lo:
+            print('LINE:' + line.strip())
+            if 'disabled' in lo or 'off' in lo or '= false' in lo:
+                print('STATE:OFF')
+            else:
+                print('STATE:ON')
+            sys.exit(0)
+except Exception as e:
+    print('ERR:' + str(e))
+print('STATE:UNKNOWN')
+_JOURNAL_PY
+}
+_journal_out=$(_read_autotrading_from_journal)
+show_message "MT5 journal AutoTrading scan: ${_journal_out}"
+_journal_state=$(echo "${_journal_out}" | grep '^STATE:' | cut -d: -f2)
+[ -z "${_journal_state}" ] && _journal_state="UNKNOWN"
+show_message "AutoTrading state from journal: ${_journal_state}"
+
+# ── Find the MT5 X11 window ────────────────────────────────────────
+# KasmVNC's Xvnc server requires the correct XAUTHORITY cookie — without it
+# xdotool silently returns no results. Discover and export the cookie file.
+_xauth_file=""
+for _xauth_candidate in \
+        /tmp/.Xauthority \
+        "${HOME}/.Xauthority" \
+        /home/abc/.Xauthority \
+        /root/.Xauthority \
+        /config/.Xauthority; do
+    if [ -f "${_xauth_candidate}" ]; then
+        _xauth_file="${_xauth_candidate}"
+        break
+    fi
+done
+if [ -z "${_xauth_file}" ]; then
+    _xauth_file=$(ls /tmp/.Xauth* /tmp/.xauth* 2>/dev/null | head -1 || true)
+fi
+if [ -n "${_xauth_file}" ]; then
+    export XAUTHORITY="${_xauth_file}"
+    show_message "Using XAUTHORITY=${_xauth_file} for xdotool."
+else
+    show_message "WARNING: no XAUTHORITY file found — xdotool may fail on KasmVNC."
+fi
+
+_mt5_win=""
+show_message "Searching for MT5 X11 window (up to 30s)..."
+_win_elapsed=0
+while [ -z "${_mt5_win}" ] && [ ${_win_elapsed} -lt 30 ]; do
+    _mt5_win=$(DISPLAY=:1 xdotool search --onlyvisible --name ".*[Mm]eta[Tt]rader.*" 2>/dev/null \
+        | head -1 || true)
+    if [ -z "${_mt5_win}" ]; then
+        _mt5_win=$(DISPLAY=:1 xdotool search --onlyvisible --name ".*" 2>/dev/null \
+            | while read -r _wid; do
+                _wn=$(DISPLAY=:1 xdotool getwindowname "${_wid}" 2>/dev/null || true)
+                case "${_wn}" in
+                    *[Mm]eta*|*[Tt]rader*|*terminal64*|*ICMarkets*|*HFM*|*[Mm][Tt]5*) echo "${_wid}"; break ;;
+                esac
+              done | head -1 || true)
+    fi
+    if [ -n "${_mt5_win}" ]; then
+        _wt=$(DISPLAY=:1 xdotool getwindowname "${_mt5_win}" 2>/dev/null || true)
+        show_message "MT5 window found: id=${_mt5_win} title='${_wt}'"
+        break
+    fi
+    sleep 3
+    _win_elapsed=$((_win_elapsed + 3))
+done
+
+if [ -z "${_mt5_win}" ]; then
+    show_message "WARNING: MT5 window not found after ${_win_elapsed}s. All visible X11 windows:"
+    DISPLAY=:1 xdotool search --onlyvisible --name ".*" 2>&1 | head -30 | \
+        while read -r _wid; do
+            _wn=$(DISPLAY=:1 xdotool getwindowname "${_wid}" 2>/dev/null || true)
+            _wc=$(DISPLAY=:1 xdotool getwindowclassname "${_wid}" 2>/dev/null || true)
+            show_message "  wid=${_wid} class=${_wc} name='${_wn}'"
+        done || true
+    show_message "AutoTrading must be enabled manually: VNC http://localhost:3000 → AutoTrading toolbar button."
+fi
+
+# ── Send Ctrl+E, verify via journal, up to 4 attempts ─────────────
+if [ -n "${_mt5_win}" ]; then
+    _at_max=4
+    _at_attempts=0
+    _at_final="UNKNOWN"
+    while [ ${_at_attempts} -lt ${_at_max} ]; do
+        _at_attempts=$((_at_attempts + 1))
+        show_message "AutoTrading Ctrl+E attempt ${_at_attempts}/${_at_max} (journal=${_journal_state})..."
+        DISPLAY=:1 xdotool key --window "${_mt5_win}" ctrl+e 2>/dev/null || \
+            DISPLAY=:1 xdotool key ctrl+e 2>/dev/null || true
+        sleep 3
+        _new_out=$(_read_autotrading_from_journal)
+        _new_state=$(echo "${_new_out}" | grep '^STATE:' | cut -d: -f2)
+        [ -z "${_new_state}" ] && _new_state="UNKNOWN"
+        show_message "  journal after attempt ${_at_attempts}: ${_new_state} (${_new_out})"
+        if [ "${_new_state}" = "ON" ]; then
+            show_message "AutoTrading confirmed ON via journal after ${_at_attempts} attempt(s)."
+            _at_final="ON"
+            break
+        elif [ "${_new_state}" = "OFF" ]; then
+            _journal_state="OFF"
+        else
+            if [ ${_at_attempts} -ge 2 ]; then
+                show_message "Journal state UNKNOWN after ${_at_attempts} attempt(s) — stopping to avoid over-toggling."
+                _at_final="UNKNOWN"
+                break
+            fi
+        fi
+    done
+    if [ "${_at_final}" != "ON" ] && [ "${_at_final}" != "UNKNOWN" ]; then
+        show_message "ERROR: AutoTrading still OFF after ${_at_max} attempts."
+        show_message "  Manual fix: VNC http://localhost:3000 → click AutoTrading toolbar button."
+    fi
 fi
 
 # ── Graceful shutdown so MT5 PERSISTS its chart + attached EA ─────
