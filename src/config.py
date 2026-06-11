@@ -208,8 +208,8 @@ SYMBOL_CANDLE_SIZE_RATIO: dict[str, float] = {
 # independently — changing M5 values does not affect M1 and vice versa.
 M1_MIN_WAVE_CANDLES          = 5     # minimum M1 candles in retracement wave before ChoCh
                                       # (_is_swing_high needs 4-candle structure + 1 retracement)
-M1_DISPLACEMENT_VOLUME_RATIO = 1.8   # M5 uses 1.3; M1 noise requires higher bar
-M1_CANDLE_SIZE_RATIO         = 3.0   # M5 uses 2.0; 3× avg body filters micro-noise
+M1_DISPLACEMENT_VOLUME_RATIO = 1.4   # relaxed from 1.8 — tick volume on demo is noisy; 1.4 still filters micro-noise
+M1_CANDLE_SIZE_RATIO         = 2.0   # relaxed from 3.0 — aligns with M5 standard; 3× was eliminating valid displacement
 M1_BODY_MIN_PRICE            = 0.00015  # absolute body floor = ~1.5 pips on 5-digit pairs
                                          # ensures displacement body ≥ typical spread
 M1_MIN_ZONE_SIZE_PIPS        = 6.0   # zone must be ≥6 pips tall for M1 wave to have
@@ -257,7 +257,7 @@ BLOCK_COUNTER_D1:     bool = False
 # Score 7 = H4 bias (3) + H4 confluence (2) + equilibrium (2) — meaning
 # institutions on H4 AND a confirmed H4 OB/FVG AND price in the correct
 # premium/discount zone.  A trade missing any of these is rejected.
-COUNTER_D1_MIN_SCORE: int  = 7
+COUNTER_D1_MIN_SCORE: int  = 5   # relaxed from 7 — score 5 still requires H4 bias + confluence; 7 was near-impossible
 
 H4_CANDLE_COUNT  = 50
 H1_CANDLE_COUNT  = 100
@@ -324,7 +324,7 @@ M5_PRECISION_MIN_PIPS     : float = 2.0
 # m1_is_early_in_m5_bar(): M1 ChoCh must fire within the first N minutes
 # of the M5 bar to have predictive value.  After minute 3 the M5 bar is
 # already 60%+ complete and the M1 signal describes history, not the future.
-M1_EARLY_BAR_MINUTES      : int   = 3
+M1_EARLY_BAR_MINUTES      : int   = 8
 
 # ── M1 ChoCh vs M5 Swing Validation ──────────────────────────────
 # m1_choch_breaks_m5_swing(): the level broken by the M1 ChoCh must be
@@ -333,7 +333,7 @@ M1_EARLY_BAR_MINUTES      : int   = 3
 # Set M1_REQUIRE_M5_SWING_BREAK=False to disable (not recommended).
 M1_REQUIRE_M5_SWING_BREAK  : bool  = True
 M1_M5_SWING_LOOKBACK        : int   = 12
-M1_M5_SWING_PROXIMITY_PIPS  : float = 3.0
+M1_M5_SWING_PROXIMITY_PIPS  : float = 5.0
 
 # ── M5 / M30 Intra-Hour Zone Mapping ─────────────────────────────
 # M30 zones re-map every 30-minute close.  They sit between H1 and M5
@@ -541,8 +541,8 @@ MAX_TRADE_DURATION_MINUTES = 600
 
 # ── SESSION FILTER (KILL ZONES) ───────────────────────────────────
 KILL_ZONES = {
-    "LONDON":   (8, 11),
-    "NEW_YORK": (14, 17),
+    "LONDON":   (8, 9),    # narrowed from (8,11) — only block the first chaotic minute; 09:00+ London is structured
+    "NEW_YORK": (14, 15),  # narrowed from (14,17) — only block the NY open spike; 15:00+ is clean trending
 }
 
 # ── Minimum SL distance ───────────────────────────────────────────
