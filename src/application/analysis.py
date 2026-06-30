@@ -859,10 +859,17 @@ def find_m5_choch_signal(
 
             # Use M5 precision OB as SL anchor when available — tighter stop,
             # better RR, and structurally grounded inside the H1 zone.
+            # Guard: if the precision SL is too close to entry (below MIN_SL_PIPS),
+            # fall back to the displacement candle SL so the trade still qualifies.
+            fallback_sl = disp.low - sl_buffer
             if precision_zone is not None:
-                sl = precision_zone[0] - sl_buffer   # precision_zone[0] = OB low
+                candidate_sl = precision_zone[0] - sl_buffer
+                min_sl_price = pip_calc.pips_to_price(
+                    config.MIN_SL_PIPS.get(symbol, config.MIN_SL_PIPS_DEFAULT)
+                )
+                sl = candidate_sl if abs(entry - candidate_sl) >= min_sl_price else fallback_sl
             else:
-                sl = disp.low - sl_buffer
+                sl = fallback_sl
             tp = find_m30_structural_tp(
                 direction=Direction.BULLISH, entry=entry,
                 m30_zones=m30_zones or [], pip_calc=pip_calc,
@@ -894,10 +901,17 @@ def find_m5_choch_signal(
             pre_disp = m5_candles[i - 2]
             entry    = pre_disp.low if pre_disp.low > disp.high else disp.open
 
+            # Same guard as bullish: fall back to displacement SL if precision
+            # zone would produce an SL distance below MIN_SL_PIPS.
+            fallback_sl = disp.high + sl_buffer
             if precision_zone is not None:
-                sl = precision_zone[1] + sl_buffer   # precision_zone[1] = OB high
+                candidate_sl = precision_zone[1] + sl_buffer
+                min_sl_price = pip_calc.pips_to_price(
+                    config.MIN_SL_PIPS.get(symbol, config.MIN_SL_PIPS_DEFAULT)
+                )
+                sl = candidate_sl if abs(entry - candidate_sl) >= min_sl_price else fallback_sl
             else:
-                sl = disp.high + sl_buffer
+                sl = fallback_sl
             tp = find_m30_structural_tp(
                 direction=Direction.BEARISH, entry=entry,
                 m30_zones=m30_zones or [], pip_calc=pip_calc,

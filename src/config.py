@@ -316,6 +316,12 @@ ZONE_HEALTH_VOL_SPIKE     : float = 1.5  # volume ratio to classify as spike
 
 # ── M5 Precision Entry Zone ───────────────────────────────────────
 # find_m5_precision_entry() locates the M5 OB inside the H1 zone.
+# When enabled, it anchors the SL at the M5 OB edge (tighter than H1 OB edge).
+# When True, find_m5_precision_entry() finds the M5 OB inside the H1 zone
+# and uses it as the SL anchor (tighter stop, better RR).  If the precision
+# SL would fall below MIN_SL_PIPS for the symbol, it gracefully falls back
+# to the displacement candle SL — so the feature never silently rejects trades.
+USE_M5_PRECISION_ZONE     : bool  = True
 # M5_PRECISION_MIN_PIPS: the M5 OB must be at least this many pips tall
 # to be meaningful — smaller OBs are noise inside the H1 zone.
 M5_PRECISION_MIN_PIPS     : float = 2.0
@@ -556,7 +562,7 @@ MIN_SL_PIPS: dict[str, float] = {
 MIN_SL_PIPS_DEFAULT = 3.0
 
 # ── Retention Policies ────────────────────────────────────────────
-LOG_RETENTION_DAYS   = 3
+LOG_RETENTION_DAYS   = 30   # keep 30 days so post-mortems have evidence
 CACHE_RETENTION_DAYS = 2
 ZONE_RETENTION_DAYS  = 5
 ZONES_DIR            = "zones"
@@ -565,6 +571,13 @@ ZONES_DIR            = "zones"
 CHECKPOINT_DIR           = ".checkpoints"
 CHECKPOINT_INTERVAL_MIN  = 5       # save checkpoint every N minutes (worst-case gap on power loss)
 CHECKPOINT_RETAIN_DAYS   = 7       # keep dated daily backups for this many days, then delete
+
+# ── Dry Run Mode ──────────────────────────────────────────────────
+# When True, the bot evaluates signals and logs every trade it WOULD place
+# but never sends an order to the broker.  Use this for one week after any
+# code change to verify the pipeline is working before risking real money.
+# Set via env:  DRY_RUN=true  in docker-compose.yml / .env
+DRY_RUN: bool = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 
 # ── Dashboard ─────────────────────────────────────────────────────
 DASHBOARD_ENABLED = True
@@ -599,7 +612,14 @@ MAX_FORWARD_M1_BARS  = 4_320
 BACKTEST_MONTHS_BACK = 2
 BACKTEST_START_DATE  = ""
 BACKTEST_END_DATE    = ""
-BACKTEST_REPORT_NAME ="Last_6_months"
+BACKTEST_REPORT_NAME = "Last_6_months"
+
+# Override which symbols run in backtest.  Defaults to all live SYMBOLS.
+# Set to a subset to isolate one instrument:
+#   BACKTEST_SYMBOLS = ["XAUUSD"]
+# This lets you tune XAUUSD parameters independently without polluting
+# the results for forex pairs (and vice versa).
+BACKTEST_SYMBOLS: list = []   # empty = use SYMBOLS
 
 # Keep False so the backtest matches live trading exactly.
 # Live trading monitors on M1 (SL/TP/MFE precision); the backtest should too.

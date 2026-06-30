@@ -10,6 +10,7 @@ CHANGES vs v5:
 """
 from __future__ import annotations
 import calendar
+import logging
 import src.config as config
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -17,6 +18,37 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from src.application.trade_monitor import MonitorEvent
+
+_live_log = logging.getLogger("live_signal")
+
+
+class LiveSignalLogger:
+    """
+    Lightweight drop-in for DiagnosticsCollector used in live mode.
+
+    Every gate rejection inside find_m1_predictive_signal / find_m5_choch_signal
+    calls diag.record_rejection(symbol, reason).  In backtest mode that feeds
+    the diagnostics report.  In live mode the diag parameter was always None,
+    so rejections were invisible.
+
+    Pass an instance of this class from execution_service so every gate
+    rejection is written to the log at DEBUG level — giving you a real-time
+    signal funnel without touching the signal functions themselves.
+    """
+
+    def record_rejection(self, symbol: str, reason: str) -> None:
+        _live_log.debug("GATE | %s | ✗ %s", symbol, reason)
+
+    def record_signal(self, symbol: str) -> None:
+        _live_log.debug("GATE | %s | ✓ signal passed all gates", symbol)
+
+    # Stubs for the remaining DiagnosticsCollector interface (not needed live)
+    def record_h1_bar(self, *a, **kw) -> None: pass
+    def record_trade_result(self, *a, **kw) -> None: pass
+    def record_mt5_data(self, *a, **kw) -> None: pass
+    def record_news_fetch(self, *a, **kw) -> None: pass
+    def record_no_trade_window(self, *a, **kw) -> None: pass
+    def record_outcome(self, *a, **kw) -> None: pass
 
 
 class DiagnosticsCollector:

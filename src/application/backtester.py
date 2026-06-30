@@ -28,6 +28,7 @@ from src.application.analysis import (
     ZoneMapper, atr,
     find_m5_choch_signal,
     find_m1_predictive_signal,
+    find_m5_precision_entry,
     find_h4_bias,
     find_d1_bias,
     compute_h4_equilibrium,
@@ -357,7 +358,19 @@ class Backtester:
                     if diag: diag.record_rejection(symbol, "m5_story_distributing")
                     continue
 
+                # ── M5 precision entry zone (mirrors execution_service) ──
+                precision_zone_bt = None
+                if getattr(config, "USE_M5_PRECISION_ZONE", True):
+                    precision_zone_bt = find_m5_precision_entry(
+                        zone, m5_win, pip_calc, h1_atr
+                    )
+
                 # ── M1 predictive signal (primary) ────────────────
+                # m5_bar_open_time: the forming M5 bar's open is the last
+                # closed M5 candle's time + 5 minutes (mirrors live logic).
+                m5_bar_open_bt = (
+                    m5_win[-1].time + timedelta(minutes=5) if m5_win else None
+                )
                 signal = None
                 if m1_win:
                     signal = find_m1_predictive_signal(
@@ -372,6 +385,7 @@ class Backtester:
                         min_rr_override=min_rr,
                         m30_zones=m30_zones_bt,
                         m5_candles=m5_win,
+                        m5_bar_open_time=m5_bar_open_bt,
                     )
                 # ── M5 ChoCh (fallback) ───────────────────────────
                 if signal is None:
@@ -381,6 +395,7 @@ class Backtester:
                         atr_price=h1_atr, diag=diag,
                         zone_buffer=zbuf, min_rr_override=min_rr,
                         m30_zones=m30_zones_bt,
+                        precision_zone=precision_zone_bt,
                     )
                 if signal is None:
                     continue
@@ -436,16 +451,15 @@ class Backtester:
                 tp2_price = None
 
             # Position size.
-            # TICK_VALUE_USD is in $/pip/lot; lot_size() expects account-currency/pip/lot.
-            # Multiply by KES_PER_USD so sizing matches live MT5 on a KES account.
-            # self._commission is already in account currency (converted in run_backtest).
-            kes_per_usd = getattr(config, "KES_PER_USD", 130.0)
-            tv_kes = tv * kes_per_usd
+            # tv (tick_value) is already in account currency per pip per lot —
+            # MT5 normalises it to the account currency before returning it.
+            # Do NOT multiply by KES_PER_USD; that would double-convert on a KES account.
+            # math.floor truncates to 2 dp so we never exceed the risk budget.
             rp = RiskParameters(account_balance=equity, risk_percent=risk_pct,
                                 commission_per_lot=self._commission,
                                 min_rr_ratio=min_rr,
                                 account_currency=self._currency)
-            lot = max(0.01, min(round(rp.lot_size(sl_pips, tv_kes, pip_calc), 2), 100.0))
+            lot = max(0.01, min(math.floor(rp.lot_size(sl_pips, tv, pip_calc) * 100) / 100, 100.0))
             ram = equity * (risk_pct / 100)
 
             max_m1 = config.MAX_FORWARD_M1_BARS
