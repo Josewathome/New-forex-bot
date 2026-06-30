@@ -504,13 +504,12 @@ class ExecutionService:
                     continue
 
                 # ── M5 precision entry zone ───────────────────────
-                # Disabled by default (USE_M5_PRECISION_ZONE=False) because
-                # the backtester never calls find_m5_precision_entry(), creating
-                # a live/backtest mismatch: the tighter SL falls below MIN_SL_PIPS
-                # and silently rejects every trade.  Enable only after the
-                # backtester is updated and re-validated.
+                # Finds the M5 OB inside the H1 zone for a tighter SL anchor.
+                # find_m5_choch_signal() now guards against the precision SL
+                # falling below MIN_SL_PIPS — it falls back to the displacement
+                # candle SL in that case, so no trades are silently rejected.
                 precision_zone = None
-                if getattr(config, "USE_M5_PRECISION_ZONE", False):
+                if getattr(config, "USE_M5_PRECISION_ZONE", True):
                     precision_zone = find_m5_precision_entry(zone, m5, pip_calc, h1_atr)
                     if precision_zone:
                         logger.debug(
