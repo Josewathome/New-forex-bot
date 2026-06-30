@@ -504,16 +504,19 @@ class ExecutionService:
                     continue
 
                 # ── M5 precision entry zone ───────────────────────
-                # Find the M5 OB / FVG INSIDE the H1 zone — this is the
-                # real institutional cluster, not the H1 zone boundary.
-                # When found, it is passed to both signal finders so the
-                # SL is anchored at the M5 OB low rather than the H1 OB low.
-                precision_zone = find_m5_precision_entry(zone, m5, pip_calc, h1_atr)
-                if precision_zone:
-                    logger.debug(
-                        "M5 PRECISION ZONE | %s | %.5f–%.5f inside H1 zone %.5f–%.5f",
-                        symbol, precision_zone[0], precision_zone[1], zone.low, zone.high,
-                    )
+                # Disabled by default (USE_M5_PRECISION_ZONE=False) because
+                # the backtester never calls find_m5_precision_entry(), creating
+                # a live/backtest mismatch: the tighter SL falls below MIN_SL_PIPS
+                # and silently rejects every trade.  Enable only after the
+                # backtester is updated and re-validated.
+                precision_zone = None
+                if getattr(config, "USE_M5_PRECISION_ZONE", False):
+                    precision_zone = find_m5_precision_entry(zone, m5, pip_calc, h1_atr)
+                    if precision_zone:
+                        logger.debug(
+                            "M5 PRECISION ZONE | %s | %.5f–%.5f inside H1 zone %.5f–%.5f",
+                            symbol, precision_zone[0], precision_zone[1], zone.low, zone.high,
+                        )
 
                 # ── M1 Predictive Signal (primary) ────────────────
                 m1 = self._md.get_candles(symbol, Timeframe.M1, config.M1_CANDLE_COUNT)

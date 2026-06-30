@@ -316,6 +316,12 @@ ZONE_HEALTH_VOL_SPIKE     : float = 1.5  # volume ratio to classify as spike
 
 # ── M5 Precision Entry Zone ───────────────────────────────────────
 # find_m5_precision_entry() locates the M5 OB inside the H1 zone.
+# When enabled, it anchors the SL at the M5 OB edge (tighter than H1 OB edge).
+# WARNING: this feature was never ported to the backtester — enabling it in
+# live mode creates a live/backtest mismatch where the tighter SL regularly
+# falls below MIN_SL_PIPS, silently rejecting every trade.
+# Leave False until the backtester is updated and re-validated.
+USE_M5_PRECISION_ZONE     : bool  = False
 # M5_PRECISION_MIN_PIPS: the M5 OB must be at least this many pips tall
 # to be meaningful — smaller OBs are noise inside the H1 zone.
 M5_PRECISION_MIN_PIPS     : float = 2.0
