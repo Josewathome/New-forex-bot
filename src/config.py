@@ -562,7 +562,7 @@ MIN_SL_PIPS: dict[str, float] = {
 MIN_SL_PIPS_DEFAULT = 3.0
 
 # ── Retention Policies ────────────────────────────────────────────
-LOG_RETENTION_DAYS   = 3
+LOG_RETENTION_DAYS   = 30   # keep 30 days so post-mortems have evidence
 CACHE_RETENTION_DAYS = 2
 ZONE_RETENTION_DAYS  = 5
 ZONES_DIR            = "zones"
@@ -571,6 +571,13 @@ ZONES_DIR            = "zones"
 CHECKPOINT_DIR           = ".checkpoints"
 CHECKPOINT_INTERVAL_MIN  = 5       # save checkpoint every N minutes (worst-case gap on power loss)
 CHECKPOINT_RETAIN_DAYS   = 7       # keep dated daily backups for this many days, then delete
+
+# ── Dry Run Mode ──────────────────────────────────────────────────
+# When True, the bot evaluates signals and logs every trade it WOULD place
+# but never sends an order to the broker.  Use this for one week after any
+# code change to verify the pipeline is working before risking real money.
+# Set via env:  DRY_RUN=true  in docker-compose.yml / .env
+DRY_RUN: bool = os.environ.get("DRY_RUN", "").lower() in ("1", "true", "yes")
 
 # ── Dashboard ─────────────────────────────────────────────────────
 DASHBOARD_ENABLED = True
@@ -605,7 +612,14 @@ MAX_FORWARD_M1_BARS  = 4_320
 BACKTEST_MONTHS_BACK = 2
 BACKTEST_START_DATE  = ""
 BACKTEST_END_DATE    = ""
-BACKTEST_REPORT_NAME ="Last_6_months"
+BACKTEST_REPORT_NAME = "Last_6_months"
+
+# Override which symbols run in backtest.  Defaults to all live SYMBOLS.
+# Set to a subset to isolate one instrument:
+#   BACKTEST_SYMBOLS = ["XAUUSD"]
+# This lets you tune XAUUSD parameters independently without polluting
+# the results for forex pairs (and vice versa).
+BACKTEST_SYMBOLS: list = []   # empty = use SYMBOLS
 
 # Keep False so the backtest matches live trading exactly.
 # Live trading monitors on M1 (SL/TP/MFE precision); the backtest should too.

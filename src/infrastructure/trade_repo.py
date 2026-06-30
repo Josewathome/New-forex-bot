@@ -122,6 +122,10 @@ class MT5TradeRepository(ITradeRepository):
         info = self._gw.get_account_info()
         return info["balance"] if info else 0.0
 
+    def get_equity(self) -> float:
+        info = self._gw.get_account_info()
+        return info["equity"] if info else 0.0
+
     def get_free_margin(self) -> float:
         info = self._gw.get_account_info()
         return info["free_margin"] if info else 0.0

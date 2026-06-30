@@ -45,6 +45,7 @@ from src.application.analysis import (
     find_m5_precision_entry,
     get_current_m5_bar_open,
 )
+from src.application.diagnostics import LiveSignalLogger
 from src.application.news_manager import NewsManager
 from src.application.trade_monitor import TradeMonitor, MonitorEvent, find_swing_trail_sl, find_runner_protection_sl
 from src.infrastructure.spread_calculator import SpreadCalculator
@@ -531,6 +532,7 @@ class ExecutionService:
                 )
                 signal = None
 
+                _live_diag = LiveSignalLogger()
                 if m1:
                     signal = find_m1_predictive_signal(
                         m1_candles=      m1,
@@ -545,6 +547,7 @@ class ExecutionService:
                         m30_zones=       self._m30_zones.get(symbol, []),
                         m5_candles=      m5,
                         m5_bar_open_time=_m5_forming_open,
+                        diag=            _live_diag,
                     )
                     if signal:
                         logger.info(
@@ -568,6 +571,7 @@ class ExecutionService:
                         min_rr_override=min_rr,
                         m30_zones=self._m30_zones.get(symbol, []),
                         precision_zone=precision_zone,
+                        diag=_live_diag,
                     )
 
                 if signal is None:
@@ -683,6 +687,18 @@ class ExecutionService:
             return None
         if req_margin is None:
             logger.debug("MARGIN CHECK unavailable for %s — proceeding (MT5 will enforce).", symbol)
+
+        if getattr(config, "DRY_RUN", False):
+            logger.info(
+                "DRY RUN | %s %s | score=%d grade=%s | %.2f lots | "
+                "entry=%.5f SL=%.5f TP=%.5f | RR=%.2f | zone=%s",
+                symbol, signal.direction.value.upper(),
+                candidate.trade_score, candidate.grade,
+                trade.lot_size, trade.entry_price,
+                trade.stop_loss, trade.take_profit,
+                signal.risk_reward, candidate.zone_id[:8],
+            )
+            return None
 
         ticket = self._tr.place_trade(trade)
         if ticket is None:
@@ -1304,7 +1320,7 @@ class ExecutionService:
 
     def _build_trade(self, signal, broker_cost, pip_calc, tick_value,
                      risk_pct_override=None):
-        balance = self._tr.get_account_balance()
+        balance = self._tr.get_equity()
         if balance <= 0:
             return None
         eff_risk = risk_pct_override if risk_pct_override is not None else self._risk_pct
