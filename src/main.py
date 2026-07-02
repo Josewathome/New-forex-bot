@@ -69,6 +69,26 @@ def _setup_logging() -> None:
         ],
     )
 
+    # Entry-gate rejection funnel: find_m1_predictive_signal / find_m5_choch_signal
+    # already call diag.record_rejection(symbol, reason) on every gate failure
+    # (via LiveSignalLogger), but it logs at DEBUG on a "live_signal" logger that
+    # was never surfaced — every rejection reason has been silently discarded
+    # since day one. Route it to its own rotating file at DEBUG, separate from
+    # the main INFO-level trading_bot.log, so we can see exactly which gate is
+    # rejecting setups without flooding the main log.
+    signal_funnel_handler = logging.handlers.TimedRotatingFileHandler(
+        "logs/signal_funnel.log",
+        when="midnight",
+        utc=True,
+        backupCount=getattr(config, "LOG_RETENTION_DAYS", 30),
+        encoding="utf-8",
+    )
+    signal_funnel_handler.setFormatter(logging.Formatter(fmt, datefmt="%Y-%m-%dT%H:%M:%S"))
+    signal_funnel_logger = logging.getLogger("live_signal")
+    signal_funnel_logger.setLevel(logging.DEBUG)
+    signal_funnel_logger.addHandler(signal_funnel_handler)
+    signal_funnel_logger.propagate = False
+
 logger = logging.getLogger("main")
 
 

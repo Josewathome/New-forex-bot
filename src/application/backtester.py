@@ -414,11 +414,14 @@ class Backtester:
             liquidity_sweep = (zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count == 0)
             fvg_clean = (zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.size > h1_atr * 0.5)
             strong_displacement = (signal.volume_ratio >= 1.5)
+            # is_kill_zone is kept only as an analytics tag on the trade record
+            # below (kill_zone=) — it no longer feeds score_trade (SCORE_KILL_ZONE
+            # was 0: backtest showed kill-zone trades perform 2.2x worse).
             in_kill_zone = is_kill_zone(signal.created_at)
 
             trade_score = score_trade(
                 htf_aligned, liquidity_sweep, fvg_clean,
-                strong_displacement, in_kill_zone
+                strong_displacement,
             )
             if trade_score < config.TRADE_SCORE_THRESHOLD:
                 if diag: diag.record_rejection(symbol, "low_trade_score")

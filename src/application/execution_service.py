@@ -34,7 +34,6 @@ from src.application.analysis import (
     score_trade,
     dynamic_risk,
     is_strong_trend,
-    is_kill_zone,
     evaluate_zone_health,
     find_opposing_opportunity,
     find_htf_zone_confluence,
@@ -588,11 +587,10 @@ class ExecutionService:
             liquidity_sweep     = (zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count == 0)
             fvg_clean           = (zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.size > h1_atr * 0.5)
             strong_displacement = (signal.volume_ratio >= 1.5)
-            in_kill_zone        = is_kill_zone(signal.created_at)
 
             trade_score = score_trade(
                 htf_aligned, liquidity_sweep, fvg_clean,
-                strong_displacement, in_kill_zone,
+                strong_displacement,
             )
             if trade_score < config.TRADE_SCORE_THRESHOLD:
                 logger.info("REJECTED | %s | low trade score %d < %d",

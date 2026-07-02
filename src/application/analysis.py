@@ -1058,15 +1058,23 @@ def find_m1_predictive_signal(
         return None
 
     # ── M5 candle-colour gate ──────────────────────────────────────
-    # If the currently-forming M5 candle is already bearish (for a bullish
-    # setup), the M1 ChoCh is likely noise inside a larger bearish M5 wave.
-    # Skip now; the M5 ChoCh fallback will re-evaluate once M5 closes.
+    # Reject only when the forming M5 candle is DECISIVELY against us.
+    # A tiny/doji-sized opposing body is noise, not a real counter-move —
+    # vetoing a qualified M1 predictive signal over a near-flat M5 candle
+    # defeats the point of a *predictive* entry (you're meant to call the
+    # M5 close before it happens, not require it to have already leaned
+    # your way). Only a body above M1_M5_COLOUR_NOISE_PIPS counts as a
+    # genuine opposing move.
     if current_m5 is not None:
-        if zone.direction == Direction.BULLISH and current_m5.close < current_m5.open:
-            if diag:
-                diag.record_rejection(symbol, "m1_m5_colour_mismatch")
-            return None
-        if zone.direction == Direction.BEARISH and current_m5.close > current_m5.open:
+        noise_floor = pip_calc.pips_to_price(
+            getattr(config, "M1_M5_COLOUR_NOISE_PIPS", 0.5)
+        )
+        opposing = (
+            zone.direction == Direction.BULLISH and current_m5.close < current_m5.open
+        ) or (
+            zone.direction == Direction.BEARISH and current_m5.close > current_m5.open
+        )
+        if opposing and current_m5.body_size >= noise_floor:
             if diag:
                 diag.record_rejection(symbol, "m1_m5_colour_mismatch")
             return None
@@ -1448,8 +1456,12 @@ def score_trade(
     liquidity_sweep: bool,
     fvg_clean: bool,
     strong_displacement: bool,
-    in_kill_zone: bool,
 ) -> int:
+    # Kill-zone was dropped as a scoring input: backtest showed trades
+    # outside kill zones perform 2.2x better, so SCORE_KILL_ZONE was set to
+    # 0 (see KILL_ZONES in config.py) — it contributed nothing to the score
+    # for a long time before being removed here. is_kill_zone()/KILL_ZONES
+    # are kept for backtest analytics (see backtester.py's kill_zone= field).
     score = 0
     if htf_aligned:
         score += config.SCORE_HTF_ALIGNMENT
@@ -1459,13 +1471,11 @@ def score_trade(
         score += config.SCORE_CLEAN_FVG
     if strong_displacement:
         score += config.SCORE_STRONG_DISPLACEMENT
-    if in_kill_zone:
-        score += config.SCORE_KILL_ZONE
     return score
 
 
 def dynamic_risk(score: int) -> float:
-    # Max possible score = 6 (HTF=2, sweep=1, FVG=1, displacement=1, kill_zone=1).
+    # Max possible score = 5 (HTF=2, sweep=1, FVG=1, displacement=1).
     # Threshold 5 catches excellent setups (HTF aligned + 3 of 4 other criteria),
     # not just mathematically perfect ones — avoids under-risking good setups.
     if score >= 5:
@@ -1884,9 +1894,11 @@ def evaluate_zone_health(
                 return False, "h1_structure_flipped"
 
     # ── Check 3: Touch count — zone liquidity exhausted ─────────────
-    if zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.touch_count >= 2:
+    fvg_max_taps = getattr(config, "ZONE_FVG_MAX_TAPS", 3)
+    ob_max_taps  = getattr(config, "ZONE_OB_MAX_TAPS", 4)
+    if zone.zone_type == ZoneType.FAIR_VALUE_GAP and zone.touch_count >= fvg_max_taps:
         return False, "fvg_over_tapped"
-    if zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count >= 3:
+    if zone.zone_type == ZoneType.ORDER_BLOCK and zone.touch_count >= ob_max_taps:
         return False, "ob_over_tapped"
 
     # ── Check 4: M5 momentum displacement against zone ───────────────

@@ -219,6 +219,11 @@ M1_MIN_ZONE_SIZE_PIPS        = 6.0   # zone must be ≥6 pips tall for M1 wave t
 # After M5 candle confirms bullish, execution_service moves SL to zone.low - buffer.
 M1_SL_USE_ZONE_MID           = True
 
+# Minimum opposing-body size (pips) for the M5 candle-colour gate in
+# find_m1_predictive_signal to veto a signal. A forming M5 candle with a
+# body smaller than this is treated as noise/doji, not a genuine counter-move.
+M1_M5_COLOUR_NOISE_PIPS      = 0.5
+
 # ── Legacy M1 LTF Signal Filters (find_ltf_signal / backtester) ───
 REJECTION_WICK_RATIO = 0.6   # Lower wick must be >= 60% of candle range for bullish rejection
 VOLUME_RATIO_MIN     = 1.0   # Volume must be >= 1× average to count as valid rejection candle
@@ -313,6 +318,16 @@ M30_STORY_LOOKBACK        : int   = 8
 ZONE_HEALTH_AGAINST_MIN   : int   = 3    # minimum M5 bars against zone (of last 4)
 ZONE_HEALTH_STRONG_MIN    : int   = 1    # minimum volume-spike bars among them
 ZONE_HEALTH_VOL_SPIKE     : float = 1.5  # volume ratio to classify as spike
+
+# Touch-count ceiling for evaluate_zone_health check 3 (zone liquidity
+# exhausted). Was FVG>=2 / OB>=3 — by far the single largest rejection
+# category in live logs (~27k of ~36k zone-stale skips over 7 weeks).
+# Real FVGs/OBs routinely get retested 2-3 times before continuing; a
+# 1-tap-and-done FVG limit was killing zones that were still valid.
+# Raised one notch each; re-tune with backtester.py once the rejection-
+# funnel log (logs/signal_funnel.log) shows the real cost/benefit.
+ZONE_FVG_MAX_TAPS         : int   = 3
+ZONE_OB_MAX_TAPS          : int   = 4
 
 # ── M5 Precision Entry Zone ───────────────────────────────────────
 # find_m5_precision_entry() locates the M5 OB inside the H1 zone.
@@ -535,7 +550,9 @@ SCORE_HTF_ALIGNMENT       = 2   # max contribution
 SCORE_LIQUIDITY_SWEEP     = 1
 SCORE_CLEAN_FVG           = 1
 SCORE_STRONG_DISPLACEMENT = 1
-SCORE_KILL_ZONE           = 0   # outside kill zones perform 2.2× better in backtest
+# SCORE_KILL_ZONE removed — backtest showed kill-zone trades perform 2.2×
+# worse, so it was set to 0 (dead weight) and dropped from score_trade().
+# KILL_ZONES/is_kill_zone below are kept for backtest analytics only.
 
 # ── DYNAMIC POSITION SIZING ───────────────────────────────────────
 RISK_HIGH_CONVICTION    = 1.5
@@ -545,7 +562,7 @@ RISK_LOW_CONVICTION     = 1.0   # was 0.5 — half-size entries at 0.5% produce 
 # ── TIME‑BASED EXIT ───────────────────────────────────────────────
 MAX_TRADE_DURATION_MINUTES = 600
 
-# ── SESSION FILTER (KILL ZONES) ───────────────────────────────────
+# ── KILL ZONES (backtest analytics tag only — no longer a live scoring input) ──
 KILL_ZONES = {
     "LONDON":   (8, 9),    # narrowed from (8,11) — only block the first chaotic minute; 09:00+ London is structured
     "NEW_YORK": (14, 15),  # narrowed from (14,17) — only block the NY open spike; 15:00+ is clean trending
