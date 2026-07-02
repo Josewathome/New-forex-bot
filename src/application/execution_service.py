@@ -1143,6 +1143,11 @@ class ExecutionService:
                 _outcome = "WIN_PARTIAL"
             else:
                 _outcome = "LOSS"
+            logger.info(
+                "TRADE CLOSED | %s ticket=%s | outcome=%s | pips=%.1f | "
+                "entry=%.5f est_close=%.5f",
+                state.symbol, t, _outcome, total_pips, state.entry, close_est,
+            )
             self._journal_close(t, total_pips, _outcome)
             self._update_streak(state.symbol, total_pips)
             del self._trade_states[t]

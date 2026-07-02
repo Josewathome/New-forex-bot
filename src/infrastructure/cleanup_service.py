@@ -24,6 +24,7 @@ _CHECKPOINT_PROTECTED = {
     "jwt_secret.txt",
     "jwt_blocklist.json",
     "symbols_override.json",
+    "trade_journal.json",
 }
 
 

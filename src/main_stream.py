@@ -560,7 +560,13 @@ def _run_entry_evaluation(execution: ExecutionService, now: datetime) -> None:
     for candidate in p1_candidates:
         if len(execution._tr.get_open_positions()) >= config.MAX_OPEN_TRADES:
             break
-        if execution.open_count_for_symbol(candidate.symbol) >= getattr(config, "MAX_TRADES_PER_SYMBOL", 2):
+        # Phase 1 is capped at ONE unproven position per symbol — MAX_TRADES_PER_SYMBOL
+        # is the combined Phase-1 + Phase-2 cap, and Phase 2 only ever adds to a symbol
+        # that already proved itself by hitting TP1 (see has_tp1_hit_for_symbol below).
+        # Without this cap, the same still-valid signal on the next M1 close could open
+        # a second, unproven position on top of the first (this doubled a losing AUDUSD
+        # signal into two identical trades on 2026-06-30).
+        if execution.open_count_for_symbol(candidate.symbol) >= 1:
             continue
         try:
             trade = execution.execute_entry_candidate(candidate)

@@ -4,7 +4,10 @@ trade_journal.py — Persistent trade record.
 Every opened/closed trade is appended here so the dashboard can
 show live analytics without querying MT5 history.
 
-Storage: .cache/trade_journal.json
+Storage: .checkpoints/trade_journal.json
+NOTE: this must NOT live under .cache/ — CleanupService.market_close_wipe()
+deletes everything in .cache/ every Friday at market close, which would
+silently erase all trade history and P&L week over week.
 """
 from __future__ import annotations
 import json
@@ -15,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PATH = Path(".cache") / "trade_journal.json"
+_DEFAULT_PATH = Path(".checkpoints") / "trade_journal.json"
 
 
 class TradeJournal:

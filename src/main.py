@@ -17,6 +17,7 @@ New services wired in:
 from __future__ import annotations
 import argparse
 import logging
+import logging.handlers
 import signal
 import sys
 import time
@@ -49,13 +50,22 @@ from src.application.weekly_backtest_runner      import WeeklyBacktestRunner
 def _setup_logging() -> None:
     Path("logs").mkdir(exist_ok=True)
     fmt = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+    # Daily rotation at UTC midnight, one backup per day. backupCount is tied to
+    # LOG_RETENTION_DAYS so "how long we keep logs" only needs to change in one place.
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        "logs/trading_bot.log",
+        when="midnight",
+        utc=True,
+        backupCount=getattr(config, "LOG_RETENTION_DAYS", 30),
+        encoding="utf-8",
+    )
     logging.basicConfig(
         level=logging.INFO,
         format=fmt,
         datefmt="%Y-%m-%dT%H:%M:%S",
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler("logs/trading_bot.log", encoding="utf-8"),
+            file_handler,
         ],
     )
 
