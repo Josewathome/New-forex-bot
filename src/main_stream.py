@@ -132,17 +132,25 @@ def _seed_builders(
 def run_stream() -> None:
     gw = connect_mt5()
 
-    clock      = BrokerClock(gw)
-    broker_now = clock.now()
-    logger.info("Broker time at startup: %s UTC", broker_now.strftime("%Y-%m-%dT%H:%M:%S"))
-
+    # Calibrate the broker-to-real-world-hour offset ONCE, here, before
+    # anything reads MT5 time. This is the only place the host clock is
+    # read at all (detect_utc_offset() compares one MT5 tick against
+    # time.time() to measure the offset) — the result is a static constant
+    # (config.BROKER_UTC_OFFSET_HOURS) that mt5_time.mt5_epoch_to_datetime
+    # applies to every MT5 timestamp from here on, including every
+    # BrokerClock.now() call. The host clock is never consulted again
+    # after this one measurement.
     _detected_offset = gw.detect_utc_offset()
     if _detected_offset != 0:
         config.BROKER_UTC_OFFSET_HOURS = _detected_offset
     logger.info(
-        "Broker UTC offset: UTC%+d (detected=%+d)",
+        "MT5-to-real-world-hour offset: UTC%+d (detected=%+d, applied once at startup)",
         config.BROKER_UTC_OFFSET_HOURS, _detected_offset,
     )
+
+    clock      = BrokerClock(gw)
+    broker_now = clock.now()
+    logger.info("Bot time at startup (MT5-derived): %s", broker_now.strftime("%Y-%m-%dT%H:%M:%S"))
 
     acc = gw.get_account_info()
     if acc:
@@ -208,8 +216,8 @@ def run_stream() -> None:
     checkpoint = CheckpointService(getattr(config, "CHECKPOINT_DIR", ".checkpoints"))
     zone_store = ZoneFileStore()
     email_svc  = EmailService()
-    scheduler  = Scheduler()
-    weekly_bt  = WeeklyBacktestRunner(mt5_market_data, email_svc)
+    scheduler  = Scheduler(clock=clock)
+    weekly_bt  = WeeklyBacktestRunner(mt5_market_data, email_svc, clock=clock)
 
     # ── Restore checkpoint ─────────────────────────────────────────────
     cp = checkpoint.load()
@@ -420,23 +428,17 @@ def run_stream() -> None:
                 except Exception as exc:
                     logger.exception("Monitoring [%s]: %s", sym, exc)
 
-        # ── CANDLE_CLOSED (from CandleBuilder) or BAR_CLOSE (from EA) ──
-        elif etype in ("CANDLE_CLOSED", "BAR_CLOSE"):
-            if etype == "CANDLE_CLOSED":
-                candle = event.get("candle")
-                if candle is None:
-                    continue
-                sym = candle.symbol
-                tf  = candle.timeframe
-            else:
-                # Raw BAR_CLOSE from EA — just use for remap triggers
-                sym = event.get("sym", "")
-                tf_s = event.get("tf", "")
-                tf_map = {"M1": Timeframe.M1, "M5": Timeframe.M5, "M30": Timeframe.M30,
-                          "H1": Timeframe.H1, "H4": Timeframe.H4}
-                tf = tf_map.get(tf_s)
-                if tf is None:
-                    continue
+        # ── CANDLE_CLOSED (from CandleBuilder) ──────────────────────────
+        # Sole source for candle-close events: CandleBuilder's _on_close
+        # callback, fired exactly once per bar (either from the tick-driven
+        # finalizer, or from the EA's BAR_CLOSE correction path when it's
+        # genuinely a new bar — see CandleBuilder.on_bar_close_from_ea).
+        elif etype == "CANDLE_CLOSED":
+            candle = event.get("candle")
+            if candle is None:
+                continue
+            sym = candle.symbol
+            tf  = candle.timeframe
 
             if sym not in config.SYMBOLS:
                 continue

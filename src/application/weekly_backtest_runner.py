@@ -22,9 +22,19 @@ REPORTS_DIR = Path("src") / "backtest_results"
 
 class WeeklyBacktestRunner:
 
-    def __init__(self, market_data, email_service) -> None:
-        self.md    = market_data
-        self.email = email_service
+    def __init__(self, market_data, email_service, clock=None) -> None:
+        self.md     = market_data
+        self.email  = email_service
+        self._clock = clock   # BrokerClock — MT5-derived "now" for the date-range bootstrap
+
+    def _now(self) -> datetime:
+        if self._clock is not None:
+            return self._clock.now()
+        logger.warning(
+            "WeeklyBacktestRunner: no clock provided — falling back to the host clock "
+            "for the backtest date range."
+        )
+        return datetime.now(tz=timezone.utc)
 
     # ── Entry point (called by Scheduler) ────────────────────────────
 
@@ -48,7 +58,7 @@ class WeeklyBacktestRunner:
         from src.infrastructure.composite_news_client import CompositeNewsClient
         from src.infrastructure.cache_store           import JsonCacheStore
 
-        end_dt   = datetime.now(tz=timezone.utc)
+        end_dt   = self._now()
         start_dt = end_dt - timedelta(days=30 * config.BACKTEST_MONTHS_BACK)
         start_str = start_dt.strftime("%Y-%m-%d")
         end_str   = end_dt.strftime("%Y-%m-%d")
@@ -229,7 +239,7 @@ class WeeklyBacktestRunner:
             sep,
             "  ZONE BOT — WEEKLY BACKTEST REPORT",
             f"  Period    : {start_str}  to  {end_str}",
-            f"  Generated : {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+            f"  Generated : {self._now().strftime('%Y-%m-%d %H:%M UTC')}",
             f"  Symbols   : {', '.join(config.SYMBOLS)}",
             sep,
             "",

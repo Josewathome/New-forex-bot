@@ -292,20 +292,29 @@ def M5ClockWatcher(broker_now: datetime) -> _BarClockWatcher:
 def run_live() -> None:
     gw  = connect_mt5()
 
+    # Calibrate the broker-to-real-world-hour offset ONCE, here, before
+    # anything reads MT5 time. This is the only place the host clock is
+    # read at all (detect_utc_offset() compares one MT5 tick against
+    # time.time() to measure the offset) — the result is a static constant
+    # (config.BROKER_UTC_OFFSET_HOURS) that mt5_time.mt5_epoch_to_datetime
+    # applies to every MT5 timestamp from here on, including every
+    # BrokerClock.now() call, candle timestamps, and position open-times.
+    # The host clock is never consulted again after this one measurement.
+    _detected_offset = gw.detect_utc_offset()
+    if _detected_offset != 0:
+        config.BROKER_UTC_OFFSET_HOURS = _detected_offset
+    logger.info(
+        "MT5-to-real-world-hour offset: UTC%+d (detected=%+d, applied once at startup)",
+        config.BROKER_UTC_OFFSET_HOURS, _detected_offset,
+    )
+
     # ── Broker clock — single source of truth for "now" ───────────────
     # All time-sensitive decisions use IC Markets server time, not the
     # Linux host clock.  One instance is created here and passed to every
     # component that needs the current time.
     clock = BrokerClock(gw)
     broker_now = clock.now()
-    logger.info("Broker time at startup: %s UTC", broker_now.strftime("%Y-%m-%dT%H:%M:%S"))
-
-    # Auto-detect broker server UTC offset (informational only — used to
-    # correct trade open_time display, not for any trading decisions).
-    _detected_offset = gw.detect_utc_offset()
-    if _detected_offset != 0:
-        config.BROKER_UTC_OFFSET_HOURS = _detected_offset
-    logger.info("Broker UTC offset: UTC%+d (detected=%+d)", config.BROKER_UTC_OFFSET_HOURS, _detected_offset)
+    logger.info("Bot time at startup (MT5-derived): %s", broker_now.strftime("%Y-%m-%dT%H:%M:%S"))
 
     acc = gw.get_account_info()
     if acc:
@@ -320,8 +329,8 @@ def run_live() -> None:
     checkpoint = CheckpointService(getattr(config,"CHECKPOINT_DIR",".checkpoints"))
     zone_store = ZoneFileStore()
     email_svc  = EmailService()
-    scheduler  = Scheduler()
-    weekly_bt  = WeeklyBacktestRunner(market_data, email_svc)
+    scheduler  = Scheduler(clock=clock)
+    weekly_bt  = WeeklyBacktestRunner(market_data, email_svc, clock=clock)
 
     cp = checkpoint.load()
     if cp:
@@ -595,7 +604,15 @@ def run_backtest(
     from src.domain.entities         import Timeframe
     from datetime                    import timedelta
 
-    _now      = datetime.now(tz=timezone.utc)
+    # Connect to MT5 first so the date-range fallback below can use MT5
+    # server time (via BrokerClock) instead of the host clock — this bot's
+    # whole design is "MT5 is the sole authoritative clock," and an
+    # untrusted host clock here would silently fetch the wrong months of
+    # history for a CLI run that omits --start/--end.
+    gw = connect_mt5()
+    md = MT5MarketDataRepository(gw)
+    _clock = BrokerClock(gw)
+    _now      = _clock.now()
     _fallback_start = _now - timedelta(days=30 * config.BACKTEST_MONTHS_BACK)
 
     # Priority: CLI arg → config override → auto-computed from BACKTEST_MONTHS_BACK
@@ -608,8 +625,6 @@ def run_backtest(
     end_dt   = datetime.strptime(end_str,   "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
     logger.info("Backtest: %s to %s", start_str, end_str)
-    gw = connect_mt5()
-    md = MT5MarketDataRepository(gw)
 
     h1_buf = timedelta(hours=150)
     h4_buf = timedelta(hours=config.H4_CANDLE_COUNT * 4 + 40)
@@ -669,7 +684,7 @@ def run_backtest(
 
     report_dir  = Path("src/backtest_results")
     report_dir.mkdir(parents=True, exist_ok=True)
-    run_ts      = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_ts      = _clock.now().strftime("%Y%m%d_%H%M%S")
     # Priority: CLI --name arg → config BACKTEST_REPORT_NAME → default "backtest"
     rname       = report_name or getattr(config, "BACKTEST_REPORT_NAME", "backtest")
     report_path = report_dir / f"{rname}_{start_str}_{end_str}_{run_ts}.txt"

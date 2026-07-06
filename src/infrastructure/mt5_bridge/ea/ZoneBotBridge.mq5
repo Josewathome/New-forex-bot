@@ -74,9 +74,14 @@ string   g_bar_keys[];
 datetime g_bar_last_open[];
 int      g_bar_count = 0;
 
-datetime g_last_tick_time    = 0;
-datetime g_last_bind_attempt = 0;
+ulong    g_last_tick_ms      = 0;   // GetTickCount64()-gated heartbeat interval — see below
+ulong    g_last_bind_attempt_ms = 0; // GetTickCount64()-gated bind-retry interval — see below
 int      g_bind_retry_secs   = 10;
+// Both intervals above used to be gated on TimeCurrent(), which freezes
+// whenever no new quotes arrive (market closed / weekend / thin liquidity).
+// That silently stopped both the heartbeat AND the bind retry for the whole
+// quiet period. GetTickCount64() is a wall-clock-independent millisecond
+// counter that always advances.
 
 //── Helper: send a string over ZMQ ────────────────────────────────────
 void _ZmqSend(const string msg)
@@ -114,9 +119,9 @@ void _TryBind()
 {
    if(g_bound) return;
 
-   datetime now = TimeCurrent();
-   if(now - g_last_bind_attempt < g_bind_retry_secs) return;
-   g_last_bind_attempt = now;
+   ulong now_ms = GetTickCount64();
+   if(now_ms - g_last_bind_attempt_ms < (ulong)g_bind_retry_secs * 1000) return;
+   g_last_bind_attempt_ms = now_ms;
 
    if(g_ctx == 0)
    {
@@ -203,7 +208,7 @@ void OnTick()
 {
    if(!g_bound) { _TryBind(); return; }
 
-   g_last_tick_time = TimeCurrent();
+   g_last_tick_ms = GetTickCount64();
 
    string tfs[5];
    tfs[0] = "M1"; tfs[1] = "M5"; tfs[2] = "M30"; tfs[3] = "H1"; tfs[4] = "H4";
@@ -267,11 +272,13 @@ void OnTimer()
 {
    if(!g_bound) { _TryBind(); return; }
 
-   datetime now = TimeCurrent();
-   if(now - g_last_tick_time >= HEARTBEAT_SECS)
+   // Gate on GetTickCount64() (always advances), not TimeCurrent() (freezes
+   // when no new quotes arrive) — see g_last_tick_ms declaration above.
+   ulong now_ms = GetTickCount64();
+   if(now_ms - g_last_tick_ms >= (ulong)HEARTBEAT_SECS * 1000)
    {
-      _ZmqSend(StringFormat("HEARTBEAT {\"time\":%d}", (int)now));
-      g_last_tick_time = now;
+      _ZmqSend(StringFormat("HEARTBEAT {\"time\":%d}", (int)TimeCurrent()));
+      g_last_tick_ms = now_ms;
    }
 }
 
