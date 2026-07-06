@@ -219,6 +219,18 @@ class ZmqFeed:
         self._q.put({"type": "TICK", "sym": sym, "bid": bid, "ask": ask, "time": t})
 
     def _handle_bar_close(self, data: dict) -> None:
+        # No separate "BAR_CLOSE" queue event here. on_bar_close_from_ea()
+        # already re-queues a CANDLE_CLOSED event via the builder's _on_close
+        # callback whenever the EA's bar is genuinely new (not a duplicate of
+        # the tick-built one) — that's the real "EA report as a fallback for
+        # missed ticks" path, and it's unaffected by removing this. A second,
+        # unconditional queue-put of this raw EA message used to fire
+        # alongside it, so a single real bar close could trigger
+        # main_stream.py's zone-remapping and _run_entry_evaluation logic
+        # more than once — see candle_builder.py's _store_closed() and
+        # on_bar_close_from_ea() docstrings for why _run_entry_evaluation
+        # in particular was exposed to a real double-trade risk from this,
+        # not just wasted CPU.
         sym  = data.get("sym", "")
         tf_s = data.get("tf", "")
         tf   = _TF_MAP.get(tf_s)
@@ -238,5 +250,3 @@ class ZmqFeed:
                 close_p=  data["close"],
                 volume=   int(data.get("vol", 0)),
             )
-
-        self._q.put({"type": "BAR_CLOSE", **data})
