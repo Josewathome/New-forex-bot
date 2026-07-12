@@ -312,6 +312,15 @@ class Backtester:
                 continue
             grade, rpct, min_rr = grade_setup(setup_score)
 
+            # Displacement timeframe (minutes) for the fill-window guard below.
+            # signal.created_at is the displacement bar's OPEN; live cannot see
+            # the signal until that bar CLOSES (created_at + this many minutes).
+            # Default 5 covers the M5 ChoCh and the zone-flip/opposing paths
+            # (both produce M5 displacement); the M1 predictive path overrides
+            # to 1 on success below.  This is a fill-timing guard only — no
+            # strategy, scoring, or signal-generation logic is affected.
+            disp_tf_min = 5
+
             # Re-evaluate zone at the moment price arrives.
             healthy, reject_reason = evaluate_zone_health(
                 zone, h1_win, m5_win, h1_atr)
@@ -387,6 +396,8 @@ class Backtester:
                         m5_candles=m5_win,
                         m5_bar_open_time=m5_bar_open_bt,
                     )
+                    if signal is not None:
+                        disp_tf_min = 1   # M1 displacement closes 1 min after its open
                 # ── M5 ChoCh (fallback) ───────────────────────────
                 if signal is None:
                     signal = find_m5_choch_signal(
@@ -466,8 +477,16 @@ class Backtester:
             ram = equity * (risk_pct / 100)
 
             max_m1 = config.MAX_FORWARD_M1_BARS
-            fm1 = [c for c in m1 if c.time >= signal.created_at][:max_m1]
-            fm5 = [c for c in m5 if c.time >= signal.created_at][:max_m1 // 5]
+            # LOOK-AHEAD FIX: the fill/simulation window must start no earlier
+            # than the displacement bar's CLOSE — the earliest moment the signal
+            # could exist in live.  signal.created_at is the displacement bar's
+            # OPEN, so scanning from there previously let the backtest fill on
+            # price action during (or before) the displacement candle — price
+            # that live could not have acted on yet.  Shift the window start to
+            # created_at + displacement duration.
+            fill_start = signal.created_at + timedelta(minutes=disp_tf_min)
+            fm1 = [c for c in m1 if c.time >= fill_start][:max_m1]
+            fm5 = [c for c in m5 if c.time >= fill_start][:max_m1 // 5]
 
             monitor = TradeMonitor(pip_calc=pip_calc, atr_price=h1_atr, symbol=symbol)
 
