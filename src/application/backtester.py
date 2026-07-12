@@ -10,6 +10,7 @@ CHANGES vs v9:
     reported MFE = 0.0 pips. Now reads from the enclosing scope at call time.
 """
 from __future__ import annotations
+import bisect
 import csv
 import logging
 import math
@@ -122,6 +123,9 @@ class Backtester:
         # the last processed H1 bar. Mirrors the live zone repo, which carries
         # touch_count across H1 remaps (execution_service.run_zone_mapping).
         self._bt_touch:       Dict[str, Dict]     = {}
+        # Cached sorted candle-time lists per (symbol, timeframe) for O(log n)
+        # intrabar M1/M5-close sampling used by the touch-detection pass.
+        self._bt_ltf:         Dict                = {}
 
     def _get_tick_value(self, symbol: str) -> float:
         if symbol in self._tick_values and self._tick_values[symbol] > 0:
@@ -310,15 +314,34 @@ class Backtester:
         # loop below re-applies, used solely to decide whether a tap counts
         # (live marks a tap only after its score gate passes).
         #
-        # Fidelity notes: live evaluates every M1 (≈60×/bar) but its per-bar
-        # dedup means each qualifying zone is marked at most once per H1 bar,
-        # and on the many minutes where no earlier zone yields a signal the
-        # loop reaches and marks every qualifying zone — so "once per H1 bar
-        # per score-passed, tapped zone" is the faithful model.  The H1 bar's
-        # [low, high] range is that bar's price path, so a tap = the range
-        # intersects the zone ± buffer.
+        # Touch DETECTION (M1-close sampled, live-faithful): live evaluates on
+        # each M1 CLOSE (≈60×/bar) and taps a zone when the ask (≈ that M1
+        # close) is inside zone ± buffer.  We reproduce this by sampling the
+        # CLOSE of every M1 bar inside this H1 bar and tapping if any lands in
+        # zone ± buffer.  This replaces the earlier H1 [low,high]-range test
+        # (bf309a2), which over-counted intrabar wicks that live's per-minute
+        # ask sampling never saw (~7% over-count, verified).  If M1 is
+        # unavailable for this bar we fall back to M5 closes, mirroring the
+        # simulator's own M1-or-M5 data handling; the per-bar dedup, score
+        # gate, identity carry-forward, and exhaustion logic are unchanged.
+        _bar_end = bar_time + timedelta(hours=1)
+        _m1_times = self._bt_ltf.get((symbol, "M1"))
+        if _m1_times is None:
+            _m1_times = [c.time for c in m1]
+            self._bt_ltf[(symbol, "M1")] = _m1_times
+        _lo = bisect.bisect_left(_m1_times, bar_time)
+        _hi = bisect.bisect_left(_m1_times, _bar_end)
+        _samples = [c.close for c in m1[_lo:_hi]]
+        if not _samples:   # no M1 for this bar → fall back to M5 closes
+            _m5_times = self._bt_ltf.get((symbol, "M5"))
+            if _m5_times is None:
+                _m5_times = [c.time for c in m5]
+                self._bt_ltf[(symbol, "M5")] = _m5_times
+            _lo = bisect.bisect_left(_m5_times, bar_time)
+            _hi = bisect.bisect_left(_m5_times, _bar_end)
+            _samples = [c.close for c in m5[_lo:_hi]]
+
         _prev_touch = self._bt_touch.get(symbol, {})
-        _h1_bar     = h1[h1_idx]
         _new_touch  = {}
         for _z in zones:
             _zid = (_z.created_at, _z.direction, _z.zone_type)
@@ -334,7 +357,8 @@ class Backtester:
                 )
                 if _score < sym_min_score:
                     continue
-                if _h1_bar.low <= _z.high + zbuf and _h1_bar.high >= _z.low - zbuf:
+                _zlo, _zhi = _z.low - zbuf, _z.high + zbuf
+                if any(_zlo <= px <= _zhi for px in _samples):
                     _zid = (_z.created_at, _z.direction, _z.zone_type)
                     _z.touch_count += 1
                     _new_touch[_zid] = _z.touch_count
