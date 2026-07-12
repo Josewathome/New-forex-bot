@@ -117,6 +117,11 @@ class Backtester:
         # Streak protection: track consecutive net-negative losses per symbol.
         self._loss_streak:    Dict[str, int]      = {}
         self._streak_pause:   Dict[str, datetime] = {}
+        # Touch-count parity (Issue 3): per-symbol map of zone identity
+        # (created_at, direction, zone_type) → accumulated touch_count as of
+        # the last processed H1 bar. Mirrors the live zone repo, which carries
+        # touch_count across H1 remaps (execution_service.run_zone_mapping).
+        self._bt_touch:       Dict[str, Dict]     = {}
 
     def _get_tick_value(self, symbol: str) -> float:
         if symbol in self._tick_values and self._tick_values[symbol] > 0:
@@ -287,6 +292,53 @@ class Backtester:
         m1_win = [c for c in m1 if c.time < bar_time][-60:]
 
         sym_min_score = config.SYMBOL_MIN_SCORE.get(symbol, config.SETUP_SCORE_THRESHOLD)
+
+        # ── Touch-count lifecycle parity with live (Issue 3) ────────────────
+        # Live (execution_service.py) increments zone.touch_count once per H1
+        # bar for every zone that (a) passes the score gate and (b) is tapped
+        # by price (ask within zone ± buffer), deduplicated per H1 bar
+        # (_zone_last_tap), and carries counts across H1 remaps by zone
+        # identity (created_at, direction, zone_type) — see run_zone_mapping
+        # lines 200-210 and the mark_tapped block lines 428-436. evaluate_zone_
+        # health() then rejects fvg_over_tapped (touch_count >= ZONE_FVG_MAX_TAPS)
+        # / ob_over_tapped (>= ZONE_OB_MAX_TAPS).  The backtester re-maps fresh
+        # zones each H1 bar, so touch_count was always 0 and those rejections
+        # could never fire.  This block reproduces that lifecycle ONLY — it sets
+        # the touch_count that the existing evaluate_zone_health() gate already
+        # reads.  No scoring, RR, displacement, or signal-generation logic is
+        # changed; the score_setup() call here is the identical gate the trade
+        # loop below re-applies, used solely to decide whether a tap counts
+        # (live marks a tap only after its score gate passes).
+        #
+        # Fidelity notes: live evaluates every M1 (≈60×/bar) but its per-bar
+        # dedup means each qualifying zone is marked at most once per H1 bar,
+        # and on the many minutes where no earlier zone yields a signal the
+        # loop reaches and marks every qualifying zone — so "once per H1 bar
+        # per score-passed, tapped zone" is the faithful model.  The H1 bar's
+        # [low, high] range is that bar's price path, so a tap = the range
+        # intersects the zone ± buffer.
+        _prev_touch = self._bt_touch.get(symbol, {})
+        _h1_bar     = h1[h1_idx]
+        _new_touch  = {}
+        for _z in zones:
+            _zid = (_z.created_at, _z.direction, _z.zone_type)
+            _z.touch_count = _prev_touch.get(_zid, 0)   # carry across remap
+            _new_touch[_zid] = _z.touch_count
+        if not (getattr(config, "REQUIRE_H4_BIAS", True) and h4_bias is None):
+            for _z in zones:
+                _score = score_setup(
+                    _z.direction, h4_bias, bar_px, h4_eq, d1_bias,
+                    find_htf_zone_confluence(_z, h4_zones),
+                    find_m30_zone_confluence(_z, m30_zones_bt),
+                    find_m5_zone_confluence(_z, m5_zones_bt),
+                )
+                if _score < sym_min_score:
+                    continue
+                if _h1_bar.low <= _z.high + zbuf and _h1_bar.high >= _z.low - zbuf:
+                    _zid = (_z.created_at, _z.direction, _z.zone_type)
+                    _z.touch_count += 1
+                    _new_touch[_zid] = _z.touch_count
+        self._bt_touch[symbol] = _new_touch
 
         for zone in zones:
             # ── Trend pre-filters ──────────────────────────────────
