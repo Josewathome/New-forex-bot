@@ -544,6 +544,45 @@ class MT5Gateway:
                 }
         return None
 
+    def get_position_result(self, position_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Broker-truth realized result for a (now-closed) position, summed across
+        ALL its deals — the single source of truth for P&L accounting.
+
+        Returns account-currency net = gross profit + commission + swap, plus the
+        actual broker entry (DEAL_ENTRY_IN price) and close (last DEAL_ENTRY_OUT
+        price).  Returns None if MT5 has no deal history for the position yet.
+        Used by ExecutionService at close time so the journal/statistics reflect
+        what the broker actually did, not signal-price geometry.
+        """
+        if not self._ensure_ready():
+            return None
+        deals = mt5.history_deals_get(position=position_id)
+        if deals is None or len(deals) == 0:
+            return None
+        gross = commission = swap = 0.0
+        entry_price = close_price = None
+        close_time = 0
+        for d in sorted(deals, key=lambda x: x.time):
+            gross      += float(d.profit)
+            commission += float(d.commission)
+            swap       += float(d.swap)
+            if d.entry == mt5.DEAL_ENTRY_IN and entry_price is None:
+                entry_price = float(d.price)
+            if d.entry == mt5.DEAL_ENTRY_OUT:
+                close_price = float(d.price)
+                close_time  = int(d.time)
+        return {
+            "position_id": int(position_id),
+            "entry_price": entry_price,
+            "close_price": close_price,
+            "gross_profit": round(gross, 2),
+            "commission":  round(commission, 2),
+            "swap":        round(swap, 2),
+            "net_profit":  round(gross + commission + swap, 2),
+            "close_time":  close_time,
+        }
+
     # ── Positions ─────────────────────────────────────────────────
 
     def get_open_positions(self) -> List[Dict[str, Any]]:

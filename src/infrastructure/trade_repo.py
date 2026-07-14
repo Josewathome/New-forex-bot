@@ -53,6 +53,12 @@ class MT5TradeRepository(ITradeRepository):
         logger.info("Trade closed ✓ ticket=%s @ %s", ticket, result.get("price"))
         return True
 
+    def get_position_result(self, ticket: int):
+        """Broker-truth realized result (net profit incl. commission+swap, actual
+        entry/close) for a closed position — passthrough to the gateway. Used for
+        broker-truth journal/statistics accounting."""
+        return self._gw.get_position_result(ticket)
+
     def partial_close_trade(self, ticket: int, volume: float, comment: str = "ZoneBot TP") -> bool:
         """
         Close `volume` lots of the position at market price.

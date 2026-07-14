@@ -730,7 +730,11 @@ class ExecutionService:
                 self._journal.record_open(
                     ticket=ticket,    symbol=symbol,
                     direction=signal.direction.value,
-                    entry=signal.entry_price, sl=signal.stop_loss,
+                    # Broker truth: trade.entry_price was overwritten with the
+                    # actual MT5 fill inside trade_repo.place_trade — record the
+                    # FILL, not signal.entry_price (which the MARKET order did not
+                    # necessarily obtain).
+                    entry=trade.entry_price, sl=signal.stop_loss,
                     tp=signal.take_profit,    lot_size=trade.lot_size,
                     grade=candidate.grade,
                 )
@@ -1070,7 +1074,8 @@ class ExecutionService:
                         _outcome = "WIN_PARTIAL"
                     else:
                         _outcome = "MONITOR_CLOSE"
-                    self._journal_close(ticket, total_pips, _outcome)
+                    # Broker truth: journal actual net P&L + broker-sign win/loss.
+                    self._broker_close(ticket, _outcome, total_pips)
                     self._update_streak(symbol, total_pips)
                     del self._trade_states[ticket]
 
@@ -1146,7 +1151,9 @@ class ExecutionService:
                 "entry=%.5f est_close=%.5f",
                 state.symbol, t, _outcome, total_pips, state.entry, close_est,
             )
-            self._journal_close(t, total_pips, _outcome)
+            # Broker truth: journal actual net P&L + broker-sign win/loss
+            # (replaces the signal-geometry pips estimate above).
+            self._broker_close(t, _outcome, total_pips)
             self._update_streak(state.symbol, total_pips)
             del self._trade_states[t]
 
@@ -1320,6 +1327,37 @@ class ExecutionService:
                 self._journal.record_close(ticket, round(pips, 1), outcome)
             except Exception as exc:
                 logger.warning("Journal record_close failed ticket=%s: %s", ticket, exc)
+
+    def _broker_close(self, ticket: int, semantic_outcome: str, fallback_pips: float) -> None:
+        """Journal a closed trade using BROKER TRUTH (net profit incl.
+        commission+swap, and win/loss by the broker's actual net sign) instead of
+        signal-price geometry.  ``semantic_outcome`` is the TP-based label
+        (WIN_FULL/WIN_PARTIAL/MONITOR_CLOSE); it is kept only when the broker
+        agrees the trade was net-positive, otherwise the outcome is recorded as
+        LOSS so win-rate statistics reflect reality.  Falls back to the pips
+        estimate only when MT5 has no deal history for the position (logged)."""
+        res = None
+        try:
+            res = self._tr.get_position_result(ticket)
+        except Exception as exc:
+            logger.warning("Broker result lookup failed ticket=%s: %s", ticket, exc)
+        if res and res.get("net_profit") is not None:
+            net = res["net_profit"]
+            outcome = semantic_outcome if net > 0 else "LOSS"
+            logger.info(
+                "BROKER TRUTH | ticket=%s | net=%.2f (gross=%.2f comm=%.2f swap=%.2f) "
+                "entry=%s close=%s | journaled outcome=%s",
+                ticket, net, res.get("gross_profit"), res.get("commission"),
+                res.get("swap"), res.get("entry_price"), res.get("close_price"), outcome,
+            )
+            self._journal_close(ticket, net, outcome)
+        else:
+            logger.warning(
+                "BROKER TRUTH unavailable for ticket=%s — journaling pips estimate "
+                "(%.1f) as fallback; reconcile later against MT5 history.",
+                ticket, fallback_pips,
+            )
+            self._journal_close(ticket, fallback_pips, semantic_outcome)
 
     def _build_trade(self, signal, broker_cost, pip_calc, tick_value,
                      risk_pct_override=None):
