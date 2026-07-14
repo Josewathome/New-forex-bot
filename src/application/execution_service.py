@@ -160,6 +160,16 @@ class ExecutionService:
         # per H1 bar.  Persisted in save/load_runtime_state so a restart mid-bar
         # does not double-count the tap that already fired before the crash.
         self._zone_last_tap: Dict[str, int] = {}
+        # WS2 — durable signal dedup: fingerprint → signal.created_at ISO of the
+        # signal that was EXECUTED. Prevents one logical signal from executing
+        # more than once (the Jul-13 XAUUSD cascade re-executed a single ChoCh
+        # signal 37×). Fingerprint is built from the signal's STABLE fields only
+        # (symbol, direction, type, entry, displacement time, zone anchor time),
+        # so it survives H1 zone remaps (zone.id regenerates) and ignores drifting
+        # fields (volume_ratio). Persisted in save/load_runtime_state → survives
+        # restarts. Entries older than the existing MAX_SIGNAL_AGE window are
+        # evicted (a signal that old can no longer fire anyway).
+        self._executed_signals: Dict[str, str] = {}
         # Gap-recovery controls:
         #   _replay_mode     — when True, collect_entry_candidate() is a no-op.
         #                      Used by GapRecoveryService to replay historical candles
@@ -666,6 +676,19 @@ class ExecutionService:
                 )
                 self._min_signal_time = None
 
+        # ── WS2: durable signal dedup ──────────────────────────────────────
+        # A single logical signal must execute at most once. Build a fingerprint
+        # from stable fields only, evict entries too old to re-fire, and skip if
+        # this fingerprint has already been executed.
+        fp = self._signal_fingerprint(candidate)
+        self._evict_stale_signals()
+        if fp in self._executed_signals:
+            logger.info(
+                "DEDUP SKIP | %s | signal already executed (fp=%s) — not re-entering",
+                symbol, fp,
+            )
+            return None
+
         trade = self._build_trade(
             signal, candidate.broker_cost, candidate.pip_calc,
             candidate.tick_value, risk_pct_override=candidate.risk_pct,
@@ -702,6 +725,10 @@ class ExecutionService:
         if ticket is None:
             logger.error("Trade placement failed for %s", symbol)
             return None
+
+        # WS2: record this signal fingerprint as executed so it can never be
+        # re-executed (survives restarts via runtime-state persistence).
+        self._executed_signals[fp] = signal.created_at.isoformat()
 
         trade.mt5_ticket      = ticket
         trade.status          = TradeStatus.OPEN
@@ -1232,6 +1259,9 @@ class ExecutionService:
             "loss_streak":  streaks,
             "streak_pause": pauses,
             "zone_last_tap": zone_taps,
+            # WS2: executed-signal dedup ledger — survives restart so a signal
+            # already traded before a crash cannot re-execute afterwards.
+            "executed_signals": dict(self._executed_signals),
         }
 
     def load_runtime_state(self, data: dict) -> None:
@@ -1318,8 +1348,46 @@ class ExecutionService:
                 self._zone_last_tap[zone_id] = int(bar_epoch)
             except Exception:
                 pass
+        # WS2: restore executed-signal dedup ledger so a signal traded before a
+        # restart cannot re-execute afterwards.
+        for fp, iso in data.get("executed_signals", {}).items():
+            self._executed_signals[str(fp)] = str(iso)
+        if self._executed_signals:
+            logger.info("Restored %d executed-signal fingerprint(s) from checkpoint.",
+                        len(self._executed_signals))
         if self._trade_states:
             logger.info("Loaded %d open trade state(s) from checkpoint.", len(self._trade_states))
+
+    def _signal_fingerprint(self, candidate: "EntryCandidate") -> str:
+        """WS2: durable identity for a logical signal, built from STABLE fields
+        only. Excludes zone.id (regenerates on every H1 remap) and volume_ratio
+        (drifts within one setup as the rolling volume average advances) — both
+        proven in the Jul-13 cascade forensics. Two evaluations of the same
+        displacement/zone/entry produce the SAME fingerprint; a genuinely new
+        setup (different displacement time, zone anchor, or entry) produces a
+        different one."""
+        s = candidate.signal
+        z = s.zone
+        entry = round(s.entry_price, candidate.digits)
+        zc = z.created_at.isoformat() if getattr(z, "created_at", None) else "?"
+        return (f"{candidate.symbol}|{s.direction.value}|{s.signal_type.value}|"
+                f"{entry}|{s.created_at.isoformat()}|{zc}")
+
+    def _evict_stale_signals(self) -> None:
+        """WS2: drop executed-signal fingerprints whose signal is older than the
+        existing MAX_SIGNAL_AGE window (past which it can no longer fire anyway),
+        keeping the ledger bounded. Reuses config.MAX_SIGNAL_AGE_M5_BARS — no new
+        tunable introduced."""
+        try:
+            max_bars = getattr(config, "MAX_SIGNAL_AGE_M5_BARS", 12)
+            horizon = timedelta(minutes=5 * max_bars * 4)  # generous multiple; hygiene only
+            now = self._now()
+            stale = [fp for fp, iso in self._executed_signals.items()
+                     if (now - datetime.fromisoformat(iso)) > horizon]
+            for fp in stale:
+                del self._executed_signals[fp]
+        except Exception as exc:
+            logger.debug("evict_stale_signals skipped: %s", exc)
 
     def _journal_close(self, ticket: int, pips: float, outcome: str) -> None:
         if self._journal:
