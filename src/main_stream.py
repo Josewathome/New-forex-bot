@@ -568,7 +568,10 @@ def _run_entry_evaluation(execution: ExecutionService, now: datetime) -> None:
         # Without this cap, the same still-valid signal on the next M1 close could open
         # a second, unproven position on top of the first (this doubled a losing AUDUSD
         # signal into two identical trades on 2026-06-30).
-        if execution.open_count_for_symbol(candidate.symbol) >= 1:
+        # WS3: entries_used_for_symbol counts open + closed-this-H1-bar, so a trade
+        # that opened and instantly closed this bar still consumes the slot — this
+        # is what stops the Jul-13 instant-close re-entry cascade (37 entries/bar).
+        if execution.entries_used_for_symbol(candidate.symbol) >= 1:
             continue
         try:
             trade = execution.execute_entry_candidate(candidate)
@@ -591,7 +594,7 @@ def _run_entry_evaluation(execution: ExecutionService, now: datetime) -> None:
     p2_candidates = []
 
     for sym in config.SYMBOLS:
-        if execution.open_count_for_symbol(sym) >= p2_cap:
+        if execution.entries_used_for_symbol(sym) >= p2_cap:   # WS3: open + closed-this-bar
             continue
         if not execution.has_tp1_hit_for_symbol(sym):
             continue
@@ -607,7 +610,7 @@ def _run_entry_evaluation(execution: ExecutionService, now: datetime) -> None:
     for candidate in p2_candidates:
         if len(execution._tr.get_open_positions()) >= config.MAX_OPEN_TRADES:
             break
-        if execution.open_count_for_symbol(candidate.symbol) >= p2_cap:
+        if execution.entries_used_for_symbol(candidate.symbol) >= p2_cap:   # WS3
             continue
         try:
             trade = execution.execute_entry_candidate(candidate)

@@ -170,6 +170,13 @@ class ExecutionService:
         # restarts. Entries older than the existing MAX_SIGNAL_AGE window are
         # evicted (a signal that old can no longer fire anyway).
         self._executed_signals: Dict[str, str] = {}
+        # WS3 — cap bypass protection: per-symbol list of close-time epochs. The
+        # position caps counted only OPEN positions, so instant TP1 closes (a
+        # market fill already past TP1) freed the slot each minute and let the
+        # Jul-13 signal re-enter 37×. Counting recently-closed trades WITHIN the
+        # current H1 bar toward the cap closes that loophole. Uses the H1 bar
+        # boundary — no new duration tunable. Persisted across restarts.
+        self._closed_this_bar: Dict[str, list] = {}
         # Gap-recovery controls:
         #   _replay_mode     — when True, collect_entry_candidate() is a no-op.
         #                      Used by GapRecoveryService to replay historical candles
@@ -267,6 +274,17 @@ class ExecutionService:
 
     def open_count_for_symbol(self, symbol: str) -> int:
         return sum(1 for p in self._tr.get_open_positions() if p.symbol == symbol)
+
+    def entries_used_for_symbol(self, symbol: str) -> int:
+        """WS3: entries a symbol has consumed in the CURRENT H1 bar = currently
+        open positions + trades already closed this bar. Counting recent closes
+        prevents the rapid open→instant-close→reopen loop that bypassed the
+        open-only caps during the Jul-13 cascade. Bounded to the current H1 bar
+        (no new tunable)."""
+        cur_bar = int(self._now().timestamp()) // 3600 * 3600
+        recent = [t for t in self._closed_this_bar.get(symbol, []) if t >= cur_bar]
+        self._closed_this_bar[symbol] = recent  # prune older bars
+        return self.open_count_for_symbol(symbol) + len(recent)
 
     def has_tp1_hit_for_symbol(self, symbol: str) -> bool:
         """True when at least one open trade on symbol has hit TP1 (proven winner)."""
@@ -787,7 +805,8 @@ class ExecutionService:
         self.run_monitoring_only(symbol)
         if len(self._tr.get_open_positions()) >= config.MAX_OPEN_TRADES:
             return None
-        if self.open_count_for_symbol(symbol) >= getattr(config, "MAX_TRADES_PER_SYMBOL", 2):
+        # WS3: count open + closed-this-H1-bar so instant closes can't free the slot.
+        if self.entries_used_for_symbol(symbol) >= getattr(config, "MAX_TRADES_PER_SYMBOL", 2):
             return None
         candidate = self.collect_entry_candidate(symbol)
         if candidate is None:
@@ -1102,7 +1121,7 @@ class ExecutionService:
                     else:
                         _outcome = "MONITOR_CLOSE"
                     # Broker truth: journal actual net P&L + broker-sign win/loss.
-                    self._broker_close(ticket, _outcome, total_pips)
+                    self._broker_close(ticket, _outcome, total_pips, symbol=symbol)
                     self._update_streak(symbol, total_pips)
                     del self._trade_states[ticket]
 
@@ -1180,7 +1199,7 @@ class ExecutionService:
             )
             # Broker truth: journal actual net P&L + broker-sign win/loss
             # (replaces the signal-geometry pips estimate above).
-            self._broker_close(t, _outcome, total_pips)
+            self._broker_close(t, _outcome, total_pips, symbol=state.symbol)
             self._update_streak(state.symbol, total_pips)
             del self._trade_states[t]
 
@@ -1262,6 +1281,9 @@ class ExecutionService:
             # WS2: executed-signal dedup ledger — survives restart so a signal
             # already traded before a crash cannot re-execute afterwards.
             "executed_signals": dict(self._executed_signals),
+            # WS3: per-symbol recent-close times so cap accounting survives a
+            # restart mid-H1-bar and instant-close re-entry stays blocked.
+            "closed_this_bar": {k: list(v) for k, v in self._closed_this_bar.items()},
         }
 
     def load_runtime_state(self, data: dict) -> None:
@@ -1355,6 +1377,12 @@ class ExecutionService:
         if self._executed_signals:
             logger.info("Restored %d executed-signal fingerprint(s) from checkpoint.",
                         len(self._executed_signals))
+        # WS3: restore per-symbol recent-close times for cap accounting.
+        for sym, times in data.get("closed_this_bar", {}).items():
+            try:
+                self._closed_this_bar[str(sym)] = [int(t) for t in times]
+            except Exception:
+                pass
         if self._trade_states:
             logger.info("Loaded %d open trade state(s) from checkpoint.", len(self._trade_states))
 
@@ -1396,7 +1424,8 @@ class ExecutionService:
             except Exception as exc:
                 logger.warning("Journal record_close failed ticket=%s: %s", ticket, exc)
 
-    def _broker_close(self, ticket: int, semantic_outcome: str, fallback_pips: float) -> None:
+    def _broker_close(self, ticket: int, semantic_outcome: str, fallback_pips: float,
+                      symbol: Optional[str] = None) -> None:
         """Journal a closed trade using BROKER TRUTH (net profit incl.
         commission+swap, and win/loss by the broker's actual net sign) instead of
         signal-price geometry.  ``semantic_outcome`` is the TP-based label
@@ -1404,6 +1433,11 @@ class ExecutionService:
         agrees the trade was net-positive, otherwise the outcome is recorded as
         LOSS so win-rate statistics reflect reality.  Falls back to the pips
         estimate only when MT5 has no deal history for the position (logged)."""
+        # WS3: record the close against the current H1 bar so entries_used_for_
+        # symbol() counts it toward the per-symbol cap (prevents instant-close
+        # re-entry loops).
+        if symbol:
+            self._closed_this_bar.setdefault(symbol, []).append(int(self._now().timestamp()))
         res = None
         try:
             res = self._tr.get_position_result(ticket)
