@@ -76,6 +76,12 @@ src/application/strategy_v2/
                        entry_confirmation.py), time exit, emergency exit.
                        Pure decision functions only -- no MT5/execution_
                        service wiring (that's the final bot-assembly step).
+  monitoring.py        Statistics/reporting over TradeJournal's existing
+                       record shape: profit factor, expectancy in R,
+                       Sharpe (raw + explicit annualization), recovery
+                       factor, equity curve, monthly returns, trade
+                       duration, daily/weekly report bundling. Reused
+                       unmodified for the final strategy evaluation.
 
 tools/validate_structure_engine.py   Structure regression suite (33 assertions)
 tools/replay_structure_engine.py     8-scenario continuous structure replay
@@ -92,7 +98,15 @@ tools/validate_trade_decision.py     Trade Decision Engine regression suite (18 
 tools/validate_risk_management.py    Risk Management regression suite (18 assertions)
 tools/validate_mt5_pending_orders.py MT5 Execution (pending orders) regression suite (20 assertions)
 tools/validate_trade_management.py   Trade Management regression suite (33 assertions)
+tools/validate_monitoring.py         Monitoring regression suite (26 assertions)
 ```
+
+All 9 planned strategy_v2 modules (Liquidity Sweep, Premium/Discount, POI
+Manager, Entry Confirmation, Trade Decision Engine, Risk Management, MT5
+Execution, Trade Management, Monitoring) are now built and validated. The
+remaining work is final bot assembly (wiring these modules together into
+`main_stream.py`'s live loop, replacing the old strategy's signal-
+generation call) and the complete-system evaluation.
 
 ## MT5 Execution (Module 7)
 
