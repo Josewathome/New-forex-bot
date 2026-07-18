@@ -103,10 +103,14 @@ tools/validate_monitoring.py         Monitoring regression suite (26 assertions)
 
 All 9 planned strategy_v2 modules (Liquidity Sweep, Premium/Discount, POI
 Manager, Entry Confirmation, Trade Decision Engine, Risk Management, MT5
-Execution, Trade Management, Monitoring) are now built and validated. The
-remaining work is final bot assembly (wiring these modules together into
-`main_stream.py`'s live loop, replacing the old strategy's signal-
-generation call) and the complete-system evaluation.
+Execution, Trade Management, Monitoring) are built, validated, and wired
+together (`tools/backtest_strategy_v2.py`). **Final verdict: NOT READY —
+see `STRATEGY_V2_FINAL_EVALUATION.md`.** The complete system produced
+zero trades across the full real ~10-month M1 window (all 4 symbols) —
+a specification/threshold problem in Entry Confirmation and Trade
+Decision Engine's confluence requirements, not a defect in any module.
+Wiring into `main_stream.py`'s live loop was not done, pending a decision
+on redesigning those thresholds.
 
 ## MT5 Execution (Module 7)
 
