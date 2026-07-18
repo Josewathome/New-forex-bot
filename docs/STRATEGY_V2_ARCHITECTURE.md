@@ -56,6 +56,12 @@ src/application/strategy_v2/
                        -> SL/TP -> RR>=MIN_RR filter. Reuses the frozen
                        StructureEngine unmodified on M1 candles for local
                        structure confirmation (see invariant #13 below).
+  trade_decision.py    Qualifies an EntrySignal into an executable trade:
+                       direction filtering (one trade/symbol), portfolio-
+                       level risk limits, session window, news validation
+                       (via a generic callable -- see NewsManager below).
+                       Returns an explicit RejectionReason on the first
+                       failing gate, never silently drops a candidate.
 
 tools/validate_structure_engine.py   Structure regression suite (33 assertions)
 tools/replay_structure_engine.py     8-scenario continuous structure replay
@@ -68,6 +74,7 @@ tools/validate_liquidity.py          Liquidity Sweep regression suite (51 assert
 tools/validate_premium_discount.py   Premium/Discount regression suite (31 assertions)
 tools/validate_poi_manager.py        POI Manager regression suite (24 assertions)
 tools/validate_entry_confirmation.py Entry Confirmation regression suite (33 assertions)
+tools/validate_trade_decision.py     Trade Decision Engine regression suite (18 assertions)
 ```
 
 ## Data flow (as built so far)
@@ -127,10 +134,15 @@ Independently, per symbol:
                   surface the future POI Manager will use.
 ```
 
-Liquidity Sweep, Premium/Discount, POI assembly, and Entry Confirmation
-are now built (see the module list above). Trade Decision Engine, Risk
+Liquidity Sweep, Premium/Discount, POI assembly, Entry Confirmation, and
+Trade Decision Engine are now built (see the module list above). Risk
 Management, MT5 Execution, Trade Management, and Monitoring are not yet
 built — see the phased plan tracked in this session.
+
+`trade_decision.py` reuses the existing framework-level `NewsManager`
+(`src/application/news_manager.py`, already built, untouched) for news
+validation via its `is_blocked(symbol, now)` method, passed in as a plain
+callable — no news infrastructure was rebuilt.
 
 Real M1/M15 data (in addition to the existing 13-month H1 dataset) was
 pulled from the live IC Markets Raw demo account for XAUUSD/EURUSD/
