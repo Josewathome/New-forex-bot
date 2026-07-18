@@ -43,6 +43,89 @@ check("structure.py does not import swing_diagnostics anywhere",
       not any("swing_diagnostics" in m for m in imported_modules),
       f"structure.py imports: {sorted(imported_modules)}")
 
+print(); print("="*78); print("SECTION 1B — STATIC PROOF: NO FUNCTION REACHABLE FROM"); print("compute_swing_metadata() CAN MUTATE ITS PARAMETERS"); print("="*78)
+# Stronger than "no import edge" alone: proves diagnostics is architecturally
+# incapable of writing back into engine state, not merely undialed today.
+# Covers every branch (not just ones the real dataset happens to exercise).
+
+MUTATING_METHODS = {
+    "append", "extend", "insert", "remove", "pop", "clear", "sort", "reverse",
+    "update", "popitem", "setdefault", "add", "discard", "__setitem__",
+    "__delitem__", "__iadd__",
+}
+
+def _root_name(node):
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+def analyze_function_no_mutation(func_node):
+    violations = []
+    params = {a.arg for a in func_node.args.args} | {a.arg for a in func_node.args.kwonlyargs}
+    tainted = set(params)
+
+    class Visitor(ast.NodeVisitor):
+        def visit_Global(self, node):
+            violations.append(f"global statement in {func_node.name}: {node.names}")
+        def visit_Nonlocal(self, node):
+            violations.append(f"nonlocal statement in {func_node.name}: {node.names}")
+        def visit_Assign(self, node):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    root = _root_name(node.value) if isinstance(node.value, (ast.Attribute, ast.Subscript)) else (
+                        node.value.id if isinstance(node.value, ast.Name) else None)
+                    if root in tainted:
+                        tainted.add(target.id)
+                elif isinstance(target, (ast.Attribute, ast.Subscript)):
+                    base = _root_name(target)
+                    if base in tainted:
+                        violations.append(f"assignment into tainted '{base}' in {func_node.name}")
+            self.generic_visit(node)
+        def visit_AugAssign(self, node):
+            if isinstance(node.target, (ast.Attribute, ast.Subscript)) and _root_name(node.target) in tainted:
+                violations.append(f"augmented assign into tainted name in {func_node.name}")
+            self.generic_visit(node)
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Attribute):
+                base = _root_name(node.func.value)
+                if node.func.attr in MUTATING_METHODS and base in tainted:
+                    violations.append(f"mutating call '.{node.func.attr}()' on tainted name '{base}' in {func_node.name}")
+            self.generic_visit(node)
+
+    Visitor().visit(func_node)
+    return violations
+
+sd_tree = ast.parse(open("src/application/strategy_v2/swing_diagnostics.py").read())
+sd_module_mutables = [t.id for node in sd_tree.body if isinstance(node, ast.Assign) for t in node.targets
+                       if isinstance(t, ast.Name) and isinstance(node.value, (ast.List, ast.Dict, ast.Set, ast.ListComp, ast.DictComp, ast.SetComp))]
+check("swing_diagnostics.py has no module-level mutable state (no cache/memo dict)",
+      len(sd_module_mutables) == 0, f"found: {sd_module_mutables}")
+
+sd_violations, sd_funcs_checked = [], []
+for node in ast.walk(sd_tree):
+    if isinstance(node, ast.FunctionDef):
+        sd_funcs_checked.append(node.name)
+        sd_violations.extend(analyze_function_no_mutation(node))
+check(f"swing_diagnostics.py: no parameter-mutation in any of its {len(sd_funcs_checked)} functions ({sorted(sd_funcs_checked)})",
+      len(sd_violations) == 0, f"violations: {sd_violations}")
+
+# The three external functions diagnostics calls into must also be pure --
+# its read-only-ness depends on their purity too.
+for path, fn_name in [
+    ("src/application/strategy_v2/atr.py", "is_displacement"),
+    ("src/application/strategy_v2/fvg.py", "detect_fvg"),
+    ("src/application/strategy_v2/order_blocks.py", "detect_order_block"),
+]:
+    tree = ast.parse(open(path).read())
+    found = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == fn_name]
+    violations = analyze_function_no_mutation(found[0]) if found else ["function not found"]
+    check(f"{fn_name} ({path}, called by diagnostics) has no parameter-mutation",
+          len(found) == 1 and len(violations) == 0, f"violations: {violations}")
+
+mutator_refs = [name for name in ("update_fvg_state", "update_ob_state") if name in open("src/application/strategy_v2/swing_diagnostics.py").read()]
+check("swing_diagnostics.py never references the mutator functions (update_fvg_state/update_ob_state) at all",
+      len(mutator_refs) == 0, f"found references to: {mutator_refs}")
+
 print(); print("="*78); print("SECTION 2 — OPTIONAL CALL HAS ZERO EFFECT ON BOS/CHoCH"); print("="*78)
 
 # Reuse the same 75-candle scenario from replay_structure_engine.py.

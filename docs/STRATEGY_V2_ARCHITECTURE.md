@@ -1,5 +1,12 @@
 # strategy_v2 — Architecture & Engineering Invariants
 
+**PHASE 2 STATUS: FROZEN** (Structure Engine, FVG, Order Blocks, shared
+`numerics.py`, diagnostics layer) — see `STRATEGY_V2_PHASE2_FREEZE_AUDIT.md`
+for the property-based equivalence, read-only, and deterministic-hash
+proofs backing this. Locked design decisions below (D1–D6) and proven
+invariants must not be redesigned or re-litigated without new, concrete
+evidence of an actual bug.
+
 This document describes the new SMC signal-generation engine that replaces the
 archived `legacy/application/{analysis,trade_monitor,backtester}.py` in full.
 It is the permanent reference for module boundaries, locked design decisions,
@@ -36,7 +43,9 @@ tools/validate_structure_engine.py   Structure regression suite (33 assertions)
 tools/replay_structure_engine.py     8-scenario continuous structure replay
 tools/validate_fvg.py                FVG regression suite (20 assertions)
 tools/validate_order_blocks.py       Order Block regression suite (20 assertions)
-tools/validate_swing_diagnostics.py  Diagnostics decoupling + well-formedness
+tools/validate_numerics.py           numerics.py regression suite (20 assertions)
+tools/validate_swing_diagnostics.py  Diagnostics decoupling, static no-mutation
+                                      proof, and well-formedness
 ```
 
 ## Data flow (as built so far)
