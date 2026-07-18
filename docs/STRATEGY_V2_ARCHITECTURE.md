@@ -62,6 +62,12 @@ src/application/strategy_v2/
                        (via a generic callable -- see NewsManager below).
                        Returns an explicit RejectionReason on the first
                        failing gate, never silently drops a candidate.
+  risk_management.py   Position sizing (delegates to the existing
+                       RiskParameters.lot_size), fixed risk % selection,
+                       correlated-exposure limiting (shared currency legs),
+                       spread filter (delegates to NewsManager.
+                       broker_cost_exceeds_atr), slippage acceptance +
+                       realized-risk recomputation.
 
 tools/validate_structure_engine.py   Structure regression suite (33 assertions)
 tools/replay_structure_engine.py     8-scenario continuous structure replay
@@ -75,6 +81,7 @@ tools/validate_premium_discount.py   Premium/Discount regression suite (31 asser
 tools/validate_poi_manager.py        POI Manager regression suite (24 assertions)
 tools/validate_entry_confirmation.py Entry Confirmation regression suite (33 assertions)
 tools/validate_trade_decision.py     Trade Decision Engine regression suite (18 assertions)
+tools/validate_risk_management.py    Risk Management regression suite (18 assertions)
 ```
 
 ## Data flow (as built so far)
@@ -134,15 +141,19 @@ Independently, per symbol:
                   surface the future POI Manager will use.
 ```
 
-Liquidity Sweep, Premium/Discount, POI assembly, Entry Confirmation, and
-Trade Decision Engine are now built (see the module list above). Risk
-Management, MT5 Execution, Trade Management, and Monitoring are not yet
+Liquidity Sweep, Premium/Discount, POI assembly, Entry Confirmation,
+Trade Decision Engine, and Risk Management are now built (see the module
+list above). MT5 Execution, Trade Management, and Monitoring are not yet
 built — see the phased plan tracked in this session.
 
 `trade_decision.py` reuses the existing framework-level `NewsManager`
 (`src/application/news_manager.py`, already built, untouched) for news
 validation via its `is_blocked(symbol, now)` method, passed in as a plain
-callable — no news infrastructure was rebuilt.
+callable — no news infrastructure was rebuilt. `risk_management.py`
+similarly reuses `RiskParameters.lot_size`/`PipCalculator`/`BrokerCost`
+(`src/domain/value_objects.py`, already built, untouched) and
+`NewsManager.broker_cost_exceeds_atr` for the spread filter — no
+position-sizing or cost-vs-ATR formula was rebuilt.
 
 Real M1/M15 data (in addition to the existing 13-month H1 dataset) was
 pulled from the live IC Markets Raw demo account for XAUUSD/EURUSD/

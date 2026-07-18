@@ -91,3 +91,9 @@ RUNNER_BE_BUFFER_PIPS = 0.5
 
 # ── Re-entry (§22) ──
 MAX_REENTRIES = 1
+
+# ── Correlated exposure (Risk Management module) ──
+# Max simultaneous open trades sharing a common currency leg (e.g. EURUSD +
+# GBPUSD both carry USD exposure) -- not in the original numbered spec;
+# a conservative, documented risk-management decision (see risk_management.py).
+MAX_TRADES_PER_CURRENCY = 2
