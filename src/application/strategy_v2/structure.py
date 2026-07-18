@@ -67,6 +67,45 @@
 #   D6 (locked). A continuation BOS in an already-active trend rolls the
 #       active External Swing Pair forward to the newest pair (recommended
 #       and confirmed) rather than keeping the original pair frozen.
+#
+# STATUS: LOCKED (2026-07-19). D2's "most recent confirmed opposite swing"
+# rule is final. Two alternative selection rules were researched on the
+# real 13-month H1 dataset (XAUUSD/EURUSD/GBPUSD/USDJPY) and REJECTED —
+# recorded here so this isn't re-litigated without new evidence:
+#
+#   REJECTED 1 — largest-displacement selection. Replacing "most recent"
+#     with "largest displacement in the whole candidate pool" collapsed
+#     BOS/CHoCH frequency 3-10x and inflated average trend duration to
+#     absurd levels (EURUSD: 1,322 bars ~ 55 days for one "trend"; XAUUSD
+#     avg Fib width 681 -> 5,865 pips). Locks onto rare historical extremes
+#     and stops resetting. Disqualified outright.
+#
+#   REJECTED 2 — equal-highs/lows bounded tie-break. A retrospective
+#     significance study (6-component score: BOS-generation, CHoCH-
+#     reference, liquidity sweep, displacement, equal-highs/lows,
+#     +-20-bar prominence) found D2 matches the best-scoring candidate in
+#     a bounded 15-swing window 46.4% of the time. Sampling 100 real BOS
+#     events, 29 showed a "better" alternative by that score -- but 3 of
+#     the 6 components are look-ahead (BOS-generation, CHoCH-reference,
+#     +-20-bar prominence require future bars and can't inform a live
+#     rule). Stripping those out: only 12/29 genuinely differ using
+#     real-time-only signals, 4/29 actually favor D2 once look-ahead is
+#     removed, and 13/29 are ties with no observable signal either way.
+#     Of the 12 genuine cases, equal-highs/lows was the dominant pattern
+#     (9/12). Built the smallest bounded tie-break (prefer the most recent
+#     of the last 3 same-kind candidates with an equal-level nearby, else
+#     D2 default) and replayed it across the full dataset: BOS/CHoCH
+#     counts stayed stable (no blow-up), but generating-member prominence
+#     -- the metric the whole exercise was meant to improve -- got
+#     slightly WORSE, not better (+-10 bars: 41.6% -> 39.9%; +-20: 20.5%
+#     -> 17.6%; +-50: 6.5% -> 4.2%). Equal-highs/lows likely marks a
+#     retested, congested price zone rather than a decisively-held
+#     extreme; the retrospective pattern did not survive an honest,
+#     non-look-ahead replay. Rejected.
+#
+# No further swing-selection research is planned. Effort moves to FVG,
+# Order Block, liquidity sweep, Premium/Discount, and entry-confirmation,
+# where the actual trading edge is more likely to emerge.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
