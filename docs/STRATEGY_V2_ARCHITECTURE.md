@@ -38,6 +38,10 @@ src/application/strategy_v2/
                        mitigation, invalidation, OB+FVG confluence.
   swing_diagnostics.py OPTIONAL, decoupled diagnostics layer. NOT imported
                        by any of the above. See "Diagnostics layer" below.
+  liquidity.py         Liquidity Sweep detection: Asian range, previous-day,
+                       and equal-high/low resting levels; sweep confirmation
+                       (stop-hunt-then-reverse) vs. invalidation (breakout).
+                       Not yet consumed by anything (POI Manager is next).
 
 tools/validate_structure_engine.py   Structure regression suite (33 assertions)
 tools/replay_structure_engine.py     8-scenario continuous structure replay
@@ -46,6 +50,7 @@ tools/validate_order_blocks.py       Order Block regression suite (20 assertions
 tools/validate_numerics.py           numerics.py regression suite (20 assertions)
 tools/validate_swing_diagnostics.py  Diagnostics decoupling, static no-mutation
                                       proof, and well-formedness
+tools/validate_liquidity.py          Liquidity Sweep regression suite (51 assertions)
 ```
 
 ## Data flow (as built so far)
@@ -76,6 +81,20 @@ Independently, per 3-candle window (c1, c2, c3):
 order_blocks.ob_fvg_confluence(ob, fvg) — inclusive overlap, tags
   'positive_width' vs 'boundary_touch', feeds the future POI-priority /
   Entry-Zone-intersection logic (not yet built).
+
+Independently, per symbol:
+      liquidity.detect_asia_levels / detect_prev_day_levels (per-candle scan)
+      liquidity.detect_equal_level (called once per confirmed swing, same
+             calling convention as compute_swing_metadata — reads
+             StructureEngine.swing_log, writes nothing back to it)
+             │
+             ▼
+      LiquidityLevel (ASIA_HIGH/LOW, PREV_DAY_HIGH/LOW, EQUAL_HIGH/LOW)
+             │
+             └──► liquidity.update_sweep_state tracks sweep/reaction
+                  forward, one-way, mirroring fvg/order_blocks lifecycle
+                  tracking. active_unswept_levels() is the pool-query
+                  surface the future POI Manager will use.
 ```
 
 Liquidity Sweep, Premium/Discount, POI assembly, Entry Confirmation, and
@@ -148,6 +167,17 @@ fixtures:
    lifecycle tracking.** Every function operates only on data through the
    current candle (or, for swing confirmation specifically, the same
    3-bar-forward window the rule itself requires — never beyond it).
+10. **A liquidity level's `swept` flag is one-way**, same as FVG/OB
+    mitigation — confirmed with zero counter-examples across 5,697 real
+    liquidity levels (all 4 symbols, 13 months). Its `reaction`
+    classification (`confirmed_reversal` vs. `breakout`) is recorded once,
+    at the first qualifying candle only, and never changes afterward.
+11. **Equal-high/low liquidity levels are an independent concept from the
+    rejected equal-hl swing-selection tie-break** (`STRATEGY_V2_REJECTED_
+    RESEARCH.md` #4) — `liquidity.detect_equal_level` marks a resting-
+    liquidity target for a future POI/entry layer; it has zero effect on
+    which swing the structure engine selects, zero import coupling into
+    `structure.py`, and is never used as a filter.
 
 ## Diagnostics layer (swing_diagnostics.py)
 

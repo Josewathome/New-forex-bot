@@ -103,3 +103,4 @@ class LiquidityLevel:
     swept: bool = False
     swept_at: Optional[datetime] = None
     sweep_penetration: float = 0.0                      # price distance beyond the level at sweep time
+    reaction: Optional[str] = None                      # "confirmed_reversal" | "breakout", set at first sweep only
