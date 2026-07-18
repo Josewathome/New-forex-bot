@@ -366,6 +366,117 @@ class MT5Gateway:
             "volume":  float(result.volume),
         }
 
+    # ── Pending orders (strategy_v2 Module 7 — MT5 Execution) ───────
+    #
+    # Additive only: place_order/close_position/partial_close_position/
+    # modify_position above are untouched. New capability for strategy_v2's
+    # pending-limit entry model (order placed at signal time, filled only
+    # if price actually trades to the level within its max age, else
+    # cancelled) -- the old strategy only ever used market orders
+    # (TRADE_ACTION_DEAL), so no pending-order support existed before this.
+    #
+    # RETRYABLE_RETCODES: transient/server-side conditions worth a retry
+    # (requote, price moved, timeout, connection). Deliberately excludes
+    # permanent rejections (e.g. no money, invalid volume, market closed) --
+    # retrying those would just fail identically and waste the retry budget.
+
+    def _retryable_retcode(self, retcode: int) -> bool:
+        retryable = {
+            getattr(mt5, "TRADE_RETCODE_REQUOTE", 10004),
+            getattr(mt5, "TRADE_RETCODE_PRICE_CHANGED", 10020),
+            getattr(mt5, "TRADE_RETCODE_TIMEOUT", 10008),
+            getattr(mt5, "TRADE_RETCODE_CONNECTION", 10031),
+            getattr(mt5, "TRADE_RETCODE_PRICE_OFF", 10021),
+        }
+        return retcode in retryable
+
+    def place_pending_order(
+        self, order: Dict[str, Any], retries: int = 3, retry_delay: float = 1.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Places a BUY_LIMIT/SELL_LIMIT pending order (TRADE_ACTION_PENDING).
+        `order` must supply: symbol, type ("BUY"|"SELL"), volume, price, sl,
+        tp, expiration (a UTC epoch-seconds int for ORDER_TIME_SPECIFIED).
+        Retries only on transient/retryable retcodes -- a permanent
+        rejection (e.g. no money) fails immediately without wasting retries."""
+        if not self._ensure_ready():
+            return None
+        order_type = mt5.ORDER_TYPE_BUY_LIMIT if order["type"] == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
+        request = {
+            "action":       mt5.TRADE_ACTION_PENDING,
+            "symbol":       str(order["symbol"]),
+            "volume":       float(order["volume"]),
+            "type":         order_type,
+            "price":        float(order["price"]),
+            "sl":           float(order["sl"]),
+            "tp":           float(order["tp"]),
+            "type_time":    mt5.ORDER_TIME_SPECIFIED,
+            "expiration":   int(order["expiration"]),
+            "deviation":    int(order.get("deviation", 20)),
+            "magic":        int(order.get("magic", 202400)),
+            "comment":      str(order.get("comment", "ZoneBot Pending")),
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        last_result = None
+        for attempt in range(1, retries + 1):
+            result = mt5.order_send(request)
+            last_result = result
+            if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
+                return {
+                    "ticket":     int(result.order),
+                    "retcode":    int(result.retcode),
+                    "price":      float(request["price"]),
+                    "volume":     float(request["volume"]),
+                    "expiration": int(request["expiration"]),
+                }
+            retcode = result.retcode if result is not None else None
+            if retcode is None or not self._retryable_retcode(retcode):
+                logger.error("place_pending_order failed (non-retryable): retcode=%s request=%s", retcode, request)
+                return None
+            logger.warning("place_pending_order retryable failure (attempt %d/%d): retcode=%s", attempt, retries, retcode)
+            if attempt < retries:
+                time.sleep(retry_delay)
+        logger.error("place_pending_order exhausted retries: last_result=%s request=%s", last_result, request)
+        return None
+
+    def poll_pending_orders(self, symbol: Optional[str] = None, magic: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Returns currently still-working pending orders (not yet filled or
+        cancelled/expired -- mt5.orders_get() only ever returns orders still
+        on the book). Optionally filtered by symbol and/or magic number."""
+        if not self._ensure_ready():
+            return []
+        orders = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
+        if not orders:
+            return []
+        out = []
+        for o in orders:
+            if magic is not None and o.magic != magic:
+                continue
+            out.append({
+                "ticket":     int(o.ticket),
+                "symbol":     o.symbol,
+                "type":       "BUY" if o.type == mt5.ORDER_TYPE_BUY_LIMIT else "SELL",
+                "price_open": float(o.price_open),
+                "sl":         float(o.sl),
+                "tp":         float(o.tp),
+                "volume":     float(o.volume_current),
+                "time_setup": int(o.time_setup),
+                "expiration": int(o.time_expiration),
+                "magic":      int(o.magic),
+            })
+        return out
+
+    def cancel_pending_order(self, ticket: int) -> Optional[Dict[str, Any]]:
+        """Cancels a still-working pending order (TRADE_ACTION_REMOVE) --
+        e.g. when its max-age window elapses before price reaches it."""
+        if not self._ensure_ready():
+            return None
+        request = {"action": mt5.TRADE_ACTION_REMOVE, "order": int(ticket)}
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            logger.error("cancel_pending_order failed ticket=%s: %s", ticket, result)
+            return None
+        return {"ticket": int(ticket), "retcode": int(result.retcode)}
+
     def close_position(self, ticket: int) -> Optional[Dict[str, Any]]:
         if not self._ensure_ready():
             return None

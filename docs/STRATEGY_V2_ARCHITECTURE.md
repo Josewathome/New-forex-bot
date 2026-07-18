@@ -82,7 +82,33 @@ tools/validate_poi_manager.py        POI Manager regression suite (24 assertions
 tools/validate_entry_confirmation.py Entry Confirmation regression suite (33 assertions)
 tools/validate_trade_decision.py     Trade Decision Engine regression suite (18 assertions)
 tools/validate_risk_management.py    Risk Management regression suite (18 assertions)
+tools/validate_mt5_pending_orders.py MT5 Execution (pending orders) regression suite (20 assertions)
 ```
+
+## MT5 Execution (Module 7)
+
+`src/infrastructure/mt5_bridge/mt5_gateway.py` gained three new, purely
+additive methods (nothing existing removed or modified — confirmed via
+`git diff` showing 111 insertions, 0 deletions): `place_pending_order`
+(TRADE_ACTION_PENDING, BUY_LIMIT/SELL_LIMIT, with retry logic that only
+retries transient/retryable retcodes — a permanent rejection like
+"no money" fails immediately rather than wasting the retry budget),
+`poll_pending_orders` (via `orders_get()`), and `cancel_pending_order`
+(TRADE_ACTION_REMOVE). Partial fills, modification, and close logic reuse
+the already-existing `partial_close_position`/`modify_position`/
+`close_position` — not rebuilt.
+
+Neither `MetaTrader5` nor `mt5linux` is importable on this development
+host (this code runs inside the Wine/MT5 container in production) — so,
+matching this repo's own established convention
+(`tools/validate_ws2_signal_dedup.py`), the new methods are validated by
+driving the real bound methods against a stubbed `self` and a fake `mt5`
+module object monkey-patched into the gateway module's namespace, rather
+than a live connection. No real order was placed against the live/demo
+account as part of this validation — actually submitting test orders
+would touch live account state and was treated as outside this build's
+authorization; the request-building and retry/response-handling logic is
+what's being proven here, and is fully exercised by the stub-based suite.
 
 ## Data flow (as built so far)
 
