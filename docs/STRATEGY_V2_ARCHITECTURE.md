@@ -46,6 +46,10 @@ src/application/strategy_v2/
                        External Swing Pair: equilibrium, Fib anchoring,
                        trend-aligned favorable zone. See invariant #12 below
                        re: pair.low/.high normalization.
+  poi_manager.py       Aggregates FVG/OB/Liquidity zones into per-symbol
+                       storage; evolves them forward via their own frozen
+                       update functions; CHoCH-driven expiry of same-
+                       direction FVG/OB zones (liquidity levels untouched).
 
 tools/validate_structure_engine.py   Structure regression suite (33 assertions)
 tools/replay_structure_engine.py     8-scenario continuous structure replay
@@ -56,6 +60,7 @@ tools/validate_swing_diagnostics.py  Diagnostics decoupling, static no-mutation
                                       proof, and well-formedness
 tools/validate_liquidity.py          Liquidity Sweep regression suite (51 assertions)
 tools/validate_premium_discount.py   Premium/Discount regression suite (31 assertions)
+tools/validate_poi_manager.py        POI Manager regression suite (24 assertions)
 ```
 
 ## Data flow (as built so far)
@@ -91,6 +96,14 @@ premium_discount.* reads StructureEngine.active_pair directly (read-only,
   same pattern as swing_diagnostics/liquidity) to classify prices/zones as
   premium, discount, or equilibrium, and to expose the trend-aligned
   favorable half for the future POI Manager / Entry Confirmation.
+
+poi_manager.POIManager composes fvg.py/order_blocks.py/liquidity.py's
+  detected zones into one per-symbol store: add_fvg/add_ob/add_liquidity
+  on detection, update(candle) once per bar to evolve every stored zone
+  forward via its own existing mitigation/invalidation/sweep function,
+  on_choch(invalidated_trend) to expire same-direction FVG/OB zones when
+  StructureEvent.choch_fired. active_fvgs()/active_obs()/active_liquidity()
+  are the query surface the future Entry Confirmation layer will use.
 
 Independently, per symbol:
       liquidity.detect_asia_levels / detect_prev_day_levels (per-candle scan)
