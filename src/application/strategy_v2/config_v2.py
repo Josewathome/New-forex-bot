@@ -97,3 +97,10 @@ MAX_REENTRIES = 1
 # GBPUSD both carry USD exposure) -- not in the original numbered spec;
 # a conservative, documented risk-management decision (see risk_management.py).
 MAX_TRADES_PER_CURRENCY = 2
+
+# ── Trade Management additions (beyond the locked R-multiple table above) ──
+# Not present in the original numbered spec material available to this
+# module -- conservative, documented decisions (see trade_management.py).
+RUNNER_TRAIL_ATR_MULTIPLIER = 1.5   # H1 ATR multiple used to trail the runner portion once past TP2
+MAX_TRADE_DURATION_HOURS = 72.0     # time-stop: close if still open this long (3 days, H1/M1 swing strategy)
+EMERGENCY_MAX_ADVERSE_R = 3.0       # close-at-market if price moves this many multiples of initial risk against the position

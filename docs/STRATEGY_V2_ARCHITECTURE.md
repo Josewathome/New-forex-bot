@@ -68,6 +68,14 @@ src/application/strategy_v2/
                        spread filter (delegates to NewsManager.
                        broker_cost_exceeds_atr), slippage acceptance +
                        realized-risk recomputation.
+  trade_management.py  Post-entry lifecycle: R-multiple exit ladder
+                       (breakeven/TP1/TP2 from the locked config_v2 table,
+                       generalized to an ordered list of steps), runner
+                       ATR trailing (one-way), opposite-CHoCH exit (reuses
+                       the local M1 StructureEngine concept from
+                       entry_confirmation.py), time exit, emergency exit.
+                       Pure decision functions only -- no MT5/execution_
+                       service wiring (that's the final bot-assembly step).
 
 tools/validate_structure_engine.py   Structure regression suite (33 assertions)
 tools/replay_structure_engine.py     8-scenario continuous structure replay
@@ -83,6 +91,7 @@ tools/validate_entry_confirmation.py Entry Confirmation regression suite (33 ass
 tools/validate_trade_decision.py     Trade Decision Engine regression suite (18 assertions)
 tools/validate_risk_management.py    Risk Management regression suite (18 assertions)
 tools/validate_mt5_pending_orders.py MT5 Execution (pending orders) regression suite (20 assertions)
+tools/validate_trade_management.py   Trade Management regression suite (33 assertions)
 ```
 
 ## MT5 Execution (Module 7)
