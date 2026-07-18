@@ -50,6 +50,12 @@ src/application/strategy_v2/
                        storage; evolves them forward via their own frozen
                        update functions; CHoCH-driven expiry of same-
                        direction FVG/OB zones (liquidity levels untouched).
+  entry_confirmation.py M1 entry sequence: sweep confirmation -> POI touch
+                       -> discount/premium validation -> local (M1)
+                       structure confirmation -> entry-candle confirmation
+                       -> SL/TP -> RR>=MIN_RR filter. Reuses the frozen
+                       StructureEngine unmodified on M1 candles for local
+                       structure confirmation (see invariant #13 below).
 
 tools/validate_structure_engine.py   Structure regression suite (33 assertions)
 tools/replay_structure_engine.py     8-scenario continuous structure replay
@@ -61,6 +67,7 @@ tools/validate_swing_diagnostics.py  Diagnostics decoupling, static no-mutation
 tools/validate_liquidity.py          Liquidity Sweep regression suite (51 assertions)
 tools/validate_premium_discount.py   Premium/Discount regression suite (31 assertions)
 tools/validate_poi_manager.py        POI Manager regression suite (24 assertions)
+tools/validate_entry_confirmation.py Entry Confirmation regression suite (33 assertions)
 ```
 
 ## Data flow (as built so far)
@@ -120,9 +127,17 @@ Independently, per symbol:
                   surface the future POI Manager will use.
 ```
 
-Liquidity Sweep, Premium/Discount, POI assembly, Entry Confirmation, and
-Strategy integration are **not yet built** — see the phased plan tracked
-in this session.
+Liquidity Sweep, Premium/Discount, POI assembly, and Entry Confirmation
+are now built (see the module list above). Trade Decision Engine, Risk
+Management, MT5 Execution, Trade Management, and Monitoring are not yet
+built — see the phased plan tracked in this session.
+
+Real M1/M15 data (in addition to the existing 13-month H1 dataset) was
+pulled from the live IC Markets Raw demo account for XAUUSD/EURUSD/
+GBPUSD/USDJPY to validate Entry Confirmation: M15 spans ~20 months
+(2024-11 to 2026-07), M1 spans ~10 months (2025-09 to 2026-07). AUDUSD and
+D1 bias data are still not pulled (Phase 1 from the original plan remains
+incomplete for those).
 
 ## Locked design decisions (D1–D6)
 
@@ -213,6 +228,28 @@ fixtures:
     ordered Fibonacci range (first: `premium_discount.py`) MUST normalize
     via `(min(low,high), max(low,high))`, never use `.low`/`.high` as
     range bounds directly.
+13. **StructureEngine is legitimately reusable, unmodified, on any
+    timeframe's candle stream** — it is already fully timeframe-generic
+    (only ever reads `Candle.time/open/high/low/close`; nothing is H1-
+    specific). `entry_confirmation.py` runs a second, independent instance
+    on M1 candles for local structure confirmation. Confirmed on real
+    data: 1.2M M1 bar-closes across all 4 symbols (~10 months), 0
+    trend-transition invariant violations — the same "trend only changes
+    via valid BOS/CHoCH" invariant proven on H1 holds identically on M1.
+14. **The full Entry Confirmation gate stack (sweep + POI touch +
+    favorable-zone + local-structure + displacement entry-candle + RR>=5)
+    is extremely selective by design** — confirmed on the same real M1
+    dataset: of 1.2M M1 bar-closes with an active pair and direction,
+    only 1 fully qualified entry signal was produced (funnel: 224,211 bars
+    had a matching-direction active POI -> 7,706 touched one -> 875 were
+    in the favorable premium/discount half -> 14 had a qualifying
+    displacement entry candle -> 1 cleared RR>=5). This matches the
+    original plan's disclosed-risk note verbatim ("RR>=5 + sweep + narrow
+    session windows is a tight funnel... expect low trade frequency...
+    may make reaching n>=100 slow") — it is an accepted, anticipated
+    property of the locked spec, not a defect. Carried forward as a power-
+    analysis fact for the Trade Decision Engine and final evaluation
+    phases, not something to loosen ad hoc.
 
 ## Diagnostics layer (swing_diagnostics.py)
 
