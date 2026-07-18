@@ -42,6 +42,10 @@ src/application/strategy_v2/
                        and equal-high/low resting levels; sweep confirmation
                        (stop-hunt-then-reverse) vs. invalidation (breakout).
                        Not yet consumed by anything (POI Manager is next).
+  premium_discount.py  Premium/Discount classification off the active
+                       External Swing Pair: equilibrium, Fib anchoring,
+                       trend-aligned favorable zone. See invariant #12 below
+                       re: pair.low/.high normalization.
 
 tools/validate_structure_engine.py   Structure regression suite (33 assertions)
 tools/replay_structure_engine.py     8-scenario continuous structure replay
@@ -51,6 +55,7 @@ tools/validate_numerics.py           numerics.py regression suite (20 assertions
 tools/validate_swing_diagnostics.py  Diagnostics decoupling, static no-mutation
                                       proof, and well-formedness
 tools/validate_liquidity.py          Liquidity Sweep regression suite (51 assertions)
+tools/validate_premium_discount.py   Premium/Discount regression suite (31 assertions)
 ```
 
 ## Data flow (as built so far)
@@ -81,6 +86,11 @@ Independently, per 3-candle window (c1, c2, c3):
 order_blocks.ob_fvg_confluence(ob, fvg) — inclusive overlap, tags
   'positive_width' vs 'boundary_touch', feeds the future POI-priority /
   Entry-Zone-intersection logic (not yet built).
+
+premium_discount.* reads StructureEngine.active_pair directly (read-only,
+  same pattern as swing_diagnostics/liquidity) to classify prices/zones as
+  premium, discount, or equilibrium, and to expose the trend-aligned
+  favorable half for the future POI Manager / Entry Confirmation.
 
 Independently, per symbol:
       liquidity.detect_asia_levels / detect_prev_day_levels (per-candle scan)
@@ -178,6 +188,18 @@ fixtures:
     liquidity target for a future POI/entry layer; it has zero effect on
     which swing the structure engine selects, zero import coupling into
     `structure.py`, and is never used as a filter.
+12. **`ExternalSwingPair.low`/`.high` are NOT guaranteed `low <= high`.**
+    They are labels for "the swing-LOW-type member" and "the swing-HIGH-
+    type member" of the pair (per structure.py's own docstring), not
+    sorted range bounds — D2 pairs the most-recently-confirmed opposite-
+    type swing chronologically, not the numerically lowest/highest one.
+    Confirmed on real data: 17 real bar-closes across 3 symbols (13-month
+    dataset) had an active pair with `low > high` numerically, all in
+    genuine `_try_continue_bearish`/choppy conditions — structure.py is
+    unchanged and behaved exactly as designed. Any consumer needing an
+    ordered Fibonacci range (first: `premium_discount.py`) MUST normalize
+    via `(min(low,high), max(low,high))`, never use `.low`/`.high` as
+    range bounds directly.
 
 ## Diagnostics layer (swing_diagnostics.py)
 
