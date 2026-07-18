@@ -20,14 +20,7 @@ from src.domain.entities import Candle, Direction, Timeframe
 from src.domain.strategy_v2_entities import FVGZone
 from src.application.strategy_v2 import config_v2
 from src.application.strategy_v2.atr import is_displacement
-
-# Binary floating-point cannot represent most decimal price fractions
-# exactly (e.g. 1.1010 - 1.1005 evaluates to 0.0004999999999999449, not
-# 0.0005) -- an exact-boundary gap would otherwise be wrongly rejected by
-# a raw `<` comparison. This tolerance is far below any real tick size
-# (smallest is XAUUSD's 0.01) so it only ever affects float-representation
-# noise, never a genuine sub-tolerance gap.
-_EPSILON = 1e-9
+from src.application.strategy_v2.numerics import approx_gte, intersect
 
 
 def min_fvg_size(symbol: str) -> float:
@@ -58,7 +51,7 @@ def detect_fvg(
     if not is_displacement(c2, atr_at_c2, config_v2.DISPLACEMENT_MULTIPLIER_HTF):
         return None
 
-    if (gap_high - gap_low) < min_fvg_size(symbol) - _EPSILON:
+    if not approx_gte(gap_high - gap_low, min_fvg_size(symbol)):
         return None
 
     return FVGZone(
@@ -95,7 +88,9 @@ def is_tradable(zone: FVGZone) -> bool:
 
 
 def overlap_range(a_low: float, a_high: float, b_low: float, b_high: float) -> Optional[Tuple[float, float]]:
-    """Intersection of two price ranges, or None if they don't overlap.
-    Needed later for the OB+FVG 'Entry Zone = intersection' rule."""
-    lo, hi = max(a_low, b_low), min(a_high, b_high)
+    """Intersection of two price ranges, or None if they don't overlap
+    (strict positive-width only — no epsilon tolerance here, unchanged
+    from the original implementation). Needed later for FVG-vs-FVG
+    overlap tracking."""
+    lo, hi = intersect(a_low, a_high, b_low, b_high)
     return (lo, hi) if lo < hi else None

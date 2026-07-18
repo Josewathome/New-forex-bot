@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import List, Optional, Sequence
 
 from src.domain.entities import Candle
+from src.application.strategy_v2.numerics import approx_gte
 
 
 def true_range(candle: Candle, prev_close: float) -> float:
@@ -50,16 +51,13 @@ def body_size(candle: Candle) -> float:
     return abs(candle.close - candle.open)
 
 
-# See fvg._EPSILON — same binary floating-point rationale: an exact-
-# boundary body size (== multiplier * ATR) can land a few ULPs below the
-# threshold due to representation error, not a genuine shortfall.
-_EPSILON = 1e-9
-
-
 def is_displacement(candle: Candle, atr_value: Optional[float], multiplier: float) -> bool:
-    """Exact pass/fail test: body_size >= multiplier * ATR. False (not
-    True) when ATR is unavailable — displacement cannot be evaluated
-    without it, so it must not silently pass."""
+    """Exact pass/fail test: body_size >= multiplier * ATR (epsilon-
+    tolerant, see numerics.py — an exact-boundary body size can land a
+    few ULPs below the threshold due to floating-point representation,
+    not a genuine shortfall). False (not True) when ATR is unavailable —
+    displacement cannot be evaluated without it, so it must not silently
+    pass."""
     if atr_value is None or atr_value <= 0:
         return False
-    return body_size(candle) >= multiplier * atr_value - _EPSILON
+    return approx_gte(body_size(candle), multiplier * atr_value)

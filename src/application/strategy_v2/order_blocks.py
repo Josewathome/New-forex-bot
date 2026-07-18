@@ -44,8 +44,7 @@ from src.domain.entities import Candle, Direction, Timeframe
 from src.domain.strategy_v2_entities import OrderBlockZone
 from src.application.strategy_v2 import config_v2
 from src.application.strategy_v2.atr import is_displacement
-
-_EPSILON = 1e-9  # see fvg._EPSILON — same binary floating-point rationale
+from src.application.strategy_v2.numerics import EPSILON, approx_gte, approx_lte, intersect
 
 
 def _displacement_direction(c2: Candle) -> Optional[Direction]:
@@ -101,18 +100,18 @@ def update_ob_state(zone: OrderBlockZone, candle: Candle) -> None:
     order. One-way transitions — neither flag ever resets."""
     if not zone.mitigated:
         if zone.direction == Direction.BULLISH:
-            if candle.low <= zone.high + _EPSILON:
+            if approx_lte(candle.low, zone.high):
                 zone.mitigated = True
         else:
-            if candle.high >= zone.low - _EPSILON:
+            if approx_gte(candle.high, zone.low):
                 zone.mitigated = True
 
     if not zone.invalidated:
         if zone.direction == Direction.BULLISH:
-            if candle.close < zone.low - _EPSILON:
+            if not approx_gte(candle.close, zone.low):
                 zone.invalidated = True
         else:
-            if candle.close > zone.high + _EPSILON:
+            if not approx_lte(candle.close, zone.high):
                 zone.invalidated = True
 
 
@@ -136,9 +135,9 @@ def ob_fvg_confluence(
     kind='boundary_touch' for the common adjacent case (OB usually IS the
     FVG's own Candle1, sharing exactly one boundary price) — never
     silently widened into a fake positive-width range."""
-    lo, hi = max(ob_low, fvg_low), min(ob_high, fvg_high)
-    if lo < hi - _EPSILON:
+    lo, hi = intersect(ob_low, ob_high, fvg_low, fvg_high)
+    if lo < hi - EPSILON:
         return (lo, hi, "positive_width")
-    if abs(lo - hi) <= _EPSILON:
+    if abs(lo - hi) <= EPSILON:
         return (lo, hi, "boundary_touch")
     return None
