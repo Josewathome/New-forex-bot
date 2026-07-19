@@ -234,11 +234,13 @@ def m1_confirmation(
 
 def _select_zone_near_swing(
     zones: Sequence[Tuple[float, float, datetime]], swing_price: float,
+    max_distance: Optional[float] = None,
 ) -> Optional[Tuple[float, float]]:
     """Helper for compute_entry_zone -- among candidate (low, high,
     created_at) zones, picks the one geometrically CLOSEST (by midpoint
     distance) to the confirmation swing's price, ties broken by most
-    recently created.
+    recently created. Candidates farther than `max_distance` (if given)
+    are excluded entirely before selection.
 
     CORRECTED after a real-data finding: an earlier version of this
     filter picked the most recently CREATED still-active zone,
@@ -254,9 +256,22 @@ def _select_zone_near_swing(
     eliminate essentially all candidates (zero temporal overlap in
     practice) -- confirming the real defect was PRICE distance, not
     timing. Distance-to-the-swing is the correct proxy for "the OB/FVG
-    relevant to this specific reversal."""
+    relevant to this specific reversal."
+
+    STALENESS CUTOFF (`max_distance`, see config_v2.MAX_ENTRY_ZONE_
+    DISTANCE_ATR's comment): even nearest-by-distance selection admitted
+    zones 50-90 pips away in all 9 real USDJPY cases sampled, because a
+    zone that never gets touched again stays "active" indefinitely
+    regardless of how far price has since moved. User-authorized fix:
+    exclude any candidate farther than `max_distance` from the swing
+    price outright, rather than always falling back to "whatever is
+    nearest even if nothing is actually close.\""""
     if not zones:
         return None
+    if max_distance is not None:
+        zones = [z for z in zones if abs(((z[0] + z[1]) / 2.0) - swing_price) <= max_distance]
+        if not zones:
+            return None
     lo, hi, _ = min(zones, key=lambda t: (abs(((t[0] + t[1]) / 2.0) - swing_price), -t[2].timestamp()))
     return lo, hi
 
@@ -264,14 +279,22 @@ def _select_zone_near_swing(
 def compute_entry_zone(
     direction: Direction, pair: ExternalSwingPair, confirmation_swing: SwingPoint,
     m1_obs: Sequence[Tuple[float, float, datetime]], m1_fvgs: Sequence[Tuple[float, float, datetime]],
+    m1_atr_value: Optional[float] = None,
 ) -> Optional[Tuple[float, float, float, str]]:
     """E6, spec §17. `m1_obs`/`m1_fvgs` are ALL active, direction-matching
     M1 OB/FVG candidates (low, high, created_at) -- this function selects
     among them (see _select_zone_near_swing), it is not pre-selected by
-    the caller. Returns (entry_price, zone_low, zone_high, poi_kind) or
-    None if no qualifying M1 OB or FVG is available."""
-    m1_ob = _select_zone_near_swing(m1_obs, confirmation_swing.price)
-    m1_fvg = _select_zone_near_swing(m1_fvgs, confirmation_swing.price)
+    the caller. `m1_atr_value` (M1 ATR(10) at the confirmation bar), if
+    given, bounds candidate distance to config_v2.MAX_ENTRY_ZONE_DISTANCE_
+    ATR x m1_atr_value -- see that constant's comment for why. Returns
+    (entry_price, zone_low, zone_high, poi_kind) or None if no qualifying
+    M1 OB or FVG is available within range."""
+    max_distance = (
+        config_v2.MAX_ENTRY_ZONE_DISTANCE_ATR * m1_atr_value
+        if m1_atr_value is not None and m1_atr_value > 0 else None
+    )
+    m1_ob = _select_zone_near_swing(m1_obs, confirmation_swing.price, max_distance)
+    m1_fvg = _select_zone_near_swing(m1_fvgs, confirmation_swing.price, max_distance)
 
     if m1_ob is not None and m1_fvg is not None:
         conf = ob_fvg_confluence(m1_ob[0], m1_ob[1], m1_fvg[0], m1_fvg[1])
@@ -384,7 +407,7 @@ def evaluate_entry(
     if confirmation_swing is None:
         return None
 
-    entry_zone = compute_entry_zone(direction, pair, confirmation_swing, m1_obs, m1_fvgs)
+    entry_zone = compute_entry_zone(direction, pair, confirmation_swing, m1_obs, m1_fvgs, m1_atr_at_prev)
     if entry_zone is None:
         return None
     entry_price, entry_zone_low, entry_zone_high, entry_zone_kind = entry_zone

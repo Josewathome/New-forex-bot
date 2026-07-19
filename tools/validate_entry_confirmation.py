@@ -232,6 +232,22 @@ zone_tie = compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_z
 check("6i equidistant candidates: tie broken by most-recently-created",
       zone_tie is not None and abs(zone_tie[0] - (1.1000 + 1.1010) / 2.0) < 1e-9, f"{zone_tie}")
 
+# STALENESS CUTOFF (user-authorized, config_v2.MAX_ENTRY_ZONE_DISTANCE_ATR):
+# 6g-6i above pass no m1_atr_value, so no cutoff applies (backward-compatible
+# default) -- confirms proximity selection alone still works when ATR is
+# unavailable. These new cases pass an explicit ATR to exercise the cutoff.
+atr_for_zone = 0.0010   # cutoff = 3x this = 0.0030
+check("6j with ATR given, a lone zone beyond the distance cutoff is excluded -> None",
+      compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, m1_obs_far_away, [], atr_for_zone) is None)
+
+zone_mixed_cutoff = compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, m1_obs_mixed, [], atr_for_zone)
+check("6k with ATR given, near+far candidates: far one excluded by cutoff, near one still wins",
+      zone_mixed_cutoff is not None and abs(zone_mixed_cutoff[0] - (1.0995 + 1.1005) / 2.0) < 1e-9, f"{zone_mixed_cutoff}")
+
+m1_obs_just_inside = [(1.0975, 1.0985, ts(5))]   # midpoint 1.0980, distance 0.0025 < 0.0030 cutoff
+check("6l a candidate just inside the cutoff is still selected",
+      compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, m1_obs_just_inside, [], atr_for_zone) is not None)
+
 print(); print("="*78); print("SECTION 7 — STOP LOSS FROM CONFIRMATION SWING (E7, spec §18)"); print("="*78)
 
 conf_swing_bull = mk_m1_swing(SwingType.HIGH, 1.1005)

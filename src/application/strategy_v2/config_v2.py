@@ -55,6 +55,22 @@ OB_MAX_SEARCH_CANDLES = 20
 SL_BUFFER_PIPS = 2.0
 SL_BUFFER_PIPS_XAUUSD = 3.0   # 30 points = 3 pips
 
+# ── Entry Zone staleness cutoff (§17) ──
+# FLAGGED ASSUMPTION, user-authorized 2026-07-19: the recovered spec text
+# does not state how far/stale an M1 OB or FVG may be before it stops being
+# a valid Entry Zone candidate. Real-data diagnosis on USDJPY showed the
+# "nearest active zone" selection (entry_confirmation._select_zone_near_
+# swing) picking zones 50-90 pips from the confirmation swing in all 9
+# sampled real cases -- these zones never got mitigated because price
+# simply never returned to touch them, so they sit "active" indefinitely
+# even after becoming irrelevant to current price action. User chose to add
+# a distance cutoff (vs. "no cutoff" or "hard reject" framing -- functionally
+# equivalent to a cutoff since a candidate beyond it is treated as absent).
+# 3x M1 ATR(10) is the cutoff: wide enough to admit a genuinely-nearby zone
+# through normal M1 noise, tight enough to exclude a zone left over from an
+# unrelated, much earlier move.
+MAX_ENTRY_ZONE_DISTANCE_ATR = 3.0
+
 # ── Liquidity (§11-12) ──
 EQUAL_LEVEL_TOLERANCE_PIPS = 3.0
 EQUAL_LEVEL_TOLERANCE_PIPS_XAUUSD = 10.0   # 100 points = $1.00
