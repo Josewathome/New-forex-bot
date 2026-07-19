@@ -35,7 +35,12 @@ from src.application.smc_3step import (
 from src.application.strategy_v2 import monitoring
 
 DATA_DIR = "logs"
-SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"]
+SYMBOLS = ["XAUUSD"]   # research scope narrowed to XAUUSD-only (Priority 4 decision, 2026-07-19):
+# EURUSD/GBPUSD/USDJPY were unprofitable across nearly every segment (zone
+# type, direction, session) under this exact strategy -- not a single
+# fixable filter, a broad regime mismatch. tools/backtest_smc_3step.py
+# still accepts symbols=[...] to re-test FX later if this changes.
+ALL_SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"]
 DIGITS = {"XAUUSD": 2, "EURUSD": 5, "GBPUSD": 5, "USDJPY": 3}
 TICK_VALUE_USD = {"EURUSD": 10.0, "GBPUSD": 10.0, "XAUUSD": 10.0, "USDJPY": 9.1}
 MIN_LOT, MAX_LOT, LOT_STEP = 0.01, 10.0, 0.01
@@ -83,7 +88,11 @@ def resample_m1_to_m5(m1_candles, symbol):
     return out
 
 
-def run_backtest(apply_costs=True, symbols=None):
+def run_backtest(apply_costs=True, symbols=None, cost_multiplier=1.0):
+    """cost_multiplier scales SPREAD_POINTS/SLIPPAGE_POINTS only (both are
+    flagged assumptions, not measured broker data) -- commission is left
+    at its real, measured rate regardless, since scaling a known-real cost
+    would misrepresent it as uncertain."""
     RAW_H1 = json.load(open(f"{DATA_DIR}/phase15_h1.json"))
     RAW_M15 = json.load(open(f"{DATA_DIR}/phase_entry_m15.json"))
     RAW_M1 = json.load(open(f"{DATA_DIR}/phase_entry_m1.json"))
@@ -129,7 +138,7 @@ def run_backtest(apply_costs=True, symbols=None):
                     if apply_costs:
                         # Exit slippage: fills worse than the requested SL/TP
                         # level, in the adverse direction, both directions.
-                        slip = SLIPPAGE_POINTS[sym] * config_v2.point_size(sym)
+                        slip = SLIPPAGE_POINTS[sym] * cost_multiplier * config_v2.point_size(sym)
                         exit_price = exit_price - slip if open_pos["direction"] == 1 else exit_price + slip
                     move = (exit_price - open_pos["entry"]) if open_pos["direction"] == 1 else (open_pos["entry"] - exit_price)
                     # Mirrors tools/backtest_strategy_v2.py's realize_pnl exactly:
@@ -180,7 +189,7 @@ def run_backtest(apply_costs=True, symbols=None):
 
             point = config_v2.point_size(sym)
             if apply_costs:
-                half_spread = SPREAD_POINTS[sym] * point / 2.0
+                half_spread = SPREAD_POINTS[sym] * cost_multiplier * point / 2.0
                 bid = m5_candle.close - half_spread
                 ask = m5_candle.close + half_spread
             else:
@@ -195,7 +204,7 @@ def run_backtest(apply_costs=True, symbols=None):
             if apply_costs:
                 # Entry slippage: filled worse than the quoted bid/ask, in
                 # the adverse direction.
-                slip = SLIPPAGE_POINTS[sym] * point
+                slip = SLIPPAGE_POINTS[sym] * cost_multiplier * point
                 if signal.direction == 1:
                     signal.entry_price += slip
                 else:

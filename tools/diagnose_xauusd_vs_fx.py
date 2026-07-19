@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, ".")
 from datetime import datetime
 
-from tools.backtest_smc_3step import run_backtest
+from tools.backtest_smc_3step import run_backtest, ALL_SYMBOLS
 
 
 def parse_ts(s):
@@ -30,7 +30,7 @@ def segment_stats(trades):
 
 if __name__ == "__main__":
     print("Running all 4 symbols with realistic costs...")
-    trade_log, summary, final_equity = run_backtest(apply_costs=True)
+    trade_log, summary, final_equity = run_backtest(apply_costs=True, symbols=ALL_SYMBOLS)
     print()
 
     by_symbol = {}
