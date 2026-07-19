@@ -59,13 +59,15 @@ from src.application.strategy_v2 import order_blocks as ob_mod
 from src.application.strategy_v2 import liquidity as liq_mod
 from src.application.strategy_v2 import swings as swings_mod
 from src.application.strategy_v2.poi_manager import POIManager
-from src.application.strategy_v2.entry_confirmation import evaluate_entry, poi_touched, poi_in_favorable_zone
+from src.application.strategy_v2.entry_confirmation import (
+    evaluate_entry, poi_touched, poi_in_favorable_zone, m1_confirmation, compute_entry_zone,
+)
 from src.application.strategy_v2.trade_decision import qualify_trade, AccountState
 from src.application.strategy_v2.risk_management import compute_position_size, select_risk_pct
 from src.application.strategy_v2.trade_management import TradeState, evaluate_trade
 from src.application.strategy_v2 import monitoring
 
-SCRATCH = "/tmp/claude-1000/-home-josewathome-project-claude-session/416d9b86-909d-4b9b-b991-7ee4b51bf0a8/scratchpad"
+DATA_DIR = "logs"  # durable data pull location (relative to repo root); NOT the ephemeral scratchpad
 SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY"]
 DIGITS = {"XAUUSD": 2, "EURUSD": 5, "GBPUSD": 5, "USDJPY": 3}
 # Transcribed from src/config.py (not imported -- that module validates
@@ -186,9 +188,9 @@ def run_backtest():
         peak_equity[0] = max(peak_equity[0], running_equity[0])
         return pnl
 
-    RAW_H1 = json.load(open(f"{SCRATCH}/phase15_h1.json"))
-    RAW_M15 = json.load(open(f"{SCRATCH}/phase_entry_m15.json"))
-    RAW_M1 = json.load(open(f"{SCRATCH}/phase_entry_m1.json"))
+    RAW_H1 = json.load(open(f"{DATA_DIR}/phase15_h1.json"))
+    RAW_M15 = json.load(open(f"{DATA_DIR}/phase_entry_m15.json"))
+    RAW_M1 = json.load(open(f"{DATA_DIR}/phase_entry_m1.json"))
 
     per_symbol_summary = {}
 
@@ -240,6 +242,11 @@ def run_backtest():
         m1_eng = StructureEngine(sym)  # only for local M1 swing/structure bookkeeping shared with trade_management's opposite-CHoCH exit
 
         n_signals = n_qualified = n_opened = n_closed = 0
+        funnel = {
+            "bars_active_pair": 0, "bars_matching_htf_zone": 0, "bars_sweep_available": 0,
+            "bars_touched_favorable": 0, "zone_bar_candidates": 0, "m1_confirmed": 0,
+            "entry_zone_found": 0, "signals": 0,
+        }
 
         for j in range(len(m1_candles)):
             m1_candle = m1_candles[j]
@@ -348,17 +355,20 @@ def run_backtest():
             if pair is None:
                 continue
             direction = Direction.BULLISH if pair.trend == TrendState.BULLISH else Direction.BEARISH
+            funnel["bars_active_pair"] += 1
 
             m15_snap = m15_snapshots[m15_idx]
             candidate_htf_zones = [(lo, hi, "fvg") for lo, hi, d in m15_snap["fvg"] if d == direction] + \
                                    [(lo, hi, "ob") for lo, hi, d in m15_snap["ob"] if d == direction]
             if not candidate_htf_zones:
                 continue
+            funnel["bars_matching_htf_zone"] += 1
 
             want_sell_side = direction == Direction.BULLISH
             sweep_level = most_recent_sell_side_reversal if want_sell_side else most_recent_buy_side_reversal
             if sweep_level is None:
                 continue
+            funnel["bars_sweep_available"] += 1
 
             for zone_low, zone_high, poi_kind in candidate_htf_zones:
                 if poi_touched(m1_candle, zone_low, zone_high):
@@ -374,6 +384,7 @@ def run_backtest():
                 matching_zones.append((zone_low, zone_high, poi_kind, touched_at))
             if not matching_zones or j < 3:
                 continue
+            funnel["bars_touched_favorable"] += 1
 
             # Full candidate lists -- compute_entry_zone (inside evaluate_
             # entry) selects the most recent one created AT OR AFTER the
@@ -400,6 +411,18 @@ def run_backtest():
 
             atr_prev = atr_m1[j-1] if j >= 1 else None
             for zone_low, zone_high, poi_kind, touched_at in matching_zones:
+                funnel["zone_bar_candidates"] += 1
+                # Instrumentation only -- these are the same pure, side-
+                # effect-free calls evaluate_entry makes internally;
+                # duplicating them here (cheap) lets the funnel report
+                # show exactly where candidates are lost without altering
+                # evaluate_entry's own gate sequence or behavior.
+                conf_swing_probe = m1_confirmation(direction, m1_swings, m1_candle, atr_prev, last_3, zone_low, zone_high)
+                if conf_swing_probe is not None:
+                    funnel["m1_confirmed"] += 1
+                    if compute_entry_zone(direction, pair, conf_swing_probe, active_m1_obs, active_m1_fvgs, atr_prev) is not None:
+                        funnel["entry_zone_found"] += 1
+
                 signal = evaluate_entry(
                     symbol=sym, direction=direction, pair=pair, sweep_level=sweep_level, poi_kind=poi_kind,
                     zone_low=zone_low, zone_high=zone_high, zone_touched_at=touched_at,
@@ -412,6 +435,7 @@ def run_backtest():
                 if signal is None:
                     continue
                 n_signals += 1
+                funnel["signals"] += 1
 
                 account = account_state_for(sym, m1_candle.time)
                 risk_pct = select_risk_pct(use_scaled=False)
@@ -441,8 +465,10 @@ def run_backtest():
                                         "risk_pct": risk_pct}
                 break
 
-        per_symbol_summary[sym] = {"signals": n_signals, "qualified": n_qualified, "opened": n_opened, "closed": n_closed}
+        per_symbol_summary[sym] = {"signals": n_signals, "qualified": n_qualified, "opened": n_opened,
+                                    "closed": n_closed, "funnel": funnel}
         print(f"{sym}: M1 bars={len(m1_candles)} signals={n_signals} qualified={n_qualified} opened={n_opened} closed={n_closed}", flush=True)
+        print(f"    funnel: {funnel}", flush=True)
 
     return trade_log, per_symbol_summary, running_equity[0]
 

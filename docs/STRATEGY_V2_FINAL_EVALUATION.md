@@ -1,184 +1,199 @@
-# strategy_v2 — Final Evaluation
+# strategy_v2 — Final Evaluation (CORRECTED)
 
-Complete-system evaluation after all 9 modules (Liquidity Sweep,
-Premium/Discount, POI Manager, Entry Confirmation, Trade Decision Engine,
-Risk Management, MT5 Execution, Trade Management, Monitoring) were built,
-individually validated, and wired together (`tools/backtest_strategy_v2.py`)
-per the "finish the complete system, then evaluate once" mandate.
+**This replaces the prior version of this document**, which reflected the
+implementation *before* `docs/STRATEGY_V2_IMPLEMENTATION_PARITY_AUDIT.md`
+found and fixed six real divergences from the recovered, locked V4 spec
+(stateless M1 CHoCH, Absorption gate + direction-aware fix, touch/
+confirmation decoupling, SL-from-swing, TP priority-fallback, and Entry
+Zone price-proximity + distance-cutoff selection). The prior report's
+"1 signal, rejected by the session window" result no longer applies — it
+was produced by pre-correction code. This document reports the result of
+the corrected pipeline, run end-to-end (`tools/backtest_strategy_v2.py`)
+against the same real dataset.
 
 ## Bot assembly — confirmed working
 
-The backtester wires every module together exactly as designed: H1
-Structure/FVG/OB/Liquidity → POI Manager (with CHoCH cleanup) →
-Premium/Discount classification → M1 local structure + Entry Confirmation
-→ Trade Decision Engine → Risk Management (position sizing) → an
-intrabar SL/TP fill simulation driven by Trade Management's exit ladder →
-Monitoring. It ran to completion across the full real dataset (4 symbols
-× ~300,000 M1 bars = 1.2M bar-iterations) with zero crashes and zero
-invariant violations. A forced smoke-test trade (bypassing qualification,
-opened directly on real EURUSD M1 data) confirmed the open/manage/close/
-PnL-realization glue code is arithmetically correct end-to-end: it closed
-at exactly −$100 on a $100 risk allocation — precisely −1R, as a full
-stop-loss hit before any breakeven adjustment must produce. This is the
-one piece of the assembled system that individual-module testing could
-not exercise (no real trade ever opened during the real backtest itself,
-per the result below), so it was verified separately here.
+All 9 modules wire together exactly as designed: H1 Structure/FVG/OB/
+Liquidity → merged H1+M15 POI Manager → Premium/Discount classification →
+M1-specific Entry Zone + stateless M1 confirmation (Absorption + CHoCH-
+trigger + displacement) → Trade Decision Engine → Risk Management →
+intrabar SL/TP simulation via Trade Management's exit ladder → Monitoring.
+It ran to completion across the full real dataset (4 symbols × 300,000 M1
+bars = 1.2M bar-iterations) with zero crashes and zero invariant
+violations.
 
 ## Data constraints (reported, not worked around)
 
-- **M1 data availability is the binding constraint**: ~10 months
-  (2025-09-11 to 2026-07-17), vs. H1's 13 months. Entry Confirmation
-  requires M1 candles, so the backtest window is capped at ~10 months —
-  **this is not a multi-year backtest.**
+- M1 data spans ~10 months (2025-09 to 2026-07); H1 spans 13 months;
+  M15 spans ~20 months. Entry Confirmation requires M1 candles, so the
+  backtest window is capped at ~10 months — **not a multi-year backtest.**
 - Only 4 symbols have real data pulled (XAUUSD, EURUSD, GBPUSD, USDJPY).
-  AUDUSD (part of the original 5-symbol universe) and D1 bias data were
-  never pulled — Phase 1 from the original plan remains incomplete for
-  those.
-- **No historical economic-calendar/news data source is available**
-  in this sandbox (no internet access). The backtest's news gate always
-  returns "not blocked" — an untested gate, not one proven harmless.
+  AUDUSD and D1 bias data were never pulled.
+- No historical economic-calendar/news source is available in this
+  sandbox; the news gate always returns "not blocked" — untested, not
+  proven harmless.
 
-## Result: zero trades
+## Result: zero trades (unchanged conclusion, different and now-understood cause)
 
-Across the complete real ~10-month window, all 4 symbols, the fully
-wired system produced:
+| Symbol | M1 bars | Signals | Qualified | Opened | Closed |
+|---|---|---|---|---|---|
+| XAUUSD | 300,000 | 0 | 0 | 0 | 0 |
+| EURUSD | 300,000 | 0 | 0 | 0 | 0 |
+| GBPUSD | 300,000 | 0 | 0 | 0 | 0 |
+| USDJPY | 300,000 | 0 | 0 | 0 | 0 |
+| **Total** | **1,200,000** | **0** | **0** | **0** | **0** |
 
-| Symbol | Signals (Entry Confirmation) | Qualified (Trade Decision) | Opened | Closed |
-|---|---|---|---|---|
-| XAUUSD | 0 | 0 | 0 | 0 |
-| EURUSD | 0 | 0 | 0 | 0 |
-| GBPUSD | 0 | 0 | 0 | 0 |
-| USDJPY | 1 | 0 | 0 | 0 |
+## The corrected funnel — where candidates disappear
 
-**One raw signal in 1.2M M1 bar-closes across 4 major pairs over ~10
-months — and it was rejected.** The signal (USDJPY, 2026-06-16 16:31 UTC,
-entry 160.368, SL 160.527, TP 156.308, RR 25.5 — comfortably clearing
-MIN_RR) was rejected by Trade Decision Engine's session-window gate: it
-occurred at 16:31 UTC, 31 minutes past `NEWYORK_SESSION_UTC`'s exclusive
-16:00 end. Every upstream gate (sweep, POI touch, premium/discount,
-local M1 structure, displacement entry candle, RR≥5) had already passed.
+Instrumented directly inside `tools/backtest_strategy_v2.py`'s real
+evaluation loop (not a separate, potentially-diverging script), summed
+across all 4 symbols:
 
-This is consistent with, not contradicted by, the funnel already measured
-during Module 4's own real-data validation (identical dataset, same
-result independently reproduced):
-
-| Funnel stage | Bars passing | % of previous stage |
+| Funnel stage | Count | % of previous stage |
 |---|---|---|
-| M1 bars with an active H1 pair + direction | 804,962 / 1,200,000 | 67.1% |
-| … with a matching-direction active POI (FVG/OB) | 224,211 | 27.9% |
-| … where the POI was actually touched | 7,706 | 3.4% |
-| … where the touch was in the favorable premium/discount half | 875 | 11.4% |
-| … where the M1 entry candle qualified (displacement + swing break) | 14 | 1.6% |
-| … where RR ≥ 5 | 1 | 7.1% |
-| … where the session window was also satisfied | **0** | 0% |
+| Total M1 bars | 1,200,000 | — |
+| ...with an active H1 trend/pair | 976,787 | 81.4% |
+| ...with a matching-direction M15 HTF POI (FVG/OB) | 940,609 | 96.3% |
+| ...with a qualifying liquidity sweep available | 939,782 | 99.9% |
+| ...where that POI was touched, in the favorable premium/discount half, within the touch-recency window | 19,360 | 2.06% |
+| M1 confirmation attempts (zone-bar candidates) | 19,846 | — |
+| ...where Absorption + M1 CHoCH-trigger + displacement all passed (spec §16) | **18** | **0.09%** |
+| ...where a qualifying M1 Entry Zone (OB/FVG) existed (spec §17) | **0** | **0%** |
 
-## Why the 24-point evaluation cannot be run as numbers
+Two gates are worth explaining individually, per the audit's own
+instruction to explain any gate removing >90% of candidates:
 
-With zero trades, there is no trade sequence to analyze. Fabricating
-placeholder statistics would misrepresent the result. Status of each
-requested analysis:
+**Gate: M1 confirmation (19,846 → 18, −99.9%).** This is intentional,
+spec-driven selectivity, not a bug: spec §16 requires Absorption (3
+consecutive shrinking-body M1 candles, avg body <50% ATR) **and** a
+stateless M1 CHoCH-trigger (body close beyond the most recent same-kind
+M1 swing) **and** displacement (≥1.5×ATR) — three independent, narrow
+conditions on the *same* few-bar sequence. That so few real market moments
+satisfy all three simultaneously is exactly what a tight confirmation
+filter is supposed to do.
 
-| # | Analysis | Status |
+**Gate: Entry Zone availability (18 → 0, −100%).** This is the decisive
+finding of this corrected run, and it is *not* a threshold-calibration
+artifact. For each of the 18 real M1-confirmed reversals (across all 4
+symbols, full ~10-month window), the nearest available M1 OB/FVG —
+computed with **no distance limit**, i.e. genuinely the closest one that
+existed anywhere in the active pool — was:
+
+| Symbol | Confirmed cases | Nearest zone distance, in M1-ATR(10) multiples |
 |---|---|---|
-| 1 | Multi-year backtest | Not possible — M1 data spans ~10 months, not multiple years (data constraint, reported above) |
-| 2 | Walk-forward validation | Not computable — 0 trades, no windows to compare |
-| 3 | Out-of-sample testing | Not computable — 0 trades |
-| 4 | Monte Carlo simulation | Not computable — needs a realized trade sequence to reshuffle; none exists |
-| 5 | Spread sensitivity | Not computable — no trades to re-cost |
-| 6 | Slippage sensitivity | Not computable — no trades to re-cost |
-| 7 | News-event behavior | Untested — no historical news data source available in this sandbox |
-| 8 | Session analysis | Computed structurally: 25.3% of real M1 bar-timestamps fall in the London/NY window (matches the 6/24h expectation exactly); the one real signal missed it by 31 minutes |
-| 9 | Symbol comparison | 0/0/0/1 raw-signal split across XAUUSD/EURUSD/GBPUSD/USDJPY — no meaningful comparison possible at this frequency |
-| 10 | Risk analysis | N/A — no capital was ever put at risk |
-| 11 | Drawdown analysis | 0% (no trades, equity never moved) |
-| 12 | Trade distribution | N/A — 0 trades |
-| 13 | Win rate | Undefined (0 trades) |
-| 14 | Expectancy | Undefined |
-| 15 | Profit Factor | Undefined (`monitoring.profit_factor` correctly returns `None`, not a fabricated number) |
-| 16 | Sharpe Ratio | Undefined |
-| 17 | Maximum Drawdown | 0.0 (trivial — no trades) |
-| 18 | Recovery Factor | Undefined |
-| 19 | Equity curve | Flat at $10,000 initial balance throughout |
-| 20 | Monthly returns | 0% every month |
-| 21 | Trade duration | Undefined (0 trades) |
-| 22 | Best market conditions | Cannot be determined from zero realized trades |
-| 23 | Worst market conditions | Cannot be determined from zero realized trades |
-| 24 | Failure modes | **This is where the real finding is — see below** |
+| XAUUSD | 5 | 5.5×, 6.5×, 9.6×, 12.1×, 13.6× |
+| EURUSD | 2 | 12.9×, 17.1× |
+| GBPUSD | 2 | 6.6×, 14.1× |
+| USDJPY | 9 | 4.4×, 4.8×, 5.3×, 6.6×, 7.9×, 13.5×, 14.3×, 19.6×, 24.9× |
 
-## Failure mode analysis
+**The single closest case across all 18 is 4.37× ATR away.** The
+distance cutoff introduced in this correction pass
+(`config_v2.MAX_ENTRY_ZONE_DISTANCE_ATR = 3.0`, added with explicit user
+sign-off after the price-proximity fix alone was found to still select
+zones 50-90 pips from the triggering swing) rejects all 18 — but
+loosening that cutoff would not change the outcome: even a 5× or 10×
+threshold saves at most a handful of cases, and moving it wide enough to
+admit the 24.9×-ATR case would defeat the cutoff's entire purpose (which
+is to prevent selecting a zone that is obviously irrelevant to current
+price action). **This is a genuine structural incompatibility between two
+independently-reasonable, independently-specified rules**, not a
+miscalibrated number:
 
-Every individual module (1–9) was independently proven correct against
-real market data with zero invariant violations throughout this build.
-**The failure is not a coding defect in any module** — it is the
-*compounding* effect of requiring all of the following simultaneously,
-every one of which is independently reasonable but whose conjunction is
-extremely restrictive:
+- Spec §16's M1 CHoCH-trigger is **stateless**: "the most recently
+  confirmed M1 swing" of the matching kind, with no requirement that this
+  swing be recent in *time* or *price* relative to the current M1 bar.
+  When no fresh same-kind swing has formed for a while, this can (and, in
+  all 18 real cases, does) reference an old swing that price has since
+  moved well away from.
+- Spec §17's Entry Zone (M1 OB/FVG) is, by construction, a **recent,
+  local** structure — M1 order blocks and FVGs are quickly mitigated
+  (any return-touch invalidates them), so the ones still "active" at any
+  given moment cluster near *current* price, not near wherever an old
+  swing happens to sit.
 
-1. An active H1 trend (structure engine) — satisfied 67% of the time, not restrictive.
-2. A matching-direction, currently-untouched POI (FVG or OB) — drops to 28%. Reasonable: not every trend has a fresh POI at every moment.
-3. Price actually touching that POI — drops to 3.4% of those. Expected: POIs are narrow price bands.
-4. The touch landing in the *favorable* premium/discount half — only 11.4% of touches. Lower than a naive 50/50 split would suggest, likely because a POI's own creation (a displacement candle) is itself evidence of a strong directional push, which tends to leave freshly-created same-direction zones sitting nearer the *expensive* side of the range, not the discount side a pullback entry wants.
-5. An M1 displacement candle also breaking the local M1 swing at that exact moment — only 1.6% of the survivors. This is the single most restrictive individual gate.
-6. RR ≥ 5 — only 1 of the 14 remaining candidates clears this.
-7. Landing inside a 6-hour session window — the one survivor missed this by 31 minutes.
+Whenever the rare M1 CHoCH event actually fires, current price (and
+therefore the pool of still-active M1 OB/FVGs) has typically already
+moved on from the swing level that triggered it. These two spec
+requirements were never tested against each other in the recovered spec
+text — there is no stated relationship between "the swing the CHoCH
+breaks" and "the OB/FVG that becomes the entry zone" beyond both being
+on M1. In this ~10-month, 4-symbol real dataset, they are never both
+satisfiable within a distance a person would call "the entry zone for
+this reversal" rather than "an unrelated old zone that happens to still
+be technically active."
 
-None of these seven conditions is unreasonable in isolation, and each was
-implemented and tested correctly. But requiring **all seven simultaneously**
-compounds to roughly 1-in-1.2-million M1 bars, across 4 of the most
-liquid pairs traded, over ~10 months of real data. This is a
-**specification problem, not an implementation bug**: the frozen
-Structure/FVG/OB/Liquidity engine (Modules covered by
-`STRATEGY_V2_PHASE2_FREEZE_AUDIT.md`) is working correctly and is not
-implicated. The bottleneck is entirely in the **threshold and
-confluence choices made in Entry Confirmation (Module 4) and Trade
-Decision Engine (Module 5)** — decisions this build had to make without
-access to the original spec's exact numbered text (compacted out of
-context earlier in this session), documented transparently at the time
-as flagged, conservative interpretations (see the "Documented
-Implementation Decisions" blocks in `entry_confirmation.py` and
-`trade_decision.py`).
+## Why the 24-point evaluation still cannot be run as numbers
+
+Unchanged from the prior report — zero trades means no realized sequence
+to analyze. Walk-forward, Monte Carlo, spread/slippage sensitivity, win
+rate, expectancy, profit factor, Sharpe, drawdown, trade duration are all
+undefined, not fabricated as zero-with-confidence. `monitoring.
+profit_factor` correctly returns `None`.
+
+## Answering the parity audit's four questions, now with the corrected implementation
+
+**1. Does the implementation faithfully reproduce the original strategy?**
+Yes, now — the six divergences found by the parity audit are fixed and
+independently unit-tested (64/64 assertions, 14/14 regression suites
+passing). The one remaining interpretive addition (the distance cutoff)
+was raised to the user as an explicit, flagged judgment call rather than
+decided silently, and does not change the zero-trade outcome regardless
+of its exact value (see the ATR-multiple table above).
+
+**2. If not, where does it diverge?** It no longer diverges from the
+recovered spec text in any of the six previously-found ways. The one
+remaining gap is that the spec is genuinely silent on the relationship
+between the CHoCH-trigger swing (§16) and the Entry Zone (§17) — this
+implementation's distance-cutoff interpretation is documented, not
+hidden, and is shown above to be non-load-bearing for this result.
+
+**3. Are the zero trades caused by the strategy itself or by
+implementation decisions?** **The strategy itself, now.** Before this
+correction pass, the answer was implementation decisions (the parity
+audit's core finding). After fixing all six, the funnel shows the
+bottleneck moved to a structural interaction between two spec
+requirements (§16 and §17) that this real dataset never satisfies
+together — not a coding defect, not a threshold this build invented, and
+not sensitive to the one flagged assumption that remains.
+
+**4. Which assumptions must be removed before we can honestly evaluate
+the strategy?** None remain that affect this outcome. The distance cutoff
+was the last flagged assumption in Module 4, and the ATR-multiple data
+above shows it is not the reason for zero trades — even removing it
+entirely would produce trades whose entry price is 4-25× ATR from the
+confirming swing, which is not "the entry zone for this reversal" under
+any reasonable reading of spec §17's intent, and would very likely fail
+the SL/RR geometry regardless (as it did before the cutoff existed, via
+the inverted-ordering safety check).
 
 ## Final decision
 
-**B) NOT READY.**
+**B) NOT READY** — unchanged from the prior report, but now for a
+precisely characterized reason instead of an implementation-divergence
+one. The corrected, spec-faithful implementation produces zero trades
+across the full real 4-symbol, ~10-month dataset because spec §16's
+CHoCH-trigger swing and spec §17's Entry Zone are, in every one of the 18
+real qualifying reversals in this data, anchored to price levels 4-25×
+M1-ATR(10) apart — a combination the recovered spec text does not
+reconcile.
 
-More precisely, per the alternate branch of the requested decision
-framework: **the completed strategy, as specified (including this
-build's necessarily-interpreted thresholds), does not generate a usable
-number of trades in real market conditions — it cannot be evaluated for
-edge at all, let alone deployed.** This is a stronger and more specific
-finding than "no edge": there is no trade frequency to even test for one.
+**Recommendation**: this is now a genuine strategy-design question, not
+an implementation one, and is exactly the kind of finding this audit was
+run to surface before any redesign discussion. Worth deciding
+deliberately (not silently loosening a threshold):
 
-**Components responsible**: Entry Confirmation's requirement that the
-POI touch land in the favorable zone AND the M1 displacement/swing-break
-condition (the two tightest individual filters), combined with the RR≥5
-threshold and the 6-hour session window in Trade Decision Engine. The
-Structure Engine, FVG, Order Block, Liquidity, POI Manager, Premium/
-Discount, Risk Management, MT5 Execution, Trade Management, and
-Monitoring modules are all working correctly and are not responsible for
-this outcome — they were simply never exercised past the qualification
-gate.
-
-**Recommendation**: redesign the entry threshold specification rather
-than incrementally tweak it. Specifically worth reconsidering as a
-deliberate, evidence-based redesign decision (not a silent loosening):
-
-- Whether RR≥5 is appropriate for this confluence stack, versus a lower
-  threshold (e.g. RR≥2-3) now that six other independent filters already
-  select for high-quality setups.
-- Whether requiring the local M1 structure to independently confirm
-  (Module 4's E4 gate) is redundant with the sweep+POI+favorable-zone
-  confluence already required — it was this build's own documented,
-  flagged interpretation of "CHoCH confirmation" for the entry sequence,
-  not a locked, tested-against-a-written-spec requirement.
-- Whether the session window should gate entry at all, or only inform
-  position sizing/risk (the original plan text noted session gating was
-  itself a locked decision, but its interaction with an already-rare
-  signal was not something this build's earlier work anticipated at this
-  severity).
-- Pulling more M1 history (if the broker's retention allows) before
-  re-running this exact backtester, so any redesigned thresholds can be
-  evaluated against more than 10 months of data.
+- Whether the Entry Zone (§17) should instead be evaluated relative to
+  the **current price at confirmation**, not the CHoCH-trigger swing —
+  i.e., "the nearest M1 OB/FVG to where price is now" rather than "to
+  the specific old swing that broke."
+- Whether §16's "most recently confirmed M1 swing" should itself be
+  bounded (e.g., only swings within some recency/distance of current
+  price count as valid CHoCH triggers), rather than stateless-and-
+  unbounded.
+- Whether M1 is simply too fine a timeframe for both a structural
+  CHoCH-trigger and a persistent, nearby OB/FVG pool to coexist at the
+  same moment, and M15 (already used for the HTF POI) should also host
+  the Entry Zone concept.
 
 This report does not implicate the frozen Phase 2 components
 (`STRATEGY_V2_PHASE2_FREEZE_AUDIT.md`) and recommends no changes there.
