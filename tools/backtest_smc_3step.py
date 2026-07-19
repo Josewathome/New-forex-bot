@@ -41,6 +41,17 @@ TICK_VALUE_USD = {"EURUSD": 10.0, "GBPUSD": 10.0, "XAUUSD": 10.0, "USDJPY": 9.1}
 MIN_LOT, MAX_LOT, LOT_STEP = 0.01, 10.0, 0.01
 INITIAL_BALANCE = 10000.0
 
+# ── Realistic cost model (IC Markets Raw Spread account, per src/config.py) ──
+# Commission is real (IC_COMMISSION_USD, src/config.py: $3.50/side, all
+# instruments, $7.00 round-trip per lot). Spread/slippage are NOT backed by
+# a historical spread log for this account (none exists in this repo) --
+# FLAGGED ASSUMPTIONS, chosen as reasonable-but-conservative raw-ECN
+# estimates, not measured. XAUUSD is the priority symbol per current
+# research direction; its spread estimate matters most here.
+COMMISSION_PER_LOT_ROUNDTRIP = 7.00   # USD, all symbols (IC Markets Raw, $3.50/side)
+SPREAD_POINTS = {"XAUUSD": 20, "EURUSD": 5, "GBPUSD": 7, "USDJPY": 7}   # points, one-way
+SLIPPAGE_POINTS = {"XAUUSD": 5, "EURUSD": 2, "GBPUSD": 2, "USDJPY": 2}   # points, PER FILL (entry and exit each)
+
 
 def to_candles(sym, rows, tf):
     return [Candle(time=datetime.fromtimestamp(r["time"], tz=timezone.utc), open=r["open"], high=r["high"],
@@ -72,7 +83,7 @@ def resample_m1_to_m5(m1_candles, symbol):
     return out
 
 
-def run_backtest():
+def run_backtest(apply_costs=True, symbols=None):
     RAW_H1 = json.load(open(f"{DATA_DIR}/phase15_h1.json"))
     RAW_M15 = json.load(open(f"{DATA_DIR}/phase_entry_m15.json"))
     RAW_M1 = json.load(open(f"{DATA_DIR}/phase_entry_m1.json"))
@@ -82,7 +93,7 @@ def run_backtest():
     per_symbol_summary = {}
     running_equity = [INITIAL_BALANCE]
 
-    for sym in SYMBOLS:
+    for sym in (symbols or SYMBOLS):
         h1_candles = to_candles(sym, RAW_H1["symbols"][sym]["rates"], Timeframe.H1)
         m15_candles = to_candles(sym, RAW_M15["symbols"][sym]["rates"], Timeframe.M15)
         m1_candles = to_candles(sym, RAW_M1["symbols"][sym]["rates"], Timeframe.M1)
@@ -101,10 +112,25 @@ def run_backtest():
             m5_candle = m5_candles[j]
 
             if open_pos is not None:
+                # MAE/MFE: intrabar best/worst excursion vs entry, this bar.
+                if open_pos["direction"] == 1:
+                    fav_excursion = m5_candle.high - open_pos["entry"]
+                    adv_excursion = open_pos["entry"] - m5_candle.low
+                else:
+                    fav_excursion = open_pos["entry"] - m5_candle.low
+                    adv_excursion = m5_candle.high - open_pos["entry"]
+                open_pos["mfe"] = max(open_pos["mfe"], fav_excursion)
+                open_pos["mae"] = max(open_pos["mae"], adv_excursion)
+
                 hit_sl = (m5_candle.low <= open_pos["sl"]) if open_pos["direction"] == 1 else (m5_candle.high >= open_pos["sl"])
                 hit_tp = (m5_candle.high >= open_pos["tp"]) if open_pos["direction"] == 1 else (m5_candle.low <= open_pos["tp"])
                 if hit_sl or hit_tp:
                     exit_price = open_pos["sl"] if hit_sl else open_pos["tp"]
+                    if apply_costs:
+                        # Exit slippage: fills worse than the requested SL/TP
+                        # level, in the adverse direction, both directions.
+                        slip = SLIPPAGE_POINTS[sym] * config_v2.point_size(sym)
+                        exit_price = exit_price - slip if open_pos["direction"] == 1 else exit_price + slip
                     move = (exit_price - open_pos["entry"]) if open_pos["direction"] == 1 else (open_pos["entry"] - exit_price)
                     # Mirrors tools/backtest_strategy_v2.py's realize_pnl exactly:
                     # pips = move/pip_size; pip_value = TICK_VALUE_USD*10 (1 pip =
@@ -114,13 +140,18 @@ def run_backtest():
                     pips_moved = move / config_v2.pip_size(sym)
                     pip_value = TICK_VALUE_USD[sym] * 10
                     pnl = pips_moved * pip_value * open_pos["lots"]
+                    if apply_costs:
+                        pnl -= COMMISSION_PER_LOT_ROUNDTRIP * open_pos["lots"]
                     running_equity[0] += pnl
+                    initial_risk = abs(open_pos["entry"] - open_pos["sl"])
                     trade_log.append({
                         "symbol": sym, "direction": "bullish" if open_pos["direction"] == 1 else "bearish",
                         "entry": open_pos["entry"], "sl": open_pos["sl"], "tp": open_pos["tp"],
                         "lots": open_pos["lots"], "pnl": round(pnl, 2),
                         "outcome": "WIN" if hit_tp else "LOSS",
                         "opened_at": open_pos["opened_at"].isoformat(), "closed_at": m5_candle.time.isoformat(),
+                        "mfe_r": round(open_pos["mfe"] / initial_risk, 3) if initial_risk > 0 else None,
+                        "mae_r": round(open_pos["mae"] / initial_risk, 3) if initial_risk > 0 else None,
                     })
                     if hit_tp:
                         wins += 1
@@ -146,13 +177,28 @@ def run_backtest():
             if h1_idx < cfg.ema_period or h1_idx < cfg.swing_lookback_h1:
                 continue
 
-            bid = m5_candle.close
-            ask = m5_candle.close + 1 * config_v2.point_size(sym)  # 1-point synthetic spread floor
+            point = config_v2.point_size(sym)
+            if apply_costs:
+                half_spread = SPREAD_POINTS[sym] * point / 2.0
+                bid = m5_candle.close - half_spread
+                ask = m5_candle.close + half_spread
+            else:
+                bid = m5_candle.close
+                ask = m5_candle.close + 1 * point   # 1-point synthetic floor, no real cost
             signal = ea.on_m5_bar(h1_candles, h1_idx, h1_ema, m15_candles, m15_idx,
                                    m5_candles, j, current_price_bid=bid, current_price_ask=ask)
             if signal is None:
                 continue
             n_signals += 1
+
+            if apply_costs:
+                # Entry slippage: filled worse than the quoted bid/ask, in
+                # the adverse direction.
+                slip = SLIPPAGE_POINTS[sym] * point
+                if signal.direction == 1:
+                    signal.entry_price += slip
+                else:
+                    signal.entry_price -= slip
 
             sl_distance = abs(signal.entry_price - signal.stop_loss)
             # calculate_lot_size's value_per_unit = tick_value/tick_size. Passing
@@ -171,7 +217,8 @@ def run_backtest():
                 continue
             n_opened += 1
             open_pos = {"direction": signal.direction, "entry": signal.entry_price, "sl": signal.stop_loss,
-                        "tp": signal.take_profit, "lots": lots, "opened_at": m5_candle.time}
+                        "tp": signal.take_profit, "lots": lots, "opened_at": m5_candle.time,
+                        "mfe": 0.0, "mae": 0.0}
 
         per_symbol_summary[sym] = {"m5_bars": len(m5_candles), "signals": n_signals, "opened": n_opened,
                                     "closed": n_closed, "wins": wins, "losses": losses}
@@ -184,9 +231,12 @@ def run_backtest():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default=None)
+    parser.add_argument("--symbols", default=None, help="comma-separated, e.g. XAUUSD")
+    parser.add_argument("--no-costs", action="store_true", help="disable commission/spread/slippage")
     args = parser.parse_args()
+    syms = args.symbols.split(",") if args.symbols else None
 
-    trade_log, per_symbol_summary, final_equity = run_backtest()
+    trade_log, per_symbol_summary, final_equity = run_backtest(apply_costs=not args.no_costs, symbols=syms)
 
     print(); print("="*78); print("PER-SYMBOL SUMMARY"); print("="*78)
     for sym, s in per_symbol_summary.items():
