@@ -88,11 +88,15 @@ def resample_m1_to_m5(m1_candles, symbol):
     return out
 
 
-def run_backtest(apply_costs=True, symbols=None, cost_multiplier=1.0):
+def run_backtest(apply_costs=True, symbols=None, cost_multiplier=1.0, exclude_hours_utc=None):
     """cost_multiplier scales SPREAD_POINTS/SLIPPAGE_POINTS only (both are
     flagged assumptions, not measured broker data) -- commission is left
     at its real, measured rate regardless, since scaling a known-real cost
-    would misrepresent it as uncertain."""
+    would misrepresent it as uncertain. exclude_hours_utc: optional set of
+    UTC hours (0-23) during which a qualifying signal is discarded rather
+    than acted on -- a Priority 5 session-filter experiment, see tools/
+    experiment_session_filter.py."""
+    exclude_hours_utc = exclude_hours_utc or set()
     RAW_H1 = json.load(open(f"{DATA_DIR}/phase15_h1.json"))
     RAW_M15 = json.load(open(f"{DATA_DIR}/phase_entry_m15.json"))
     RAW_M1 = json.load(open(f"{DATA_DIR}/phase_entry_m1.json"))
@@ -198,6 +202,13 @@ def run_backtest(apply_costs=True, symbols=None, cost_multiplier=1.0):
             signal = ea.on_m5_bar(h1_candles, h1_idx, h1_ema, m15_candles, m15_idx,
                                    m5_candles, j, current_price_bid=bid, current_price_ask=ask)
             if signal is None:
+                continue
+            # Session filter (Priority 5 experiment): gates only the final
+            # entry action, not the EA's internal state machine -- the zone
+            # acquisition/CHoCH-wait timer above still runs every bar
+            # regardless, matching how a session gate is meant to apply
+            # only to "may I act now," not "am I tracking a setup."
+            if exclude_hours_utc and m5_candle.time.hour in exclude_hours_utc:
                 continue
             n_signals += 1
 
