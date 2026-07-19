@@ -16,7 +16,7 @@ from src.application.strategy_v2.liquidity import (
     is_buy_side, is_sell_side, equal_level_tolerance, min_sweep_penetration,
     is_asian_session, is_london_session, detect_asia_levels, detect_prev_day_levels,
     detect_equal_level, classify_sweep_reaction, update_sweep_state,
-    swept_during_london, active_unswept_levels,
+    swept_during_london, active_unswept_levels, merge_equal_levels,
 )
 
 FAILS = []
@@ -238,6 +238,54 @@ check("12b XAUUSD min sweep penetration = 1 pip = $0.10", abs(min_sweep_penetrat
       f"got {min_sweep_penetration('XAUUSD')}")
 check("12c EURUSD equal-level tolerance = 3 pips = 0.0003", abs(equal_level_tolerance("EURUSD") - 0.0003) < 1e-9)
 check("12d EURUSD min sweep penetration = 1 pip = 0.0001", abs(min_sweep_penetration("EURUSD") - 0.0001) < 1e-9)
+
+print(); print("="*78); print("SECTION 13 — M15 TIMEFRAME TAGGING (spec §11: detected on M15 AND H1)"); print("="*78)
+
+asia_highs_m15, asia_lows_m15 = detect_asia_levels(candles_asia, "EURUSD", timeframe=Timeframe.M15)
+check("13a detect_asia_levels tags primary_timeframe=M15 when passed timeframe=M15",
+      asia_highs_m15 and asia_highs_m15[0].primary_timeframe == Timeframe.M15)
+asia_highs_default, _ = detect_asia_levels(candles_asia, "EURUSD")
+check("13b detect_asia_levels still defaults to H1 (backward compatible)",
+      asia_highs_default and asia_highs_default[0].primary_timeframe == Timeframe.H1)
+
+prev_highs_m15, _ = detect_prev_day_levels(candles_2day, "EURUSD", timeframe=Timeframe.M15)
+check("13c detect_prev_day_levels tags primary_timeframe=M15 when passed timeframe=M15",
+      prev_highs_m15 and prev_highs_m15[0].primary_timeframe == Timeframe.M15)
+
+m15_swing_log = []
+m15_s1 = mk_swing(SwingType.HIGH, 1.2050, 10, 10)  # reuses mk_swing helper -- appends to module-level swing_log
+m15_swing = SwingPoint(symbol="EURUSD", timeframe=Timeframe.M15, kind=SwingType.HIGH, price=1.2052,
+                       candle_time=ts(11), confirmed_at_index=11)
+lvl_m15_tagged = detect_equal_level("EURUSD", [m15_s1], m15_swing, tol, lookback_bars=72)
+check("13d detect_equal_level tags primary_timeframe from the swing's OWN timeframe (M15 here), not hardcoded H1",
+      lvl_m15_tagged is not None and lvl_m15_tagged.primary_timeframe == Timeframe.M15,
+      f"{lvl_m15_tagged}")
+
+print(); print("="*78); print("SECTION 14 — EQUAL-LEVEL M15/H1 DEDUP (spec clarification #5)"); print("="*78)
+
+h1_eq = [LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.EQUAL_HIGH, price=1.1050,
+                         primary_timeframe=Timeframe.H1, created_at=ts(10))]
+m15_eq_match = [LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.EQUAL_HIGH, price=1.1051,
+                                primary_timeframe=Timeframe.M15, created_at=ts(10))]
+merged = merge_equal_levels(h1_eq, m15_eq_match, tolerance=0.0003)
+check("14a matching H1+M15 equal levels merge into exactly one pool entry",
+      len(merged) == 1, f"got {len(merged)}")
+check("14b merged entry keeps H1 as primary_timeframe, M15 as secondary_timeframe",
+      merged[0].primary_timeframe == Timeframe.H1 and merged[0].secondary_timeframe == Timeframe.M15,
+      f"{merged[0]}")
+check("14c merged entry keeps the H1 level's price (H1 retained as primary classification)",
+      abs(merged[0].price - 1.1050) < 1e-9)
+
+m15_eq_no_match = [LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.EQUAL_HIGH, price=1.1200,
+                                   primary_timeframe=Timeframe.M15, created_at=ts(10))]
+merged2 = merge_equal_levels(h1_eq, m15_eq_no_match, tolerance=0.0003)
+check("14d non-matching H1/M15 levels both pass through unmerged (2 entries)",
+      len(merged2) == 2, f"got {len(merged2)}")
+check("14e unmerged M15-only entry keeps M15 as its own primary_timeframe (no secondary)",
+      any(lv.primary_timeframe == Timeframe.M15 and lv.secondary_timeframe is None for lv in merged2))
+
+merged_empty_m15 = merge_equal_levels(h1_eq, [], tolerance=0.0003)
+check("14f no M15 levels at all: H1 levels pass through unchanged", merged_empty_m15 == h1_eq)
 
 print(); print("="*78)
 if FAILS:

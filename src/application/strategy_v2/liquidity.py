@@ -117,10 +117,13 @@ def is_london_session(dt: datetime) -> bool:
     return _hour_in(dt, config_v2.LONDON_SESSION_UTC)
 
 
-def detect_asia_levels(candles: Sequence[Candle], symbol: str) -> Tuple[List[LiquidityLevel], List[LiquidityLevel]]:
+def detect_asia_levels(
+    candles: Sequence[Candle], symbol: str, timeframe: Timeframe = Timeframe.H1,
+) -> Tuple[List[LiquidityLevel], List[LiquidityLevel]]:
     """One ASIA_HIGH/ASIA_LOW pair per UTC calendar day, created at the
     first candle after that day's Asian session has closed (L1 -- no
-    look-ahead into a session not yet complete)."""
+    look-ahead into a session not yet complete). `timeframe` tags which
+    candle series produced this level (spec §11: detected on M15 AND H1)."""
     highs: List[LiquidityLevel] = []
     lows: List[LiquidityLevel] = []
     current_day = None
@@ -136,14 +139,16 @@ def detect_asia_levels(candles: Sequence[Candle], symbol: str) -> Tuple[List[Liq
             day_low = c.low if day_low is None else min(day_low, c.low)
         elif day_high is not None:
             highs.append(LiquidityLevel(symbol=symbol, kind=LiquidityLevelType.ASIA_HIGH, price=day_high,
-                                         primary_timeframe=Timeframe.H1, created_at=c.time))
+                                         primary_timeframe=timeframe, created_at=c.time))
             lows.append(LiquidityLevel(symbol=symbol, kind=LiquidityLevelType.ASIA_LOW, price=day_low,
-                                        primary_timeframe=Timeframe.H1, created_at=c.time))
+                                        primary_timeframe=timeframe, created_at=c.time))
             day_high = day_low = None  # emit once per day only
     return highs, lows
 
 
-def detect_prev_day_levels(candles: Sequence[Candle], symbol: str) -> Tuple[List[LiquidityLevel], List[LiquidityLevel]]:
+def detect_prev_day_levels(
+    candles: Sequence[Candle], symbol: str, timeframe: Timeframe = Timeframe.H1,
+) -> Tuple[List[LiquidityLevel], List[LiquidityLevel]]:
     """PREV_DAY_HIGH/PREV_DAY_LOW: the fully completed prior UTC day's
     high/low, created at the first candle of the following day (L2)."""
     highs: List[LiquidityLevel] = []
@@ -161,10 +166,10 @@ def detect_prev_day_levels(candles: Sequence[Candle], symbol: str) -> Tuple[List
             day_high = day_low = None
             if prev_completed is not None:
                 highs.append(LiquidityLevel(symbol=symbol, kind=LiquidityLevelType.PREV_DAY_HIGH,
-                                             price=prev_completed[0], primary_timeframe=Timeframe.H1,
+                                             price=prev_completed[0], primary_timeframe=timeframe,
                                              created_at=c.time))
                 lows.append(LiquidityLevel(symbol=symbol, kind=LiquidityLevelType.PREV_DAY_LOW,
-                                            price=prev_completed[1], primary_timeframe=Timeframe.H1,
+                                            price=prev_completed[1], primary_timeframe=timeframe,
                                             created_at=c.time))
         day_high = c.high if day_high is None else max(day_high, c.high)
         day_low = c.low if day_low is None else min(day_low, c.low)
@@ -178,7 +183,9 @@ def detect_equal_level(
     swing_diagnostics.compute_swing_metadata). Returns an EQUAL_HIGH/
     EQUAL_LOW LiquidityLevel if a same-kind confirmed swing exists within
     `tolerance` price and `lookback_bars` of this swing (L3), else None.
-    Zero effect on structure/BOS/CHoCH -- purely a liquidity-target concept."""
+    Zero effect on structure/BOS/CHoCH -- purely a liquidity-target concept.
+    Tags primary_timeframe from new_swing.timeframe (whatever timeframe the
+    swing itself was confirmed on -- H1 or M15, per spec §11)."""
     candidates = [
         s for s in swing_log
         if s.kind == new_swing.kind and s is not new_swing
@@ -195,7 +202,38 @@ def detect_equal_level(
         extreme = min(prices)
         kind = LiquidityLevelType.EQUAL_LOW
     return LiquidityLevel(symbol=symbol, kind=kind, price=extreme,
-                           primary_timeframe=Timeframe.H1, created_at=new_swing.candle_time)
+                           primary_timeframe=new_swing.timeframe, created_at=new_swing.candle_time)
+
+
+def merge_equal_levels(
+    h1_levels: Sequence[LiquidityLevel], m15_levels: Sequence[LiquidityLevel], tolerance: float,
+) -> List[LiquidityLevel]:
+    """Spec §11 + clarification #5: if an Equal High/Low is detected on
+    both M15 and H1 (same kind, within `tolerance` price), merge into a
+    single pool entry -- H1 retained as primary_timeframe, M15 stamped as
+    secondary_timeframe. A liquidity pool may only exist once in the
+    database. H1-only or M15-only levels (no cross-timeframe match) pass
+    through unmerged, still valid resting liquidity on their own."""
+    merged: List[LiquidityLevel] = []
+    used_m15_ids = set()
+    for h1_lv in h1_levels:
+        match = next(
+            (m15_lv for m15_lv in m15_levels
+             if id(m15_lv) not in used_m15_ids and m15_lv.kind == h1_lv.kind
+             and abs(m15_lv.price - h1_lv.price) <= tolerance),
+            None,
+        )
+        if match is not None:
+            used_m15_ids.add(id(match))
+            merged.append(LiquidityLevel(
+                symbol=h1_lv.symbol, kind=h1_lv.kind, price=h1_lv.price,
+                primary_timeframe=Timeframe.H1, secondary_timeframe=Timeframe.M15,
+                created_at=h1_lv.created_at,
+            ))
+        else:
+            merged.append(h1_lv)
+    merged.extend(m15_lv for m15_lv in m15_levels if id(m15_lv) not in used_m15_ids)
+    return merged
 
 
 def classify_sweep_reaction(level: LiquidityLevel, candle: Candle, min_pen: float) -> Optional[str]:

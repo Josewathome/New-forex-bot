@@ -1,9 +1,11 @@
 """Regression test for src/application/strategy_v2/entry_confirmation.py
-against the test matrix: sweep confirmation (recency + reaction type),
-POI touch, discount/premium validation, local structure confirmation,
-entry-candle confirmation (displacement + body-close break), SL/TP
-computation, RR filter, and full evaluate_entry() orchestration
-(positive path + one failure per gate).
+(CORRECTED per docs/STRATEGY_V2_IMPLEMENTATION_PARITY_AUDIT.md) against
+the test matrix: sweep confirmation, POI touch, discount/premium
+validation, Absorption (spec §15), the STATELESS M1 CHoCH trigger (spec
+§16, no StructureEngine reuse), Entry Zone computation (spec §17,
+OB+FVG intersection or deeper-structure fallback), SL from the
+confirmation swing (spec §18), TP priority-fallback (spec §19), and full
+evaluate_entry() orchestration (positive path + one failure per gate).
 
 HOW TO RUN
     python3 tools/validate_entry_confirmation.py   (from repo root; no env vars needed)
@@ -17,8 +19,9 @@ from src.domain.strategy_v2_entities import (
 )
 from src.application.strategy_v2 import config_v2
 from src.application.strategy_v2.entry_confirmation import (
-    EntrySignal, sweep_confirmed, poi_touched, poi_in_favorable_zone, local_structure_confirms,
-    entry_candle_confirmed, compute_stop_loss, compute_take_profit, compute_rr, evaluate_entry,
+    EntrySignal, sweep_confirmed, poi_touched, poi_in_favorable_zone, zone_touch_confirmed, absorption_confirmed,
+    most_recent_swing, m1_choch_trigger, m1_confirmation, compute_entry_zone, compute_stop_loss,
+    compute_rr, select_take_profit, evaluate_entry,
 )
 
 FAILS = []
@@ -32,174 +35,281 @@ def ts(minutes): return T0 + timedelta(minutes=minutes)
 def C(minutes, o, h, l, c, sym="EURUSD"):
     return Candle(time=ts(minutes), open=o, high=h, low=l, close=c, volume=10.0, symbol=sym, timeframe=Timeframe.M1)
 
-def mk_swing(kind, price, idx=0, minute=0):
+def mk_h1_swing(kind, price, idx=0, minute=0):
     return SwingPoint(symbol="EURUSD", timeframe=Timeframe.H1, kind=kind, price=price, candle_time=ts(minute), confirmed_at_index=idx)
+
+def mk_m1_swing(kind, price, idx=0, minute=0):
+    return SwingPoint(symbol="EURUSD", timeframe=Timeframe.M1, kind=kind, price=price, candle_time=ts(minute), confirmed_at_index=idx)
 
 def mk_pair(low, high, trend):
     return ExternalSwingPair(symbol="EURUSD", trend=trend, low=low, high=high,
-                              low_swing=mk_swing(SwingType.LOW, low), high_swing=mk_swing(SwingType.HIGH, high), bos_time=T0)
+                              low_swing=mk_h1_swing(SwingType.LOW, low), high_swing=mk_h1_swing(SwingType.HIGH, high), bos_time=T0)
 
-print("="*78); print("SECTION 1 — SWEEP CONFIRMATION (E1)"); print("="*78)
+print("="*78); print("SECTION 1 — SWEEP CONFIRMATION (E1, unchanged)"); print("="*78)
 
 level_reversal = LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.ASIA_LOW, price=1.0950,
                                  primary_timeframe=Timeframe.H1, created_at=ts(0),
                                  swept=True, swept_at=ts(60), reaction="confirmed_reversal")
 check("1a confirmed_reversal, within max age: True", sweep_confirmed(level_reversal, ts(120), timedelta(minutes=90)))
 check("1b confirmed_reversal, beyond max age: False", not sweep_confirmed(level_reversal, ts(300), timedelta(minutes=90)))
-
 level_breakout = LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.ASIA_LOW, price=1.0950,
                                  primary_timeframe=Timeframe.H1, created_at=ts(0),
                                  swept=True, swept_at=ts(60), reaction="breakout")
-check("1c breakout reaction (never a valid trigger): False", not sweep_confirmed(level_breakout, ts(120), timedelta(minutes=90)))
+check("1c breakout reaction: False", not sweep_confirmed(level_breakout, ts(120), timedelta(minutes=90)))
 
-level_unswept = LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.ASIA_LOW, price=1.0950,
-                                primary_timeframe=Timeframe.H1, created_at=ts(0))
-check("1d unswept level: False", not sweep_confirmed(level_unswept, ts(120), timedelta(minutes=90)))
-
-print(); print("="*78); print("SECTION 2 — POI TOUCH (E2)"); print("="*78)
+print(); print("="*78); print("SECTION 2 — POI TOUCH (E2, revised: decoupled from same-bar confirmation) / SECTION 3 — FAVORABLE ZONE (E3, unchanged)"); print("="*78)
+print("CORRECTED per docs/STRATEGY_V2_IMPLEMENTATION_PARITY_AUDIT.md's real-data")
+print("follow-up: the POI touch and M1 confirmation no longer need to happen on")
+print("the exact same candle -- zone_touch_confirmed() checks a bounded recency")
+print("window instead, mirroring sweep_confirmed()'s own pattern.")
 
 zone_low, zone_high = 1.1000, 1.1010
-touch_candle = C(0, 1.1015, 1.1018, 1.1005, 1.1012)  # low(1.1005) inside zone
+touch_candle = C(0, 1.1015, 1.1018, 1.1005, 1.1012)
 check("2a candle wick reaches into the zone: touched", poi_touched(touch_candle, zone_low, zone_high))
-exact_boundary = C(0, 1.1015, 1.1018, 1.1010, 1.1012)  # low exactly == zone_high
-check("2b candle low exactly at zone_high: touched (inclusive)", poi_touched(exact_boundary, zone_low, zone_high))
-no_touch = C(0, 1.1020, 1.1025, 1.1015, 1.1022)  # never reaches down to 1.1010
-check("2c candle entirely above the zone: not touched", not poi_touched(no_touch, zone_low, zone_high))
+no_touch = C(0, 1.1020, 1.1025, 1.1015, 1.1022)
+check("2b candle entirely above the zone: not touched", not poi_touched(no_touch, zone_low, zone_high))
 
-print(); print("="*78); print("SECTION 3 — DISCOUNT/PREMIUM VALIDATION (E3, delegated)"); print("="*78)
+check("2c touch within max age: confirmed", zone_touch_confirmed(ts(0), ts(60), timedelta(minutes=90)))
+check("2d touch beyond max age: not confirmed", not zone_touch_confirmed(ts(0), ts(300), timedelta(minutes=90)))
+check("2e never touched (None): not confirmed", not zone_touch_confirmed(None, ts(60), timedelta(minutes=90)))
+check("2f touch time in the future relative to now: not confirmed (no look-ahead)",
+      not zone_touch_confirmed(ts(100), ts(60), timedelta(minutes=90)))
 
-pair_bull = mk_pair(1.1000, 1.1100, TrendState.BULLISH)
-check("3a BULLISH pair, zone in discount half: favorable", poi_in_favorable_zone(pair_bull, 1.1005, 1.1015))
-check("3b BULLISH pair, zone in premium half: NOT favorable", not poi_in_favorable_zone(pair_bull, 1.1080, 1.1095))
+pair_bull_wide = mk_pair(1.0900, 1.1200, TrendState.BULLISH)  # equilibrium=1.1050
+check("3a BULLISH pair, zone in discount half: favorable", poi_in_favorable_zone(pair_bull_wide, 1.0995, 1.1005))
+check("3b BULLISH pair, zone in premium half: NOT favorable", not poi_in_favorable_zone(pair_bull_wide, 1.1080, 1.1095))
 
-print(); print("="*78); print("SECTION 4 — LOCAL STRUCTURE CONFIRMATION (E4)"); print("="*78)
+print(); print("="*78); print("SECTION 4 — ABSORPTION (E4, spec §15)"); print("="*78)
+print("CORRECTED per docs/STRATEGY_V2_IMPLEMENTATION_PARITY_AUDIT.md's real-data")
+print("follow-up: 'beyond the HTF POI' means overshooting the FAR side in the")
+print("direction of travel, NOT simply being outside the zone on the approach")
+print("side (which is the normal, expected state before the actual touch).")
 
-check("4a BULLISH direction, local trend BULLISH: confirmed", local_structure_confirms(Direction.BULLISH, TrendState.BULLISH))
-check("4b BULLISH direction, local trend BEARISH: not confirmed", not local_structure_confirms(Direction.BULLISH, TrendState.BEARISH))
-check("4c BULLISH direction, local trend NEUTRAL: not confirmed", not local_structure_confirms(Direction.BULLISH, TrendState.NEUTRAL))
+atr_val = 0.0010
+htf_lo, htf_hi = 1.0990, 1.1010
 
-print(); print("="*78); print("SECTION 5 — ENTRY CANDLE CONFIRMATION (E5)"); print("="*78)
+# strictly decreasing bodies, avg < 50%*ATR, no close beyond HTF POI
+c1 = C(0, 1.1000, 1.1006, 1.0997, 1.1003)   # body 0.0003
+c2 = C(1, 1.1003, 1.1006, 1.1000, 1.1004)   # body 0.0001
+c3 = C(2, 1.1004, 1.1005, 1.1002, 1.10045)  # body 0.00005
+check("4a strictly decreasing bodies, small avg, closes within HTF POI: confirmed",
+      absorption_confirmed(Direction.BULLISH, [c1, c2, c3], atr_val, htf_lo, htf_hi))
 
-atr_val = 0.0004
-strong_bull_candle = C(0, 1.1000, 1.1012, 1.0999, 1.1010)  # body=0.0010, 2.5x ATR; closes above swing(1.1005)
-check("5a strong bullish displacement candle closing above local swing: confirmed",
-      entry_candle_confirmed(strong_bull_candle, 1.1005, Direction.BULLISH, atr_val))
-weak_candle = C(0, 1.1000, 1.1006, 1.0999, 1.1002)  # body=0.0002, well under 1.5x ATR
-check("5b weak (non-displacement) candle: not confirmed", not entry_candle_confirmed(weak_candle, 1.1000, Direction.BULLISH, atr_val))
-no_break_candle = C(0, 1.1000, 1.1012, 1.0999, 1.1002)  # displacement but closes BELOW the local swing(1.1005)
-check("5c displacement candle that does NOT break the local swing: not confirmed",
-      not entry_candle_confirmed(no_break_candle, 1.1005, Direction.BULLISH, atr_val))
-strong_bear_candle = C(0, 1.1010, 1.1011, 1.0998, 1.1000)  # body=0.0010, closes below swing(1.1005)
-check("5d bearish mirror: strong displacement, closes below local swing: confirmed",
-      entry_candle_confirmed(strong_bear_candle, 1.1005, Direction.BEARISH, atr_val))
-check("5e atr_value=None: never confirmed (never silently passes displacement)",
-      not entry_candle_confirmed(strong_bull_candle, 1.1005, Direction.BULLISH, None))
+c1_tie = C(0, 1.1000, 1.1005, 1.0998, 1.1002)   # body 0.0002
+c2_tie = C(1, 1.1002, 1.1006, 1.1000, 1.1004)   # body 0.0002 (tie -- disqualifies)
+c3_tie = C(2, 1.1004, 1.1005, 1.1002, 1.10045)
+check("4b tied consecutive bodies (not STRICTLY decreasing): rejected",
+      not absorption_confirmed(Direction.BULLISH, [c1_tie, c2_tie, c3_tie], atr_val, htf_lo, htf_hi))
 
-print(); print("="*78); print("SECTION 6 — STOP LOSS PLACEMENT (E6)"); print("="*78)
+c_big = C(0, 1.1000, 1.1050, 1.0950, 1.1040)  # huge body, avg would exceed 50%*ATR
+check("4c large average body (>=50%*ATR): rejected",
+      not absorption_confirmed(Direction.BULLISH, [c_big, c2, c3], atr_val, htf_lo, htf_hi))
 
-sl_bull = compute_stop_loss(Direction.BULLISH, 1.1000, 1.1010, "EURUSD")
-check("6a BULLISH SL = zone_low - buffer (2 pips = 0.0002)", abs(sl_bull - (1.1000 - 0.0002)) < 1e-9, f"{sl_bull}")
-sl_bear = compute_stop_loss(Direction.BEARISH, 1.1000, 1.1010, "EURUSD")
-check("6b BEARISH SL = zone_high + buffer", abs(sl_bear - (1.1010 + 0.0002)) < 1e-9, f"{sl_bear}")
-sl_xau = compute_stop_loss(Direction.BULLISH, 4000.00, 4005.00, "XAUUSD")
-check("6c XAUUSD SL uses the wider 3-pip buffer ($0.30)", abs(sl_xau - (4000.00 - 0.30)) < 1e-9, f"{sl_xau}")
+# KEY REGRESSION TEST: BULLISH setup, all 3 candles still APPROACHING from
+# ABOVE the zone (close > htf_hi) -- the normal, expected pre-touch state.
+# Must be CONFIRMED, not rejected (this is exactly what the two-sided bug
+# got wrong and made Absorption fail on ~100% of real approach sequences).
+c1_above = C(0, 1.1020, 1.1026, 1.1017, 1.1023)   # body 0.0003, closes above htf_hi
+c2_above = C(1, 1.1023, 1.1026, 1.1020, 1.1024)   # body 0.0001
+c3_above = C(2, 1.1024, 1.1025, 1.1022, 1.10245)  # body 0.00005
+check("4d BULLISH, approaching from ABOVE the zone (not yet touched): CONFIRMED",
+      absorption_confirmed(Direction.BULLISH, [c1_above, c2_above, c3_above], atr_val, htf_lo, htf_hi))
 
-print(); print("="*78); print("SECTION 7 — TAKE PROFIT CALCULATION (E7)"); print("="*78)
+c_undershoot = C(0, 1.1000, 1.1006, 1.0997, 1.0985)  # closes BELOW htf_lo=1.0990 -- overshoot past support
+check("4e BULLISH, a candle closing BELOW the zone's far side (undershoot): rejected",
+      not absorption_confirmed(Direction.BULLISH, [c_undershoot, c2, c3], atr_val, htf_lo, htf_hi))
 
-pair_tp = mk_pair(1.0900, 1.1100, TrendState.BULLISH)  # range_hi=1.1100
-entry_price = 1.1010
-asia_high_far = LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.ASIA_HIGH, price=1.1200,
-                                primary_timeframe=Timeframe.H1, created_at=ts(0))
-tp_htf_nearer = compute_take_profit(Direction.BULLISH, entry_price, pair_tp, asia_high_far)
-check("7a HTF pair extreme (1.1100) nearer than a far Asia high (1.1200): picks HTF target",
-      abs(tp_htf_nearer - 1.1100) < 1e-9, f"{tp_htf_nearer}")
+# BEARISH mirror: approaching from BELOW is fine; overshooting ABOVE htf_hi is not.
+c1_below = C(0, 1.0970, 1.0976, 1.0967, 1.0973)
+c2_below = C(1, 1.0973, 1.0976, 1.0970, 1.0974)
+c3_below = C(2, 1.0974, 1.0975, 1.0972, 1.09745)
+check("4f BEARISH, approaching from BELOW the zone (not yet touched): CONFIRMED",
+      absorption_confirmed(Direction.BEARISH, [c1_below, c2_below, c3_below], atr_val, htf_lo, htf_hi))
 
-asia_high_near = LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.ASIA_HIGH, price=1.1050,
-                                 primary_timeframe=Timeframe.H1, created_at=ts(0))
-tp_asia_nearer = compute_take_profit(Direction.BULLISH, entry_price, pair_tp, asia_high_near)
-check("7b Asia high (1.1050) nearer than HTF pair extreme (1.1100): picks Asia target",
-      abs(tp_asia_nearer - 1.1050) < 1e-9, f"{tp_asia_nearer}")
+c_overshoot = C(0, 1.1000, 1.1025, 1.0997, 1.1015)  # closes ABOVE htf_hi=1.1010 -- overshoot past resistance
+check("4g BEARISH, a candle closing ABOVE the zone's far side (overshoot): rejected",
+      not absorption_confirmed(Direction.BEARISH, [c_overshoot, c2, c3], atr_val, htf_lo, htf_hi))
 
-tp_no_asia = compute_take_profit(Direction.BULLISH, entry_price, pair_tp, None)
-check("7c no Asia level available: falls back to HTF target only", abs(tp_no_asia - 1.1100) < 1e-9)
+check("4h wrong candle count (not exactly 3): rejected", not absorption_confirmed(Direction.BULLISH, [c1, c2], atr_val, htf_lo, htf_hi))
+check("4i atr_value None: rejected (never silently passes)", not absorption_confirmed(Direction.BULLISH, [c1, c2, c3], None, htf_lo, htf_hi))
 
-pair_tp_bear = mk_pair(1.0900, 1.1100, TrendState.BEARISH)
-tp_bear = compute_take_profit(Direction.BEARISH, 1.0990, pair_tp_bear, None)
-check("7d BEARISH direction targets the range LOW, not the high", abs(tp_bear - 1.0900) < 1e-9, f"{tp_bear}")
+print(); print("="*78); print("SECTION 5 — STATELESS M1 CHoCH TRIGGER (E5, spec §16, NEW MECHANISM)"); print("="*78)
 
-print(); print("="*78); print("SECTION 8 — RR FILTER (E8)"); print("="*78)
+m1_swings = [mk_m1_swing(SwingType.HIGH, 1.1005, idx=10, minute=10), mk_m1_swing(SwingType.LOW, 1.0995, idx=15, minute=15)]
+check("5a most_recent_swing finds the most recent HIGH", most_recent_swing(m1_swings, SwingType.HIGH).price == 1.1005)
+check("5b most_recent_swing finds the most recent LOW", most_recent_swing(m1_swings, SwingType.LOW).price == 0.0995 or most_recent_swing(m1_swings, SwingType.LOW).price == 1.0995)
+check("5c most_recent_swing returns None if no swing of that kind exists", most_recent_swing([], SwingType.HIGH) is None)
 
+break_candle = C(20, 1.1000, 1.1010, 1.0998, 1.1008)  # closes above swing HIGH 1.1005
+trigger = m1_choch_trigger(Direction.BULLISH, m1_swings, break_candle)
+check("5d bullish trigger: body close above the most recent M1 swing HIGH fires, returns that swing",
+      trigger is not None and trigger.price == 1.1005)
+
+no_break_candle = C(20, 1.1000, 1.1004, 1.0998, 1.1002)  # closes below 1.1005
+check("5e no body close beyond the swing: no trigger", m1_choch_trigger(Direction.BULLISH, m1_swings, no_break_candle) is None)
+
+bear_break_candle = C(20, 1.0998, 1.1000, 1.0990, 1.0992)  # closes below swing LOW 1.0995
+trigger_bear = m1_choch_trigger(Direction.BEARISH, m1_swings, bear_break_candle)
+check("5f bearish trigger: body close below the most recent M1 swing LOW fires",
+      trigger_bear is not None and trigger_bear.price == 1.0995)
+
+check("5g no swing of the needed kind at all: no trigger",
+      m1_choch_trigger(Direction.BULLISH, [mk_m1_swing(SwingType.LOW, 1.0995)], break_candle) is None)
+
+# Combined m1_confirmation (Absorption + trigger + displacement)
+strong_break_candle = C(20, 1.0993, 1.1012, 1.0992, 1.1010)  # body=0.0017 >= 1.5*0.0010 ATR needed, closes above 1.1005
+combined = m1_confirmation(Direction.BULLISH, m1_swings, strong_break_candle, atr_val, [c1, c2, c3], htf_lo, htf_hi)
+check("5h m1_confirmation: all three conditions pass together -> returns the confirmation swing",
+      combined is not None and combined.price == 1.1005)
+weak_displacement_candle = C(20, 1.0998, 1.1006, 1.0997, 1.1006)  # closes above swing but body too small for 1.5x ATR
+check("5i m1_confirmation: swing broken but displacement insufficient -> None",
+      m1_confirmation(Direction.BULLISH, m1_swings, weak_displacement_candle, atr_val, [c1, c2, c3], htf_lo, htf_hi) is None)
+check("5j m1_confirmation: Absorption fails (tied bodies) even with a valid break+displacement -> None",
+      m1_confirmation(Direction.BULLISH, m1_swings, strong_break_candle, atr_val, [c1_tie, c2_tie, c3_tie], htf_lo, htf_hi) is None)
+
+print(); print("="*78); print("SECTION 6 — ENTRY ZONE (E6, spec §17, NEW)"); print("="*78)
+
+pair_for_zone = mk_pair(1.0900, 1.1200, TrendState.BULLISH)  # equilibrium=1.1050
+
+# OB and FVG overlap (positive width)
+m1_ob_overlap = (1.0995, 1.1005)
+m1_fvg_overlap = (1.1000, 1.1010)
+zone = compute_entry_zone(Direction.BULLISH, pair_for_zone, m1_ob_overlap, m1_fvg_overlap)
+check("6a OB+FVG overlap: entry zone = intersection, entry price = its midpoint",
+      zone is not None and zone[3] == "ob+fvg" and abs(zone[0] - (1.1000 + 1.1005) / 2.0) < 1e-9, f"{zone}")
+
+# OB and FVG adjacent only (boundary touch, still "overlap" per inclusive semantics)
+m1_ob_adj = (1.0990, 1.1000)
+m1_fvg_adj = (1.1000, 1.1010)
+zone_adj = compute_entry_zone(Direction.BULLISH, pair_for_zone, m1_ob_adj, m1_fvg_adj)
+check("6b OB+FVG boundary-touch (adjacent): still treated as overlap, entry = shared price",
+      zone_adj is not None and zone_adj[3] == "ob+fvg" and abs(zone_adj[0] - 1.1000) < 1e-9, f"{zone_adj}")
+
+# No overlap at all -- deeper discount/premium structure wins (BULLISH wants lower ratio = deeper discount)
+m1_ob_far = (1.0920, 1.0930)   # deep discount, near range low
+m1_fvg_shallow = (1.1140, 1.1150)  # shallow, near range high (premium side)
+zone_deep = compute_entry_zone(Direction.BULLISH, pair_for_zone, m1_ob_far, m1_fvg_shallow)
+check("6c no overlap: BULLISH picks the deeper-discount zone (the OB here), its own midpoint",
+      zone_deep is not None and zone_deep[3] == "ob" and abs(zone_deep[0] - (1.0920 + 1.0930) / 2.0) < 1e-9, f"{zone_deep}")
+
+pair_for_zone_bear = mk_pair(1.0900, 1.1200, TrendState.BEARISH)
+zone_deep_bear = compute_entry_zone(Direction.BEARISH, pair_for_zone_bear, m1_ob_far, m1_fvg_shallow)
+check("6d no overlap, BEARISH: picks the deeper-premium zone (the FVG here, near range high)",
+      zone_deep_bear is not None and zone_deep_bear[3] == "fvg", f"{zone_deep_bear}")
+
+zone_only_ob = compute_entry_zone(Direction.BULLISH, pair_for_zone, m1_ob_overlap, None)
+check("6e only an OB exists (no FVG): uses the OB's own midpoint",
+      zone_only_ob is not None and zone_only_ob[3] == "ob" and abs(zone_only_ob[0] - (1.0995 + 1.1005) / 2.0) < 1e-9)
+
+check("6f neither OB nor FVG exists: no valid entry zone", compute_entry_zone(Direction.BULLISH, pair_for_zone, None, None) is None)
+
+print(); print("="*78); print("SECTION 7 — STOP LOSS FROM CONFIRMATION SWING (E7, spec §18)"); print("="*78)
+
+conf_swing_bull = mk_m1_swing(SwingType.HIGH, 1.1005)
+sl_bull = compute_stop_loss(Direction.BULLISH, conf_swing_bull, "EURUSD")
+check("7a BULLISH SL = swing.price - buffer (2 pips = 0.0002)", abs(sl_bull - (1.1005 - 0.0002)) < 1e-9, f"{sl_bull}")
+conf_swing_bear = mk_m1_swing(SwingType.LOW, 1.0995)
+sl_bear = compute_stop_loss(Direction.BEARISH, conf_swing_bear, "EURUSD")
+check("7b BEARISH SL = swing.price + buffer", abs(sl_bear - (1.0995 + 0.0002)) < 1e-9, f"{sl_bear}")
+sl_xau = compute_stop_loss(Direction.BULLISH, mk_m1_swing(SwingType.HIGH, 4000.00), "XAUUSD")
+check("7c XAUUSD SL uses the wider 3-pip buffer ($0.30)", abs(sl_xau - (4000.00 - 0.30)) < 1e-9)
+
+print(); print("="*78); print("SECTION 8 — TP PRIORITY FALLBACK (E8, spec §19)"); print("="*78)
+
+entry_price, stop_loss = 1.1010, 1.0993  # risk = 0.0017
 check("8a RR computed correctly", abs(compute_rr(1.1010, 1.1000, 1.1060) - 5.0) < 1e-9)
-check("8b zero-risk (entry==SL) returns 0.0 rather than raising", compute_rr(1.1000, 1.1000, 1.1100) == 0.0)
+check("8b zero-risk returns 0.0", compute_rr(1.1000, 1.1000, 1.1100) == 0.0)
+
+htf_clears = 1.1200   # reward=0.019, rr~11.2 -- clears
+result = select_take_profit(Direction.BULLISH, entry_price, stop_loss, htf_clears, 1.1050, 1.1030)
+check("8c HTF target clears RR>=5: used first, even though other targets exist",
+      result is not None and abs(result[0] - htf_clears) < 1e-9 and result[2] == "htf_swing", f"{result}")
+
+htf_fails = 1.1013   # reward=0.0003, rr~0.18 -- fails
+eq_clears = 1.1100   # reward=0.009, rr~5.3 -- clears
+result2 = select_take_profit(Direction.BULLISH, entry_price, stop_loss, htf_fails, eq_clears, 1.1030)
+check("8d HTF fails RR: falls back to equal-level target, which clears",
+      result2 is not None and abs(result2[0] - eq_clears) < 1e-9 and result2[2] == "equal_level", f"{result2}")
+
+eq_fails = 1.1012
+asia_clears = 1.1120  # reward=0.011, rr~6.47 -- clears
+result3 = select_take_profit(Direction.BULLISH, entry_price, stop_loss, htf_fails, eq_fails, asia_clears)
+check("8e HTF and equal-level both fail: falls back to opposite Asian range, which clears",
+      result3 is not None and abs(result3[0] - asia_clears) < 1e-9 and result3[2] == "opposite_asia", f"{result3}")
+
+result4 = select_take_profit(Direction.BULLISH, entry_price, stop_loss, htf_fails, eq_fails, 1.1011)
+check("8f all three fail RR: rejected (None)", result4 is None)
+
+result5 = select_take_profit(Direction.BULLISH, entry_price, stop_loss, None, None, asia_clears)
+check("8g missing candidates (None) are skipped, not treated as failures", result5 is not None and result5[2] == "opposite_asia")
 
 print(); print("="*78); print("SECTION 9 — FULL evaluate_entry() ORCHESTRATION"); print("="*78)
 
 def base_args(**overrides):
-    # pair equilibrium = (1.0900+1.1200)/2 = 1.1050 -- the zone (1.0995,
-    # 1.1005), midpoint 1.1000, is clearly in the discount half (< 1.1050).
     args = dict(
-        symbol="EURUSD",
-        direction=Direction.BULLISH,
-        pair=mk_pair(1.0900, 1.1200, TrendState.BULLISH),
+        symbol="EURUSD", direction=Direction.BULLISH,
+        pair=mk_pair(1.0900, 1.1200, TrendState.BULLISH),  # equilibrium 1.1050
         sweep_level=LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.ASIA_LOW, price=1.0995,
                                     primary_timeframe=Timeframe.H1, created_at=ts(0),
-                                    swept=True, swept_at=ts(50), reaction="confirmed_reversal"),
-        poi_kind="ob",
-        zone_low=1.0995, zone_high=1.1005,
-        entry_candle=C(60, 1.0998, 1.1012, 1.0997, 1.1010),  # body=0.0012, touches zone, breaks swing, in discount
-        local_trend=TrendState.BULLISH,
-        local_swing_price=1.1005,
-        m1_atr_at_prev=0.0004,
-        # nearer than the HTF target (1.1200), still leaves RR well above MIN_RR
-        opposite_asia_level=LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.ASIA_HIGH, price=1.1120,
-                                            primary_timeframe=Timeframe.H1, created_at=ts(0)),
+                                    swept=True, swept_at=ts(15), reaction="confirmed_reversal"),
+        poi_kind="ob", zone_low=1.0995, zone_high=1.1005,   # M15 POI, discount half
+        # Touch happened at minute 15 -- BEFORE the confirmation candle
+        # (minute 20), not on the same bar (see zone_touch_confirmed's
+        # docstring for why these are decoupled).
+        zone_touched_at=ts(15),
+        entry_candle=C(20, 1.0993, 1.1012, 1.0992, 1.1010),  # displacement (body=0.0017), breaks swing
+        m1_swings=[mk_m1_swing(SwingType.HIGH, 1.1005, idx=10, minute=10)],
+        last_3_m1_candles=[c1, c2, c3],
+        m1_atr_at_prev=atr_val,
+        # entry zone intersection = (1.1005, 1.1007), midpoint 1.1006 -- above
+        # the confirmation-swing-derived SL (1.1005 - 0.0002 = 1.1003), so
+        # SL < entry as a real bullish trade requires.
+        m1_ob=(1.1003, 1.1007), m1_fvg=(1.1005, 1.1012),
+        htf_swing_target=1.1200, equal_level_target=None, opposite_asia_target=None,
     )
     args.update(overrides)
     return args
 
 signal = evaluate_entry(**base_args())
-check("9a happy path: produces a valid EntrySignal", signal is not None and isinstance(signal, EntrySignal))
+check("9a happy path: produces a valid EntrySignal", signal is not None and isinstance(signal, EntrySignal), f"{signal}")
 if signal:
-    check("9b entry_price == candle close", abs(signal.entry_price - 1.1010) < 1e-9)
-    check("9c stop_loss below the zone (bullish)", signal.stop_loss < 1.0995)
-    check("9d rr >= MIN_RR (5.0)", signal.rr >= config_v2.MIN_RR, f"rr={signal.rr}")
+    check("9b entry_price is the Entry Zone midpoint (not the candle close)",
+          abs(signal.entry_price - (1.1005 + 1.1007) / 2.0) < 1e-9, f"{signal.entry_price}")
+    check("9c stop_loss derived from the confirmation swing (1.1005 - buffer)",
+          abs(signal.stop_loss - (1.1005 - 0.0002)) < 1e-9, f"{signal.stop_loss}")
+    check("9c2 stop_loss is below entry (valid bullish risk ordering)", signal.stop_loss < signal.entry_price)
+    check("9d rr >= MIN_RR and take_profit_source is htf_swing", signal.rr >= config_v2.MIN_RR and signal.take_profit_source == "htf_swing")
+    check("9e confirmation_swing attached to the signal", signal.confirmation_swing.price == 1.1005)
 
-# One failure per gate:
-stale_sweep = base_args()
-stale_sweep["sweep_level"].swept_at = ts(0)  # far in the past relative to entry_candle at ts(60), default max_age=6h so still fine -- force truly stale:
-stale_args = base_args()
-stale_args["sweep_level"] = LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.ASIA_LOW, price=1.0995,
-                                            primary_timeframe=Timeframe.H1, created_at=ts(0),
-                                            swept=True, swept_at=ts(0) - timedelta(hours=10), reaction="confirmed_reversal")
-check("9e stale sweep: rejected (None)", evaluate_entry(**stale_args) is None)
+check("9f stale sweep: rejected", evaluate_entry(**base_args(sweep_level=LiquidityLevel(
+    symbol="EURUSD", kind=LiquidityLevelType.ASIA_LOW, price=1.0995, primary_timeframe=Timeframe.H1,
+    created_at=ts(0), swept=True, swept_at=ts(0) - timedelta(hours=10), reaction="confirmed_reversal"))) is None)
 
-breakout_args = base_args()
-breakout_args["sweep_level"] = LiquidityLevel(symbol="EURUSD", kind=LiquidityLevelType.ASIA_LOW, price=1.0995,
-                                               primary_timeframe=Timeframe.H1, created_at=ts(0),
-                                               swept=True, swept_at=ts(50), reaction="breakout")
-check("9f breakout (not a reversal) sweep: rejected (None)", evaluate_entry(**breakout_args) is None)
+check("9g breakout (not reversal) sweep: rejected", evaluate_entry(**base_args(sweep_level=LiquidityLevel(
+    symbol="EURUSD", kind=LiquidityLevelType.ASIA_LOW, price=1.0995, primary_timeframe=Timeframe.H1,
+    created_at=ts(0), swept=True, swept_at=ts(15), reaction="breakout"))) is None)
 
-no_touch_args = base_args(entry_candle=C(60, 1.1030, 1.1035, 1.1025, 1.1032))  # never reaches the zone
-check("9g no POI touch: rejected (None)", evaluate_entry(**no_touch_args) is None)
+check("9h never touched (zone_touched_at=None): rejected", evaluate_entry(**base_args(zone_touched_at=None)) is None)
 
-premium_zone_args = base_args(zone_low=1.1080, zone_high=1.1090)  # in premium half, not discount, for a BULLISH pair
-premium_zone_args["entry_candle"] = C(60, 1.1082, 1.1095, 1.1078, 1.1092)
-check("9h POI in premium half (BULLISH pair wants discount): rejected (None)", evaluate_entry(**premium_zone_args) is None)
+check("9h2 touch too stale (beyond max_touch_age): rejected", evaluate_entry(**base_args(
+    zone_touched_at=ts(15) - timedelta(hours=10))) is None)
 
-wrong_trend_args = base_args(local_trend=TrendState.BEARISH)
-check("9i local structure not confirming direction: rejected (None)", evaluate_entry(**wrong_trend_args) is None)
+check("9i POI in premium half: rejected", evaluate_entry(**base_args(
+    zone_low=1.1080, zone_high=1.1090)) is None)
 
-weak_entry_args = base_args(entry_candle=C(60, 1.0998, 1.1002, 1.0997, 1.1000))  # touches zone but no displacement/no break
-check("9j weak entry candle (no displacement / no swing break): rejected (None)", evaluate_entry(**weak_entry_args) is None)
+check("9j Absorption fails: rejected", evaluate_entry(**base_args(last_3_m1_candles=[c1_tie, c2_tie, c3_tie])) is None)
 
-low_rr_args = base_args(
-    # equilibrium=(1.0900+1.1013)/2=1.10065, still above the zone's midpoint
-    # (1.1000) so E1-E5 all still pass -- but the HTF target (1.1013) sits
-    # right next to entry (1.1010), forcing RR well below MIN_RR.
-    pair=mk_pair(1.0900, 1.1013, TrendState.BULLISH),
-    opposite_asia_level=None,
-)
-check("9k RR below MIN_RR: rejected (None)", evaluate_entry(**low_rr_args) is None)
+check("9k no M1 swing break: rejected", evaluate_entry(**base_args(
+    entry_candle=C(20, 1.0998, 1.1004, 1.0997, 1.1002))) is None)
+
+check("9l no Entry Zone available (neither M1 OB nor FVG): rejected",
+      evaluate_entry(**base_args(m1_ob=None, m1_fvg=None)) is None)
+
+check("9m RR fails on every TP tier: rejected", evaluate_entry(**base_args(
+    htf_swing_target=1.1010, equal_level_target=None, opposite_asia_target=None)) is None)
+
+check("9n Entry Zone/confirmation-swing produce inverted SL-vs-entry ordering: rejected as invalid risk",
+      evaluate_entry(**base_args(m1_ob=(1.0995, 1.1005), m1_fvg=(1.1000, 1.1010))) is None)
 
 print(); print("="*78)
 if FAILS:

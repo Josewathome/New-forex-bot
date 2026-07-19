@@ -9,7 +9,8 @@ HOW TO RUN
 import sys
 sys.path.insert(0, ".")
 from datetime import datetime, timezone
-from src.domain.entities import Direction
+from src.domain.entities import Direction, Timeframe
+from src.domain.strategy_v2_entities import SwingPoint, SwingType
 from src.application.strategy_v2 import config_v2
 from src.application.strategy_v2.entry_confirmation import EntrySignal
 from src.application.strategy_v2.trade_decision import (
@@ -23,8 +24,11 @@ def check(label, cond, extra=""):
         FAILS.append(label)
 
 def mk_signal():
+    dummy_swing = SwingPoint(symbol="EURUSD", timeframe=Timeframe.M1, kind=SwingType.HIGH, price=1.1005,
+                              candle_time=datetime(2026, 1, 1, 7, 50, tzinfo=timezone.utc), confirmed_at_index=10)
     return EntrySignal(symbol="EURUSD", direction=Direction.BULLISH, entry_price=1.1010,
-                        stop_loss=1.0990, take_profit=1.1200, rr=9.5, poi_kind="ob",
+                        stop_loss=1.0990, take_profit=1.1200, take_profit_source="htf_swing", rr=9.5,
+                        poi_kind="ob", confirmation_swing=dummy_swing,
                         entry_time=datetime(2026, 1, 1, 8, 0, tzinfo=timezone.utc))
 
 def clean_account():

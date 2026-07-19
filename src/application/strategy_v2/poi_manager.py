@@ -89,10 +89,31 @@ class POIManager:
         """Evolves every stored zone forward exactly one candle, via each
         zone type's own existing (frozen) update function. Call once per
         new candle close, after any new zones for that candle have been
-        added."""
+        added.
+
+        Records whose zone already has mitigated=True are skipped.
+        Rationale: is_tradable() = `not mitigated and not invalidated` is
+        already permanently False the instant mitigated becomes True
+        (mitigation is a one-way flag; see fvg.py/order_blocks.py's own
+        "maximum 1 mitigation" documentation) -- so active_fvgs()/
+        active_obs() (which gate on is_tradable) can never be affected by
+        continuing to evolve `invalidated` afterward. The only field that
+        could theoretically still change is `invalidated` itself, and
+        nothing in this codebase reads it independently of is_tradable
+        (expired_fvgs()/expired_obs() also route through is_tradable) --
+        so this is a genuine zero-observable-behavior-change optimization,
+        not a simplification of trading logic. This matters at M1 scale:
+        without it, this loop is O(bars x zones-ever-added) and blows up
+        past ~300k bars with thousands of zones, most of which mitigate
+        (and thus stop needing further updates) long before the replay
+        ends."""
         for rec in self.fvg_records:
+            if rec.zone.mitigated:
+                continue
             fvg_mod.update_fvg_state(rec.zone, candle)
         for rec in self.ob_records:
+            if rec.zone.mitigated:
+                continue
             ob_mod.update_ob_state(rec.zone, candle)
         min_pen = liq_mod.min_sweep_penetration(self.symbol)
         for level in self.liquidity_levels:
