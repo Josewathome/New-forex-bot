@@ -152,6 +152,7 @@ def run_backtest(apply_costs=True, symbols=None):
                         "opened_at": open_pos["opened_at"].isoformat(), "closed_at": m5_candle.time.isoformat(),
                         "mfe_r": round(open_pos["mfe"] / initial_risk, 3) if initial_risk > 0 else None,
                         "mae_r": round(open_pos["mae"] / initial_risk, 3) if initial_risk > 0 else None,
+                        "zone_is_ob": open_pos["zone_is_ob"], "entry_hour_utc": open_pos["opened_at"].hour,
                     })
                     if hit_tp:
                         wins += 1
@@ -218,7 +219,7 @@ def run_backtest(apply_costs=True, symbols=None):
             n_opened += 1
             open_pos = {"direction": signal.direction, "entry": signal.entry_price, "sl": signal.stop_loss,
                         "tp": signal.take_profit, "lots": lots, "opened_at": m5_candle.time,
-                        "mfe": 0.0, "mae": 0.0}
+                        "mfe": 0.0, "mae": 0.0, "zone_is_ob": signal.zone.is_ob}
 
         per_symbol_summary[sym] = {"m5_bars": len(m5_candles), "signals": n_signals, "opened": n_opened,
                                     "closed": n_closed, "wins": wins, "losses": losses}
