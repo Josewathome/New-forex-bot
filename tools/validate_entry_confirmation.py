@@ -167,41 +167,70 @@ check("5i m1_confirmation: swing broken but displacement insufficient -> None",
 check("5j m1_confirmation: Absorption fails (tied bodies) even with a valid break+displacement -> None",
       m1_confirmation(Direction.BULLISH, m1_swings, strong_break_candle, atr_val, [c1_tie, c2_tie, c3_tie], htf_lo, htf_hi) is None)
 
-print(); print("="*78); print("SECTION 6 — ENTRY ZONE (E6, spec §17, NEW)"); print("="*78)
+print(); print("="*78); print("SECTION 6 — ENTRY ZONE (E6, spec §17)"); print("="*78)
+print("CORRECTED per docs/STRATEGY_V2_IMPLEMENTATION_PARITY_AUDIT.md's real-data")
+print("follow-up: candidates are now full lists (low, high, created_at); the")
+print("function itself selects the zone CLOSEST IN PRICE to the confirmation")
+print("swing (ties broken by most-recently-created) -- an ancient, still-")
+print("\"active\"-but-far-away zone can no longer be picked just because it's")
+print("the most recently created one that hasn't mitigated yet.")
 
 pair_for_zone = mk_pair(1.0900, 1.1200, TrendState.BULLISH)  # equilibrium=1.1050
+conf_swing_for_zone = mk_m1_swing(SwingType.HIGH, 1.1005, idx=10, minute=10)  # candle_time = ts(10)
 
-# OB and FVG overlap (positive width)
-m1_ob_overlap = (1.0995, 1.1005)
-m1_fvg_overlap = (1.1000, 1.1010)
-zone = compute_entry_zone(Direction.BULLISH, pair_for_zone, m1_ob_overlap, m1_fvg_overlap)
+# OB and FVG overlap (positive width), both created AFTER the confirmation swing
+m1_obs_overlap = [(1.0995, 1.1005, ts(12))]
+m1_fvgs_overlap = [(1.1000, 1.1010, ts(13))]
+zone = compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, m1_obs_overlap, m1_fvgs_overlap)
 check("6a OB+FVG overlap: entry zone = intersection, entry price = its midpoint",
       zone is not None and zone[3] == "ob+fvg" and abs(zone[0] - (1.1000 + 1.1005) / 2.0) < 1e-9, f"{zone}")
 
 # OB and FVG adjacent only (boundary touch, still "overlap" per inclusive semantics)
-m1_ob_adj = (1.0990, 1.1000)
-m1_fvg_adj = (1.1000, 1.1010)
-zone_adj = compute_entry_zone(Direction.BULLISH, pair_for_zone, m1_ob_adj, m1_fvg_adj)
+m1_obs_adj = [(1.0990, 1.1000, ts(12))]
+m1_fvgs_adj = [(1.1000, 1.1010, ts(13))]
+zone_adj = compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, m1_obs_adj, m1_fvgs_adj)
 check("6b OB+FVG boundary-touch (adjacent): still treated as overlap, entry = shared price",
       zone_adj is not None and zone_adj[3] == "ob+fvg" and abs(zone_adj[0] - 1.1000) < 1e-9, f"{zone_adj}")
 
 # No overlap at all -- deeper discount/premium structure wins (BULLISH wants lower ratio = deeper discount)
-m1_ob_far = (1.0920, 1.0930)   # deep discount, near range low
-m1_fvg_shallow = (1.1140, 1.1150)  # shallow, near range high (premium side)
-zone_deep = compute_entry_zone(Direction.BULLISH, pair_for_zone, m1_ob_far, m1_fvg_shallow)
+m1_obs_far = [(1.0920, 1.0930, ts(12))]   # deep discount, near range low
+m1_fvgs_shallow = [(1.1140, 1.1150, ts(13))]  # shallow, near range high (premium side)
+zone_deep = compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, m1_obs_far, m1_fvgs_shallow)
 check("6c no overlap: BULLISH picks the deeper-discount zone (the OB here), its own midpoint",
       zone_deep is not None and zone_deep[3] == "ob" and abs(zone_deep[0] - (1.0920 + 1.0930) / 2.0) < 1e-9, f"{zone_deep}")
 
 pair_for_zone_bear = mk_pair(1.0900, 1.1200, TrendState.BEARISH)
-zone_deep_bear = compute_entry_zone(Direction.BEARISH, pair_for_zone_bear, m1_ob_far, m1_fvg_shallow)
+conf_swing_bear_for_zone = mk_m1_swing(SwingType.LOW, 1.0995, idx=10, minute=10)
+zone_deep_bear = compute_entry_zone(Direction.BEARISH, pair_for_zone_bear, conf_swing_bear_for_zone, m1_obs_far, m1_fvgs_shallow)
 check("6d no overlap, BEARISH: picks the deeper-premium zone (the FVG here, near range high)",
       zone_deep_bear is not None and zone_deep_bear[3] == "fvg", f"{zone_deep_bear}")
 
-zone_only_ob = compute_entry_zone(Direction.BULLISH, pair_for_zone, m1_ob_overlap, None)
+zone_only_ob = compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, m1_obs_overlap, [])
 check("6e only an OB exists (no FVG): uses the OB's own midpoint",
       zone_only_ob is not None and zone_only_ob[3] == "ob" and abs(zone_only_ob[0] - (1.0995 + 1.1005) / 2.0) < 1e-9)
 
-check("6f neither OB nor FVG exists: no valid entry zone", compute_entry_zone(Direction.BULLISH, pair_for_zone, None, None) is None)
+check("6f neither OB nor FVG exists: no valid entry zone",
+      compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, [], []) is None)
+
+# KEY REGRESSION TEST: with two candidates, the one CLOSER in price to the
+# confirmation swing (1.1005) is picked over a far-away one -- this is
+# exactly the real-data bug found (a stale M1 OB 50+ pips from the
+# confirmation swing was being selected purely because it was the most
+# recently created still-active zone, producing an inverted SL-vs-entry
+# ordering on every real case before this fix).
+m1_obs_far_away = [(1.1500, 1.1510, ts(5))]   # far from the swing (1.1005), but created earlier
+check("6g a lone far-away zone is still returned (no other candidate exists)",
+      compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, m1_obs_far_away, []) is not None)
+
+m1_obs_mixed = [(1.1500, 1.1510, ts(5)), (1.0995, 1.1005, ts(2))]  # far one created LATER, near one created EARLIER
+zone_mixed = compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, m1_obs_mixed, [])
+check("6h with a near AND a far candidate, the NEAR one wins even though it's the OLDER of the two",
+      zone_mixed is not None and abs(zone_mixed[0] - (1.0995 + 1.1005) / 2.0) < 1e-9, f"{zone_mixed}")
+
+m1_obs_tie_break = [(1.0990, 1.1000, ts(2)), (1.1000, 1.1010, ts(8))]  # equidistant from 1.1005 (both 0.0005 away)
+zone_tie = compute_entry_zone(Direction.BULLISH, pair_for_zone, conf_swing_for_zone, m1_obs_tie_break, [])
+check("6i equidistant candidates: tie broken by most-recently-created",
+      zone_tie is not None and abs(zone_tie[0] - (1.1000 + 1.1010) / 2.0) < 1e-9, f"{zone_tie}")
 
 print(); print("="*78); print("SECTION 7 — STOP LOSS FROM CONFIRMATION SWING (E7, spec §18)"); print("="*78)
 
@@ -263,8 +292,10 @@ def base_args(**overrides):
         m1_atr_at_prev=atr_val,
         # entry zone intersection = (1.1005, 1.1007), midpoint 1.1006 -- above
         # the confirmation-swing-derived SL (1.1005 - 0.0002 = 1.1003), so
-        # SL < entry as a real bullish trade requires.
-        m1_ob=(1.1003, 1.1007), m1_fvg=(1.1005, 1.1012),
+        # SL < entry as a real bullish trade requires. created_at=ts(12) is
+        # AFTER the confirmation swing (ts(10)), satisfying the "not stale"
+        # filter in compute_entry_zone.
+        m1_obs=[(1.1003, 1.1007, ts(12))], m1_fvgs=[(1.1005, 1.1012, ts(12))],
         htf_swing_target=1.1200, equal_level_target=None, opposite_asia_target=None,
     )
     args.update(overrides)
@@ -303,13 +334,17 @@ check("9k no M1 swing break: rejected", evaluate_entry(**base_args(
     entry_candle=C(20, 1.0998, 1.1004, 1.0997, 1.1002))) is None)
 
 check("9l no Entry Zone available (neither M1 OB nor FVG): rejected",
-      evaluate_entry(**base_args(m1_ob=None, m1_fvg=None)) is None)
+      evaluate_entry(**base_args(m1_obs=[], m1_fvgs=[])) is None)
+
+check("9l2 an OLD (by creation time) but PRICE-CLOSE M1 OB/FVG still produces a valid signal "
+      "-- only price proximity to the swing matters now, not creation recency",
+      evaluate_entry(**base_args(m1_obs=[(1.1003, 1.1007, ts(5))], m1_fvgs=[(1.1005, 1.1012, ts(5))])) is not None)
 
 check("9m RR fails on every TP tier: rejected", evaluate_entry(**base_args(
     htf_swing_target=1.1010, equal_level_target=None, opposite_asia_target=None)) is None)
 
 check("9n Entry Zone/confirmation-swing produce inverted SL-vs-entry ordering: rejected as invalid risk",
-      evaluate_entry(**base_args(m1_ob=(1.0995, 1.1005), m1_fvg=(1.1000, 1.1010))) is None)
+      evaluate_entry(**base_args(m1_obs=[(1.0995, 1.1005, ts(12))], m1_fvgs=[(1.1000, 1.1010, ts(12))])) is None)
 
 print(); print("="*78)
 if FAILS:

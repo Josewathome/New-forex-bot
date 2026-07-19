@@ -232,12 +232,47 @@ def m1_confirmation(
     return swing
 
 
+def _select_zone_near_swing(
+    zones: Sequence[Tuple[float, float, datetime]], swing_price: float,
+) -> Optional[Tuple[float, float]]:
+    """Helper for compute_entry_zone -- among candidate (low, high,
+    created_at) zones, picks the one geometrically CLOSEST (by midpoint
+    distance) to the confirmation swing's price, ties broken by most
+    recently created.
+
+    CORRECTED after a real-data finding: an earlier version of this
+    filter picked the most recently CREATED still-active zone,
+    unconditionally. Since swing detection (a structural pattern) and
+    OB/FVG detection (a displacement-gated event) are independent, there
+    is no guaranteed timing relationship between them -- "most recently
+    created" could be (and empirically was) a zone left over from a much
+    earlier, unrelated move, sitting 50+ pips away from the current
+    reversal (confirmed via real-data diagnosis on USDJPY), which produced
+    a nonsensical inverted SL-vs-entry ordering on every real confirmed
+    case (0/18 valid across the full real-data replay). A stricter
+    "created at/after the swing" filter was tried next and turned out to
+    eliminate essentially all candidates (zero temporal overlap in
+    practice) -- confirming the real defect was PRICE distance, not
+    timing. Distance-to-the-swing is the correct proxy for "the OB/FVG
+    relevant to this specific reversal."""
+    if not zones:
+        return None
+    lo, hi, _ = min(zones, key=lambda t: (abs(((t[0] + t[1]) / 2.0) - swing_price), -t[2].timestamp()))
+    return lo, hi
+
+
 def compute_entry_zone(
-    direction: Direction, pair: ExternalSwingPair,
-    m1_ob: Optional[Tuple[float, float]], m1_fvg: Optional[Tuple[float, float]],
+    direction: Direction, pair: ExternalSwingPair, confirmation_swing: SwingPoint,
+    m1_obs: Sequence[Tuple[float, float, datetime]], m1_fvgs: Sequence[Tuple[float, float, datetime]],
 ) -> Optional[Tuple[float, float, float, str]]:
-    """E6, spec §17. Returns (entry_price, zone_low, zone_high, poi_kind)
-    or None if neither an M1 OB nor M1 FVG is available."""
+    """E6, spec §17. `m1_obs`/`m1_fvgs` are ALL active, direction-matching
+    M1 OB/FVG candidates (low, high, created_at) -- this function selects
+    among them (see _select_zone_near_swing), it is not pre-selected by
+    the caller. Returns (entry_price, zone_low, zone_high, poi_kind) or
+    None if no qualifying M1 OB or FVG is available."""
+    m1_ob = _select_zone_near_swing(m1_obs, confirmation_swing.price)
+    m1_fvg = _select_zone_near_swing(m1_fvgs, confirmation_swing.price)
+
     if m1_ob is not None and m1_fvg is not None:
         conf = ob_fvg_confluence(m1_ob[0], m1_ob[1], m1_fvg[0], m1_fvg[1])
         if conf is not None:
@@ -319,8 +354,8 @@ def evaluate_entry(
     m1_swings: Sequence[SwingPoint],
     last_3_m1_candles: Sequence[Candle],
     m1_atr_at_prev: Optional[float],
-    m1_ob: Optional[Tuple[float, float]],
-    m1_fvg: Optional[Tuple[float, float]],
+    m1_obs: Sequence[Tuple[float, float, datetime]],
+    m1_fvgs: Sequence[Tuple[float, float, datetime]],
     htf_swing_target: Optional[float],
     equal_level_target: Optional[float],
     opposite_asia_target: Optional[float],
@@ -349,7 +384,7 @@ def evaluate_entry(
     if confirmation_swing is None:
         return None
 
-    entry_zone = compute_entry_zone(direction, pair, m1_ob, m1_fvg)
+    entry_zone = compute_entry_zone(direction, pair, confirmation_swing, m1_obs, m1_fvgs)
     if entry_zone is None:
         return None
     entry_price, entry_zone_low, entry_zone_high, entry_zone_kind = entry_zone
