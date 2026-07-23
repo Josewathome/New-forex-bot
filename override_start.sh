@@ -1064,15 +1064,28 @@ _graceful_shutdown() {
 trap _graceful_shutdown SIGTERM SIGINT
 
 # ── START BOT ─────────────────────────────────────────────────────
-# Launch the event-driven streaming bot (main_stream.py).
-# Wine reports os.name == "nt" so mt5_gateway.py uses direct
-# MetaTrader5 import — no RPyC bridge.
-# PYTHONUTF8=1 forces UTF-8 to prevent cp1252 crashes on box-drawing chars.
-# Run in BACKGROUND + wait so the trap above can fire on container stop
-# (a foreground command would swallow the signal until it returns).
-echo "Starting ZoneBot (stream mode) in Wine Python..."
-cd /bot && DISPLAY=:1 WINEPREFIX=/config/.wine PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
-    $wine_executable python -m src.main_stream &
+# main_stream.py (the OLD SMC strategy) is DELIBERATELY NOT launched here.
+# It depends on src.application.analysis/trade_monitor, which were moved to
+# legacy/ on 2026-07-18 (commit 2325d1d) because that strategy was proven
+# unprofitable live (-$9.74 net over 41 real positions, 5% win rate) --
+# see that commit message. Something restarted this container afterward
+# without knowing that, and main_stream.py crashed on the missing import on
+# EVERY attempt, before logging a single line. Because this whole script's
+# last step just `wait`s on that process, an instant crash exited the
+# entire script, which whatever supervises it then restarted from scratch
+# -- relaunching MT5 fully each time. That's the "~3 minute restart loop":
+# it was this crash, not an MT5 connection failure.
+#
+# Decision (2026-07-23, with the user): do not restore the old strategy.
+# Current live/demo validation runs via src/smc_3step_live_runner.py
+# instead (a separate process, launched manually via docker exec -- see
+# that file's own module docstring), against the MT5 terminal this script
+# still launches and keeps healthy above. This block is now a harmless
+# keep-alive so the container stays up without crash-looping. If the old
+# strategy is ever intentionally restored, revert this to the `wine python
+# -m src.main_stream` launch it replaced.
+echo "main_stream.py launch is disabled (see comment above) -- MT5 terminal stays up for src/smc_3step_live_runner.py."
+sleep infinity &
 _bot_pid=$!
-# `wait` returns when the bot exits OR when a trapped signal fires.
+# `wait` returns when the placeholder exits OR when a trapped signal fires.
 wait "${_bot_pid}"
