@@ -55,6 +55,28 @@ H1_BARS_NEEDED = 220      # cfg.ema_period(50) + cfg.swing_lookback_h1(80) + mar
 M15_BARS_NEEDED = 160     # cfg.zone_lookback_m15(80) + margin
 M5_BARS_NEEDED = 100      # cfg.choch_lookback_m5(40) + margin
 
+# ── Connection-stability workarounds (found empirically, 2026-07-23/27) ──
+# The MT5-under-Wine Python API IPC channel hung completely (mt5.initialize()
+# timing out for ALL clients, not just this process) twice within ~24h of
+# real running time, with the terminal process itself staying alive and
+# healthy throughout (confirmed via its own internal log) -- a genuine
+# automation-interface deadlock, not a crash, not caused by concurrent
+# diagnostic connections (the second hang happened with zero other
+# connections made). Two mitigations, since the true Wine-side cause isn't
+# fixable from the Python side:
+#   1. RECONNECT_INTERVAL_SECONDS: proactively cycle mt5.shutdown() + a
+#      fresh connect() periodically, before a long-held session has a
+#      chance to degrade, instead of holding one IPC session open for the
+#      entire runtime.
+#   2. MAX_CONSECUTIVE_FAILURES: if reconnection itself is failing (the
+#      hang has already happened), exit the process after this many
+#      consecutive failed cycles rather than retrying forever inside a
+#      Python process that may itself be in a bad state -- see
+#      override_start.sh's supervising restart loop, which relaunches this
+#      script (a fresh interpreter, fresh MT5Gateway) on exit.
+RECONNECT_INTERVAL_SECONDS = 1800   # 30 min
+MAX_CONSECUTIVE_FAILURES = 20        # ~5 min of failed cycles at POLL_SECONDS=15
+
 cfg = ThreeStepConfig()
 
 
@@ -133,9 +155,26 @@ def main():
 
     ea = ThreeStepEA(cfg, SYMBOL)
     last_m5_bar_time = None
+    last_reconnect = time_mod.time()
+    consecutive_failures = 0
 
     while True:
         try:
+            if time_mod.time() - last_reconnect >= RECONNECT_INTERVAL_SECONDS:
+                logger.info("Proactive reconnect (interval reached) -- cycling the IPC session.")
+                try:
+                    import MetaTrader5 as mt5
+                    mt5.shutdown()
+                except Exception:
+                    pass
+                gw._ready = False
+                if gw.connect(retries=3, delay=5.0):
+                    last_reconnect = time_mod.time()
+                    consecutive_failures = 0
+                    logger.info("Proactive reconnect succeeded.")
+                else:
+                    logger.warning("Proactive reconnect failed -- will retry next cycle.")
+
             # Re-detect every cycle, not just at startup: detect_utc_offset()
             # falls back to 0 when the most recent tick is stale (market
             # closed, e.g. weekend) since it has nothing fresh to measure
@@ -148,9 +187,17 @@ def main():
 
             m5_probe = fetch_closed_candles(gw, SYMBOL, "M5", Timeframe.M5, 2, utc_offset)
             if m5_probe is None:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.critical(
+                        "%d consecutive failed cycles -- exiting so the supervising "
+                        "restart loop can relaunch with a fresh process.", consecutive_failures,
+                    )
+                    sys.exit(1)
                 logger.warning("Could not fetch M5 candles -- retrying.")
                 time_mod.sleep(POLL_SECONDS)
                 continue
+            consecutive_failures = 0
             latest_closed_m5_time = m5_probe[-1].time
 
             if latest_closed_m5_time == last_m5_bar_time:
@@ -213,6 +260,13 @@ def main():
 
         except Exception:
             logger.exception("Unhandled error in main loop -- continuing after a pause.")
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logger.critical(
+                    "%d consecutive failed cycles -- exiting so the supervising "
+                    "restart loop can relaunch with a fresh process.", consecutive_failures,
+                )
+                sys.exit(1)
             time_mod.sleep(POLL_SECONDS)
             continue
 

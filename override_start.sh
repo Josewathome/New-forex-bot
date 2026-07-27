@@ -1078,14 +1078,36 @@ trap _graceful_shutdown SIGTERM SIGINT
 #
 # Decision (2026-07-23, with the user): do not restore the old strategy.
 # Current live/demo validation runs via src/smc_3step_live_runner.py
-# instead (a separate process, launched manually via docker exec -- see
-# that file's own module docstring), against the MT5 terminal this script
-# still launches and keeps healthy above. This block is now a harmless
-# keep-alive so the container stays up without crash-looping. If the old
-# strategy is ever intentionally restored, revert this to the `wine python
-# -m src.main_stream` launch it replaced.
-echo "main_stream.py launch is disabled (see comment above) -- MT5 terminal stays up for src/smc_3step_live_runner.py."
-sleep infinity &
+# against the MT5 terminal this script still launches and keeps healthy
+# above. If the old strategy is ever intentionally restored, revert this
+# block to the `wine python -m src.main_stream` launch it replaced.
+#
+# SUPERVISED, not one-shot (added 2026-07-27): the runner was previously
+# launched manually via `docker exec` and was NOT restarted by anything if
+# it exited or the container rebooted -- it silently sat dead for 3 days
+# before anyone checked back. The runner's own script now proactively
+# recycles its MT5 IPC session (found empirically to hang after enough
+# real running time, independent of this container's own stability) and
+# exits after sustained failure instead of looping forever in a possibly-
+# bad process state; this loop is what actually relaunches it when that
+# happens, or on any other crash, or after a container restart.
+_run_smc_3step_supervised() {
+    _child_pid=""
+    trap '[ -n "${_child_pid}" ] && kill "${_child_pid}" 2>/dev/null; exit 0' TERM INT
+    while true; do
+        show_message "[smc_3step] launching src.smc_3step_live_runner..."
+        cd /bot && DISPLAY=:1 WINEPREFIX=/config/.wine PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
+            $wine_executable python -m src.smc_3step_live_runner &
+        _child_pid=$!
+        wait "${_child_pid}"
+        _exit_code=$?
+        _child_pid=""
+        show_message "[smc_3step] exited (code ${_exit_code}) -- relaunching in 10s..."
+        sleep 10
+    done
+}
+_run_smc_3step_supervised &
 _bot_pid=$!
-# `wait` returns when the placeholder exits OR when a trapped signal fires.
+# `wait` returns when the supervisor loop exits (via its trap) OR when a
+# trapped signal fires on this outer script.
 wait "${_bot_pid}"
