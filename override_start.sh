@@ -815,6 +815,23 @@ _relaunch_mt5() {
 
 _WATCHDOG_INTERVAL=20
 _HEAL_AFTER_SECS=120         # bot listening but no EA this long → relaunch w/ [StartUp]
+
+# DISABLED 2026-07-27 (found via real usage): this watchdog exists to heal
+# the ZoneBotBridge EA's TCP handshake with main_stream.py -- it force-kills
+# and relaunches MT5 whenever port :${_FEED_PORT} sits in LISTEN (EA bound,
+# waiting) without reaching ESTAB (main_stream.py connected) for 120s. Since
+# main_stream.py is deliberately disabled (see the "START BOT" section
+# below), NOTHING ever connects, so this watchdog was firing "EA not
+# connected... relaunching" every ~2-3 minutes in an endless self-inflicted
+# loop (confirmed in this container's own logs: dozens of consecutive
+# relaunches over more than an hour) -- destabilizing MT5 for
+# src/smc_3step_live_runner.py as pure collateral damage, unrelated to that
+# script's own separate IPC issues. Its premise (a python client will
+# eventually connect to the EA's feed) is no longer true, so the "healing"
+# behavior itself became the problem. Left in place, unused, in case
+# main_stream.py is ever intentionally restored -- uncomment the block below
+# to re-enable it at that point.
+: <<'WATCHDOG_DISABLED'
 (
     _no_feed=0
     while true; do
@@ -857,7 +874,8 @@ _HEAL_AFTER_SECS=120         # bot listening but no EA this long → relaunch w/
     done
 ) &
 _watchdog_pid=$!
-show_message "MT5 auto-heal watchdog started (monitors EA connection on :${_FEED_PORT})."
+WATCHDOG_DISABLED
+show_message "MT5 auto-heal watchdog DISABLED (see comment above -- was self-triggering every ~2-3min with main_stream.py retired)."
 
 # ── Wait until MT5 IPC is actually reachable before starting the bot ─
 # The bot's mt5.initialize() attaches to the RUNNING terminal (MT5_PATH is
