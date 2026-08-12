@@ -108,6 +108,7 @@ def run_segment(h1_candles, m15_candles, m5_candles, spread_points, slippage_poi
                     "mae_r": round(open_pos["mae"] / initial_risk, 3) if initial_risk > 0 else None,
                     "zone_is_ob": open_pos["zone_is_ob"],
                     "adx_at_signal": open_pos["adx_at_signal"], "er_at_signal": open_pos["er_at_signal"],
+                    "zone_age_m15_bars": open_pos["zone_age_m15_bars"],
                 })
                 open_pos = None
             continue
@@ -139,6 +140,7 @@ def run_segment(h1_candles, m15_candles, m5_candles, spread_points, slippage_poi
         n_signals += 1
         adx_val = h1_adx[h1_idx]
         er_val = h1_er[h1_idx]
+        zone_age_m15_bars = m15_idx - signal.zone.form_index
 
         # Geometry sanity check -- mirrors the same guard added to
         # smc_3step_live_runner.py 2026-08-12 after a real live occurrence
@@ -184,7 +186,8 @@ def run_segment(h1_candles, m15_candles, m5_candles, spread_points, slippage_poi
                     "tp": signal.take_profit, "lots": lots, "opened_at": m5_candle.time,
                     "mfe": 0.0, "mae": 0.0, "zone_is_ob": signal.zone.is_ob,
                     "adx_at_signal": round(adx_val, 2) if adx_val is not None else None,
-                    "er_at_signal": round(er_val, 4) if er_val is not None else None}
+                    "er_at_signal": round(er_val, 4) if er_val is not None else None,
+                    "zone_age_m15_bars": zone_age_m15_bars}
 
     n_wins = sum(1 for t in trade_log if t["outcome"] == "WIN")
     n_losses = len(trade_log) - n_wins

@@ -11,9 +11,9 @@ the expectancy-maximizing threshold with a minimum trade-count floor, freeze
 it, then run the real engine on the test quarter alone and report both the
 gated and ungated result for direct comparison.
 
-HOW TO RUN: python3 tools/wf_regime_gate.py
+HOW TO RUN: python3 tools/wf_regime_gate.py [--er-period N]
 """
-import sys, json, math
+import sys, json, math, argparse
 from datetime import datetime, timezone
 sys.path.insert(0, ".")
 
@@ -23,6 +23,7 @@ from tools.regime_metrics import adx_series, efficiency_ratio_series
 
 DATA = "logs/smc3step_backtest_data.json"
 SPREAD, SLIPPAGE = 6.0, 5.0
+ER_PERIOD = int(sys.argv[sys.argv.index("--er-period") + 1]) if "--er-period" in sys.argv else 20
 
 # Same quarter boundaries used throughout this investigation (index-based
 # quartering of the 200k M5 bars, dates confirmed by the engine's own
@@ -55,7 +56,8 @@ def main():
     m15_candles = to_candles(raw["m15"], Timeframe.M15)
     m5_candles = to_candles(raw["m5"], Timeframe.M5)
     h1_adx = adx_series(h1_candles, 14)
-    h1_er = efficiency_ratio_series(h1_candles, 20)
+    h1_er = efficiency_ratio_series(h1_candles, ER_PERIOD)
+    print(f"ER_PERIOD={ER_PERIOD}")
 
     n = len(m5_candles)
     bounds = [int(f * n) for f in QUARTER_FRACTIONS]
