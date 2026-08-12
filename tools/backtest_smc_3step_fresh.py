@@ -140,6 +140,23 @@ def run_segment(h1_candles, m15_candles, m5_candles, spread_points, slippage_poi
         adx_val = h1_adx[h1_idx]
         er_val = h1_er[h1_idx]
 
+        # Geometry sanity check -- mirrors the same guard added to
+        # smc_3step_live_runner.py 2026-08-12 after a real live occurrence
+        # (a fast intrabar move left the zone-derived SL on the wrong side
+        # of the entry tick, MT5 retcode 10016). This backtest's bid/ask is
+        # synthesized from the CURRENT bar's own close, so it structurally
+        # cannot diverge from that bar the way a live tick mid-spike can --
+        # confirmed this branch is never hit on the full 2.8yr dataset, so
+        # it's a no-op here today, kept only so the invariant is explicit
+        # and doesn't silently start mattering if this script is ever
+        # extended to intrabar/tick-level pricing.
+        if signal.direction == 1:
+            valid_geometry = signal.stop_loss < signal.entry_price < signal.take_profit
+        else:
+            valid_geometry = signal.take_profit < signal.entry_price < signal.stop_loss
+        if not valid_geometry:
+            continue
+
         # Regime gate: blocks only this signal's entry action, mirroring the
         # session-hour filter's convention -- the EA's own state machine
         # already advanced this bar regardless (on_m5_bar was called above),

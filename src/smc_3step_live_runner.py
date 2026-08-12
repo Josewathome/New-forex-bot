@@ -268,6 +268,37 @@ def main():
                         "BULLISH" if signal.direction == 1 else "BEARISH",
                         signal.entry_price, signal.stop_loss, signal.take_profit, signal.zone.is_ob)
 
+            # Geometry sanity check (added 2026-08-12, after a real occurrence):
+            # build_signal prices SL/TP off the ZONE's static levels, formed
+            # possibly hours earlier (zone_max_age_bars=60 M15 bars). A fast
+            # intrabar move between zone acquisition and CHoCH confirmation
+            # can leave that zone-derived SL on the WRONG side of the live
+            # entry tick -- confirmed live: a ~$45 five-minute XAUUSD spike
+            # (real tick, verified against raw tick history, not a data/
+            # offset bug) produced sl=4405.60 ABOVE entry=4392.94 for a
+            # BULLISH signal. The broker already rejects these (retcode
+            # 10016 "invalid stops") but only after wasting an order_send
+            # call and logging a scary ERROR -- catch it locally instead so
+            # the log reads as an understood, handled case, not a fault.
+            # This CANNOT occur in the backtest (its bid/ask is synthesized
+            # from the bar's own close, so it can never diverge from that
+            # bar the way a live tick mid-spike can) -- confirmed 0/953
+            # backtested trades hit this, so it doesn't affect the
+            # regime-gate validation already deployed; it is a live-only,
+            # rare-but-real edge case.
+            if signal.direction == 1:
+                valid_geometry = signal.stop_loss < signal.entry_price < signal.take_profit
+            else:
+                valid_geometry = signal.take_profit < signal.entry_price < signal.stop_loss
+            if not valid_geometry:
+                logger.warning(
+                    "SIGNAL GEOMETRY INVALID (likely a fast intrabar move since zone "
+                    "acquisition) -- direction=%s entry=%.2f sl=%.2f tp=%.2f -- skipping, not placing an order.",
+                    "BULLISH" if signal.direction == 1 else "BEARISH",
+                    signal.entry_price, signal.stop_loss, signal.take_profit,
+                )
+                continue
+
             # Regime gate: blocks only this signal's entry action, same
             # convention validated in the backtest -- the EA's own state
             # machine already advanced (on_m5_bar reset it above before
