@@ -26,6 +26,26 @@
 # identifiable and separate from anything main_stream.py's own (currently
 # not running) SMC pipeline might place on the same account/symbol.
 #
+# REGIME GATE (added 2026-08-12): a full-period backtest (2023-10 to
+# present, ~2.8yr real XAUUSD data) found this strategy's edge is NOT
+# stable across the whole sample -- split-half showed flat/negative
+# 2023-10..2025-03 vs significantly positive 2025-03..present. Kaufman
+# Efficiency Ratio(20) on H1 at signal time was validated as a real,
+# not-just-selectivity regime filter: rolling walk-forward across 3
+# independent forward-fit folds (fit on strictly-prior quarters only,
+# real cascade-aware engine) showed the gate improving every fold, and a
+# random-gate matched-selectivity control (30 seeds/fold) showed the real
+# ER-gated result beating 27-30/30 random draws of equal selectivity in
+# every fold (combined p~0.012, Fisher's method). ADX(14) was also tested
+# and does NOT work (the apparent effect vanished when checked within
+# each half independently -- pure correlation with calendar time, not
+# causation). See src/application/regime_metrics.py and this repo's
+# tools/wf_regime_gate.py / tools/random_gate_control.py for the
+# validation runs. Still short of this project's strict "proven" bar
+# (aggregate gated-vs-ungated Welch t=1.85, just under 1.96) -- gating is
+# a defensible risk-reducer given it never underperformed the ungated
+# baseline in any honest forward test, not a claim of a fully proven edge.
+#
 # HOW TO RUN (inside the mt5 container, Wine environment):
 #   docker exec -u abc -e WINEPREFIX=/config/.wine mt5 wine python -m src.smc_3step_live_runner
 
@@ -40,6 +60,7 @@ from src.infrastructure.mt5_bridge.mt5_gateway import MT5Gateway
 from src.domain.entities import Candle, Timeframe, Direction
 from src.application.strategy_v2 import config_v2
 from src.application.smc_3step import ema_series, ThreeStepEA, ThreeStepConfig
+from src.application.regime_metrics import efficiency_ratio_series
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +75,13 @@ POLL_SECONDS = 15
 H1_BARS_NEEDED = 220      # cfg.ema_period(50) + cfg.swing_lookback_h1(80) + margin
 M15_BARS_NEEDED = 160     # cfg.zone_lookback_m15(80) + margin
 M5_BARS_NEEDED = 100      # cfg.choch_lookback_m5(40) + margin
+
+# Regime gate (see module docstring): only enter when H1 Efficiency
+# Ratio(20) at signal time is >= this threshold. H1_BARS_NEEDED (220) is
+# already far more than ER_LOOKBACK needs, so no extra history-fetch is
+# required.
+ER_LOOKBACK = 20
+ER_GATE_THRESHOLD = 0.45
 
 # ── Connection-stability workarounds (found empirically, 2026-07-23/27) ──
 # The MT5-under-Wine Python API IPC channel hung completely (mt5.initialize()
@@ -221,6 +249,7 @@ def main():
                 continue
 
             h1_ema = ema_series([c.close for c in h1_candles], cfg.ema_period)
+            h1_er = efficiency_ratio_series(h1_candles, ER_LOOKBACK)
             tick = gw.get_tick(SYMBOL)
             if tick is None:
                 logger.warning("No tick data -- skipping.")
@@ -239,6 +268,17 @@ def main():
                         "BULLISH" if signal.direction == 1 else "BEARISH",
                         signal.entry_price, signal.stop_loss, signal.take_profit, signal.zone.is_ob)
 
+            # Regime gate: blocks only this signal's entry action, same
+            # convention validated in the backtest -- the EA's own state
+            # machine already advanced (on_m5_bar reset it above before
+            # returning the signal), so a rejected signal doesn't distort
+            # zone-tracking/CHoCH-wait state, it just isn't acted on.
+            er_at_signal = h1_er[-1]
+            if er_at_signal is None or er_at_signal < ER_GATE_THRESHOLD:
+                logger.info("REGIME GATE: H1 ER(20)=%s < %.2f -- rejecting signal, not placing an order.",
+                            f"{er_at_signal:.3f}" if er_at_signal is not None else "None", ER_GATE_THRESHOLD)
+                continue
+
             sl_distance = abs(signal.entry_price - signal.stop_loss)
             lots = compute_lots(gw, sl_distance, cfg.risk_percent)
             if lots <= 0:
@@ -253,7 +293,7 @@ def main():
                 "sl": signal.stop_loss,
                 "tp": signal.take_profit,
                 "magic": MAGIC_NUMBER,
-                "comment": "smc3step_v1",
+                "comment": "smc3step_v1_er045",
             }
             result = gw.place_order(order)
             logger.info("ORDER RESULT: %s", result)
