@@ -62,7 +62,7 @@ def main():
         end = int(fold["end_frac"] * n_total)
         test_m5 = m5_candles[start:end]
 
-        er_gate = (lambda a, e, th=fold["er_threshold"]: e is not None and e >= th)
+        er_gate = (lambda a, e, z=None, th=fold["er_threshold"]: e is not None and e >= th)
         er_result = run_segment(h1_candles, m15_candles, test_m5, SPREAD, SLIPPAGE, True,
                                  f"{fold['label']}-ERgate", regime_gate=er_gate, h1_adx=h1_adx, h1_er=h1_er)
         er_stats = stats(er_result["trade_log"])
@@ -82,7 +82,7 @@ def main():
         random_means = []
         for seed in range(N_SEEDS):
             rng = random.Random(seed * 1000 + hash(fold["label"]) % 1000)
-            random_gate = (lambda a, e, rng=rng, rate=accept_rate: rng.random() < rate)
+            random_gate = (lambda a, e, z=None, rng=rng, rate=accept_rate: rng.random() < rate)
             res = run_segment(h1_candles, m15_candles, test_m5, SPREAD, SLIPPAGE, True,
                                f"{fold['label']}-rand{seed}", regime_gate=random_gate, h1_adx=h1_adx, h1_er=h1_er)
             s = stats(res["trade_log"])

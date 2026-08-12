@@ -75,7 +75,7 @@ def main():
 
         best = None
         for th in THRESHOLDS:
-            gate = (lambda a, e, th=th: e is not None and e >= th)
+            gate = (lambda a, e, z=None, th=th: e is not None and e >= th)
             res = run_segment(h1_candles, m15_candles, train_m5, SPREAD, SLIPPAGE, True,
                                f"train-fold{fold}-th{th}", regime_gate=gate, h1_adx=h1_adx, h1_er=h1_er)
             s = stats(res["trade_log"])
@@ -91,7 +91,7 @@ def main():
         chosen_th, train_stats = best
         print(f"  CHOSEN (in-sample): ER>={chosen_th}  train_n={train_stats['n']} train_mean=${train_stats['mean']}")
 
-        gate = (lambda a, e, th=chosen_th: e is not None and e >= th)
+        gate = (lambda a, e, z=None, th=chosen_th: e is not None and e >= th)
         test_gated = run_segment(h1_candles, m15_candles, test_m5, SPREAD, SLIPPAGE, True,
                                   f"test-fold{fold}-gated", regime_gate=gate, h1_adx=h1_adx, h1_er=h1_er)
         test_ungated = run_segment(h1_candles, m15_candles, test_m5, SPREAD, SLIPPAGE, True,

@@ -163,7 +163,10 @@ def run_segment(h1_candles, m15_candles, m5_candles, spread_points, slippage_poi
         # session-hour filter's convention -- the EA's own state machine
         # already advanced this bar regardless (on_m5_bar was called above),
         # so a rejected signal doesn't distort zone-tracking/CHoCH-wait state.
-        if regime_gate is not None and not regime_gate(adx_val, er_val):
+        # zone_age passed as a 3rd positional arg -- older gate callables
+        # written as `lambda a, e: ...` still work as long as they're
+        # updated to accept (and can ignore) it; see tools/wf_combo_gate.py.
+        if regime_gate is not None and not regime_gate(adx_val, er_val, zone_age_m15_bars):
             continue
 
         if apply_costs:
@@ -229,7 +232,7 @@ def main():
     regime_gate = None
     if args.er_gate is not None:
         thresh = args.er_gate
-        regime_gate = lambda adx_val, er_val: er_val is not None and er_val >= thresh
+        regime_gate = lambda adx_val, er_val, zone_age=None: er_val is not None and er_val >= thresh
     h1_adx = adx_series(h1_candles, 14)
     h1_er = efficiency_ratio_series(h1_candles, 20)
 
