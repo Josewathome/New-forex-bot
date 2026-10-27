@@ -5,9 +5,25 @@
 [![Python](https://img.shields.io/badge/Python-3.10-blue?logo=python)](https://www.python.org/)
 [![MetaTrader 5](https://img.shields.io/badge/Broker-MetaTrader%205-blueviolet)](https://www.metatrader5.com/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)](https://docs.docker.com/compose/)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 ---
+
+> **Current status (2026).** The original zone bot described below has been
+> retired: `analysis.py`, `trade_monitor.py` and `backtester.py` now live in
+> `legacy/application/`, so `src.main` and `--backtest` no longer run as
+> documented. Current work in this repo:
+>
+> - **`src/smc_3step_live_runner.py`** — a Python port of a Smart Money 3-Step EA
+>   (`src/application/smc_3step.py`) for XAUUSD on a **demo** account, with an
+>   H1 Efficiency Ratio(20) regime gate (`src/application/regime_metrics.py`).
+>   Backtest: `docs/SMC_3STEP_EA_BACKTEST_REPORT.md`.
+> - **`src/application/strategy_v2/`** — a multi-module SMC engine. Its own
+>   evaluation produced zero trades on the full dataset and it was not deployed
+>   (`docs/STRATEGY_V2_FINAL_EVALUATION.md`).
+> - **`tools/`** — walk-forward, ablation and random-gate control scripts used to
+>   test the regime filter.
+>
+> No strategy here has been validated for live trading.
 
 ## Overview
 
@@ -16,7 +32,7 @@ ZoneBot connects to a MetaTrader 5 broker account and autonomously identifies hi
 **What it does every 60 seconds:**
 
 1. Re-maps supply/demand zones on every H1 bar close.
-2. Scores entry candidates across all six pairs and executes the highest-conviction setups first — **Phase 1**.
+2. Scores entry candidates across all configured pairs (five in `src/config.py`) and executes the highest-conviction setups first — **Phase 1**.
 3. Re-enters top-tier setups (score ≥ 5 / 6) on the same symbol once a first trade hits TP1, "doubling down on a proven winner" — **Phase 2**.
 4. Monitors open trades: trails SL to swing pivots, closes at TP1 → TP2 → runner, exits stalling trades after a configurable duration.
 5. Pauses trading 30 minutes before any high-impact news event.
@@ -61,9 +77,9 @@ Active sessions: **London 08:00–16:00 UTC** · **New York 13:00–21:00 UTC**
 | Layer | Module | Responsibility |
 |---|---|---|
 | Entry point | `src/main.py` | Two-phase loop, startup wiring |
-| Analysis | `src/application/analysis.py` | Zone mapping, ChoCh detection, scoring |
+| Analysis | `legacy/application/analysis.py` | Zone mapping, ChoCh detection, scoring |
 | Execution | `src/application/execution_service.py` | Candidate collection, ranking, trade placement |
-| Monitoring | `src/application/trade_monitor.py` | TP1/TP2 partial closes, SL trail, stall exit |
+| Monitoring | `legacy/application/trade_monitor.py` | TP1/TP2 partial closes, SL trail, stall exit |
 | MT5 bridge | `src/infrastructure/mt5_bridge/mt5_gateway.py` | Raw MT5 API via RPyC (Docker) or native (Windows) |
 | Dashboard | `src/api/server.py` + `src/dashboard/index.html` | Flask REST API + browser UI |
 
@@ -87,7 +103,7 @@ Active sessions: **London 08:00–16:00 UTC** · **New York 13:00–21:00 UTC**
 |---|---|
 | Python 3.10 | Exact version — `metatrader5` package requires 3.10 |
 | MetaTrader 5 | Desktop client installed and logged in |
-| `metatrader5` package | Windows-only; installs automatically via `requirements.txt` |
+| `metatrader5` package | Windows-only; not in `requirements.txt` — install it separately on Windows (`pip install MetaTrader5`) |
 
 > **Linux / macOS users must use Docker.** The `metatrader5` Python package is Windows-only; the container uses `mt5linux` over RPyC to bridge the gap.
 
@@ -98,8 +114,8 @@ Active sessions: **London 08:00–16:00 UTC** · **New York 13:00–21:00 UTC**
 ### 1 — Clone the repository
 
 ```bash
-git clone https://github.com/Josewathome/zonebot.git
-cd zonebot
+git clone https://github.com/Josewathome/New-forex-bot.git
+cd New-forex-bot
 ```
 
 ### 2 — Create your environment file
@@ -184,6 +200,8 @@ Go to **http://localhost:8000** for live trade analytics, configuration controls
 ## Running the Backtest
 
 The backtester replays historical candle data through the same analysis engine used for live trading and writes a detailed text report.
+
+> **Note:** the backtester moved to `legacy/application/backtester.py` with the rest of the retired zone bot, so the commands below fail until the imports are restored.
 
 > **Important — Docker always requires `wine python`.**
 > The `MetaTrader5` package is installed inside Wine, not in the Linux layer of the container. Using `python` (without `wine`) will fail with `ModuleNotFoundError`. Always use the full command shown below.
